@@ -27,9 +27,8 @@ ssh 192.168.201.226 'uname -a; /usr/local/bin/micromamba --version'
 在服务器目标目录下直接克隆或拉取：
 ```bash
 ssh 192.168.201.226
-# 进入工作目录
 mkdir -p ~/eacbp_project && cd ~/eacbp_project
-git clone git@github.com:qiaokelihahaj/EACBP.git current
+git clone https://github.com/qiaokelihahaj/EACBP.git current
 cd current
 ```
 
@@ -44,16 +43,16 @@ scp -r .\dist\server_bundle 192.168.201.226:~/eacbp_project/current
 
 ## 3. 服务器端环境创建与验证
 
-登录服务器后：
+### 快速接入（使用已验证的共享环境）：
+服务器上已配置并安装好依赖的 Python 环境：
 ```bash
-ssh 192.168.201.226
+PYTHON=/public/home/qiaoke/.local/share/mamba/envs/perturb-seq/bin/python
+
 cd ~/eacbp_project/current
+"$PYTHON" -m pip install "pydantic>=2.5.0" -i https://pypi.tuna.tsinghua.edu.cn/simple
+"$PYTHON" -m pip install --no-deps -e .
 
-# 使用 micromamba 创建虚拟环境
-/usr/local/bin/micromamba create -n eacbp python=3.11 -c conda-forge -y
-/usr/local/bin/micromamba run -n eacbp pip install -e ".[bio,dev]"
-
-# 验证环境与运行测试套件
-/usr/local/bin/micromamba run -n eacbp python scripts/verify_environment.py
-/usr/local/bin/micromamba run -n eacbp pytest -q
+# 验证环境与运行完整测试套件（92 passed）
+"$PYTHON" scripts/verify_environment.py
+"$PYTHON" -m pytest -q
 ```
