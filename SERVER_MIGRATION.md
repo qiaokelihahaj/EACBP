@@ -1,11 +1,30 @@
-﻿# EACBP 服务器连接与部署指引
+﻿# EACBP 服务器连接、初始化须知与部署指引
 
-本项目参考了 `Perturb-seq_test_project` 的服务器配置与迁移流程规范。
+本项目严格遵循通用服务器部署模板（`/public/home/qiaoke/remote_python_project_bundle.tar.gz`）及 `Perturb-seq_test_project` 的规范。
 
-## 1. 远端服务器与 SSH 配置
+---
 
-在 `~/.ssh/config` 中已配置 SSH 别名与专有私钥：
+## 1. 核心运行契约与节点分工 (Execution Contract)
 
+1. **目标平台**：Linux x86-64。
+2. **登录节点（Login Node）**：
+   - 仅用于准备目标项目专属的 Python 运行环境、同步代码、执行非侵入式健康检查与静态校验；
+   - **禁止在登录节点直接运行长时间/高负载的重型计算任务**。
+3. **计算节点（Compute Node）**：
+   - 由 Slurm 作业调度器统一调度；
+   - 计算脚本中必须调用由部署者准备好的 **Python 解释器绝对路径**。
+4. **依赖管理原则（External to Bundle）**：
+   - 部署包不打包虚拟环境、不含本地操作系统硬编码路径；
+   - 服务器端 Python 依赖独立配置并通过国内镜像（清华源/阿里源）加速构建。
+5. **安全与数据管理契约**：
+   - 严禁将密码、私钥、Token 写入代码、脚本、`.env` 或提交历史中；
+   - 原始大文件数据集（raw data）、中间产物（interim/processed）和计算输出（outputs）与源码物理解耦，使用独立目录管理。
+
+---
+
+## 2. 远端服务器与 SSH 配置
+
+在 `~/.ssh/config` 中已配置：
 ```sshconfig
 Host 192.168.201.226
   HostName 192.168.201.226
@@ -14,45 +33,63 @@ Host 192.168.201.226
   IdentitiesOnly yes
 ```
 
-### 免密连接测试
-```powershell
-ssh 192.168.201.226 'uname -a; /usr/local/bin/micromamba --version'
-```
-
 ---
 
-## 2. 代码打包与同步
+## 3. 服务器端部署与非侵入式校验 (Non-mutating Verification)
 
-### 方式 A：通过 Git 仓库同步（推荐）
-在服务器目标目录下直接克隆或拉取：
+### 进入工作目录
 ```bash
 ssh 192.168.201.226
-mkdir -p ~/eacbp_project && cd ~/eacbp_project
-git clone https://github.com/qiaokelihahaj/EACBP.git current
-cd current
+cd ~/eacbp_project/current
 ```
 
-### 方式 B：本地打包并 SCP 同步
-在 Windows 本地执行：
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\prepare_server_bundle.ps1
-scp -r .\dist\server_bundle 192.168.201.226:~/eacbp_project/current
-```
-
----
-
-## 3. 服务器端环境创建与验证
-
-### 快速接入（使用已验证的共享环境）：
-服务器上已配置并安装好依赖的 Python 环境：
+### 环境配置与依赖安装
 ```bash
 PYTHON=/public/home/qiaoke/.local/share/mamba/envs/perturb-seq/bin/python
 
-cd ~/eacbp_project/current
+# 快速安装与本地包可编辑挂载
 "$PYTHON" -m pip install "pydantic>=2.5.0" -i https://pypi.tuna.tsinghua.edu.cn/simple
 "$PYTHON" -m pip install --no-deps -e .
+```
 
-# 验证环境与运行完整测试套件（92 passed）
-"$PYTHON" scripts/verify_environment.py
-"$PYTHON" -m pytest -q
+### 登录节点环境校验
+```bash
+bash scripts/verify_remote.sh
+```
+
+---
+
+## 4. Slurm 作业提交与集群运维 (Slurm Cluster Specs)
+
+### 提交计算作业 (CPU 任务模板)
+```bash
+cd ~/eacbp_project/current
+sbatch slurm/run_cpu.sbatch
+```
+
+### Slurm 调度参数说明：
+- **账号与分区**：`#SBATCH --account=libin`，`#SBATCH --partition=gpu`（集群未配置独立 CPU 分区时，通用任务挂载到 gpu 分区运行）
+- **计算资源**：1 节点、1 task、4 cpus-per-task、16GB 内存
+- **多线程控制**：
+  ```bash
+  export CUDA_VISIBLE_DEVICES=""
+  export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+  export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+  export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+  ```
+- **日志输出路径**：`logs/slurm-%j.out` 与 `logs/slurm-%j.err`
+
+### 常用集群运维与监控命令：
+```bash
+# 1. 查看作业队列
+squeue -u qiaoke
+
+# 2. 查询作业执行资源与状态
+sacct -j <JOB_ID> --format=JobID,State,Elapsed,AllocTRES,MaxRSS,ExitCode
+
+# 3. 实时跟踪日志
+tail -f logs/slurm-<JOB_ID>.out
+
+# 4. 取消/终止作业
+scancel <JOB_ID>
 ```
