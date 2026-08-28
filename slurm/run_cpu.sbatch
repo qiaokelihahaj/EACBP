@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 
 # CPU-only generic Slurm template for EACBP.
 # The gpu partition is used when the account is associated with the cluster GPU partition.
