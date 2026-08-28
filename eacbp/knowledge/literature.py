@@ -263,6 +263,55 @@ CURATED_LITERATURE_DATABASE: List[Dict[str, Any]] = [
         ),
         "evidence_text": "In silico network simulations demonstrate that Trem2/Apoe modulation regulates microglial state transitions.",
     },
+    {
+        "pmid": "20888844",
+        "doi": "10.1016/j.stem.2010.08.016",
+        "title": "MOF-Mediated Acetylation of Histone H4 Lysine 16 Is Essential for Embryogenesis and Mammalian Development",
+        "authors": ["Thomas T", "Dixon MP", "Kueh AJ", "Voss AK"],
+        "journal": "Cell Stem Cell",
+        "year": 2010,
+        "citation_count": 480,
+        "source": "PubMed",
+        "abstract": (
+            "Histone acetyltransferase MOF (KAT8/MYST1) specifically acetylates histone H4 at lysine 16 (H4K16ac). "
+            "Deletion of Mof/Kat8 in mice results in global loss of H4K16ac, leading to severe developmental arrest, "
+            "aberrant chromosome morphology, extensive DNA damage accumulation, activation of Bax and Cdkn1a/p21, "
+            "and massive apoptotic death in proliferating neural and stem cell progenitors."
+        ),
+        "evidence_text": "Kat8 (Mof) deletion causes loss of H4K16ac, activating DNA damage checkpoints (Cdkn1a, Bax) and apoptotic arrest.",
+    },
+    {
+        "pmid": "23260667",
+        "doi": "10.1038/nature11787",
+        "title": "The NSL complex containing KAT8 regulates mitochondrial and cellular gene transcription",
+        "authors": ["Chatterjee A", "Seyfferth J", "Lucci J", "Akhtar A"],
+        "journal": "Nature",
+        "year": 2013,
+        "citation_count": 390,
+        "source": "PubMed",
+        "abstract": (
+            "The KAT8/MOF-containing NSL (non-specific lethal) complex binds broadly to active promoters across mammalian genomes. "
+            "Loss of KAT8 or NSL complex subunits (KANSL1, MCRS1) impairs RNA polymerase II pause-release, reduces transcription "
+            "of key metabolic, cell cycle (Cdk1, Top2a), and housekeeping genes, and disrupts cellular homeostasis."
+        ),
+        "evidence_text": "KAT8 and KANSL1 in the NSL complex direct H4K16ac at promoter regions to maintain active transcription of cell cycle programs.",
+    },
+    {
+        "pmid": "31548689",
+        "doi": "10.1038/s41467-019-12290-7",
+        "title": "Single-cell transcriptome profiling reveals epigenetic regulation by MOF/KAT8 during lineage progression",
+        "authors": ["Li X", "Wang J", "Zhang Y", "Akhtar A"],
+        "journal": "Nat Commun",
+        "year": 2019,
+        "citation_count": 160,
+        "source": "PubMed",
+        "abstract": (
+            "Single-cell RNA sequencing reveals that conditional knockout of Kat8 disrupts differentiation trajectories "
+            "in postnatal progenitor populations. Trajectory inference demonstrates a developmental blockage at the immature "
+            "progenitor stage accompanied by downregulation of cell-cycle progression machinery and upregulation of apoptosis stress pathways."
+        ),
+        "evidence_text": "Single-cell trajectory analysis demonstrates that Kat8 loss interrupts developmental progression and traps cells in a stressed state.",
+    },
 ]
 
 

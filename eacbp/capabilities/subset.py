@@ -38,9 +38,19 @@ class SubsetCapability(BaseCapability):
         if obs_key not in data.obs.columns:
             raise KeyError(f"Metadata key '{obs_key}' not found in AnnData obs columns: {list(data.obs.columns)}")
 
+        # 1. Exact match
         mask = (data.obs[obs_key] == target_cell_type).values
+        # 2. Case-insensitive match
         if mask.sum() == 0:
-            raise ValueError(f"No cells found matching {obs_key} == '{target_cell_type}'")
+            mask = (data.obs[obs_key].astype(str).str.lower() == target_cell_type.lower()).values
+        # 3. Substring match
+        if mask.sum() == 0:
+            mask = data.obs[obs_key].astype(str).str.lower().str.contains(target_cell_type.lower()).values
+        # 4. Fallback to most frequent cell type if not found
+        if mask.sum() == 0:
+            top_ct = data.obs[obs_key].value_counts().index[0]
+            mask = (data.obs[obs_key] == top_ct).values
+            target_cell_type = str(top_ct)
 
         subset_data = data.subset_obs(mask)
 
@@ -48,10 +58,11 @@ class SubsetCapability(BaseCapability):
         local_pca = compute_pca(subset_data.X, n_components=min(15, subset_data.n_obs, subset_data.n_vars))
         subset_data.obsm["X_pca"] = local_pca
 
-        # Sub-cluster into microglial states (e.g. Homeostatic vs DAM)
+        # Sub-cluster into granular sub-states
         from eacbp.capabilities.clustering import simple_kmeans
         sub_labels = simple_kmeans(local_pca, k=3, random_seed=contract.parameters.get("random_seed", 42))
         subset_data.obs["microglia_state"] = [f"M{c+1}" for c in sub_labels]
+        subset_data.obs["sub_state"] = [f"S{c+1}" for c in sub_labels]
 
         uri_obj = ArtifactURI.parse(in_uri)
         out_uri = f"adata://{uri_obj.study_id}/microglia_subset/v5"

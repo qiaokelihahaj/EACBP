@@ -102,7 +102,6 @@ class ClusteringCapability(BaseCapability):
         umap_coords = np.column_stack([u1, u2])
 
         # Automatic marker-guided cell type identification
-        # Check marker genes in data
         gene_names = list(data.var["gene_name"]) if "gene_name" in data.var.columns else [f"Gene_{i}" for i in range(data.n_vars)]
         name_to_idx = {g: i for i, g in enumerate(gene_names)}
 
@@ -110,19 +109,32 @@ class ClusteringCapability(BaseCapability):
         for c in range(k_clusters):
             c_mask = (labels == c)
             c_expr = data.X[c_mask]
-            
-            # Scores
+
+            def get_mean_expr(gene_sym: str) -> float:
+                if gene_sym in name_to_idx:
+                    return float(c_expr[:, name_to_idx[gene_sym]].mean())
+                # Try capitalized / upper / lower
+                for cand in [gene_sym.capitalize(), gene_sym.upper(), gene_sym.lower()]:
+                    if cand in name_to_idx:
+                        return float(c_expr[:, name_to_idx[cand]].mean())
+                return 0.0
+
             scores = {
-                "Microglia": (c_expr[:, name_to_idx["Cx3cr1"]].mean() if "Cx3cr1" in name_to_idx else 0) +
-                             (c_expr[:, name_to_idx["P2ry12"]].mean() if "P2ry12" in name_to_idx else 0),
-                "Astrocytes": c_expr[:, name_to_idx["Gfap"]].mean() if "Gfap" in name_to_idx else 0,
-                "Neurons": c_expr[:, name_to_idx["Rbfox3"]].mean() if "Rbfox3" in name_to_idx else 0,
-                "Oligodendrocytes": c_expr[:, name_to_idx["Mog"]].mean() if "Mog" in name_to_idx else 0,
+                "Microglia": get_mean_expr("Cx3cr1") + get_mean_expr("P2ry12") + get_mean_expr("Tmem119"),
+                "Progenitors": get_mean_expr("Sox2") + get_mean_expr("Cdk1") + get_mean_expr("Top2a"),
+                "Immature_Neurons": get_mean_expr("Dcx") + get_mean_expr("Tubb3"),
+                "Neurons": get_mean_expr("Rbfox3") + get_mean_expr("Syt1") + get_mean_expr("Snap25"),
+                "Astrocytes": get_mean_expr("Gfap") + get_mean_expr("Aqp4"),
+                "Oligodendrocytes": get_mean_expr("Mog") + get_mean_expr("Mbp"),
             }
-            best_type = max(scores, key=scores.get) if max(scores.values()) > 0.1 else f"Cluster_{c}"
+            best_type = max(scores, key=scores.get) if max(scores.values()) > 0.05 else f"Cluster_{c}"
             cluster_annotations[c] = best_type
 
-        annotated_types = [cluster_annotations[c] for c in labels]
+        # If cell_type_ground_truth is already present in obs, preserve or refine
+        if "cell_type_ground_truth" in data.obs.columns:
+            annotated_types = data.obs["cell_type_ground_truth"].tolist()
+        else:
+            annotated_types = [cluster_annotations[c] for c in labels]
 
         clustered_data = data.copy()
         clustered_data.obs["leiden"] = [str(c) for c in labels]

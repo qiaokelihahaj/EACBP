@@ -235,7 +235,7 @@ class GeneAgentAdapter(BaseAgentAdapter):
                 "database": pw_info["database"],
                 "pathway_size": pw_size,
                 "overlap_count": k,
-                "overlap_genes": ", ".join(overlap) if overlap else "None",
+                "overlap_genes": ", ".join(overlap) if overlap else "no_overlap",
                 "p_value": p_val,
                 "odds_ratio": round(odds_ratio, 3),
                 "functional_description": pw_info["description"],

@@ -33,11 +33,16 @@ class IntentParser:
         # Tissue detection
         tissue = "brain" if any(w in prompt_lower for w in ["brain", "脑", "cortex", "hippocampus"]) else "tissue_sample"
 
-        # Disease detection
-        disease = "Alzheimer" if any(w in prompt_lower for w in ["ad", "alzheimer", "阿尔茨海默", "痴呆"]) else "healthy"
-
-        # Conditions
-        conditions = ["AD", "control"] if disease == "Alzheimer" else ["condition_1", "condition_2"]
+        # Disease / Intervention detection
+        if any(w in prompt_lower for w in ["kat8", "mof", "myst1", "cko", "敲除"]):
+            disease = "Kat8_cKO_Developmental_Disruption"
+            conditions = ["cKO", "con"]
+        elif any(w in prompt_lower for w in ["ad", "alzheimer", "阿尔茨海默", "痴呆"]):
+            disease = "Alzheimer"
+            conditions = ["AD", "control"]
+        else:
+            disease = "healthy"
+            conditions = ["condition_1", "condition_2"]
 
         # Target cell types
         target_cells = []
@@ -47,17 +52,25 @@ class IntentParser:
             target_cells.append("Astrocytes")
         if any(w in prompt_lower for w in ["neuron", "神经元"]):
             target_cells.append("Neurons")
+        if any(w in prompt_lower for w in ["progenitor", "前体", "干细胞", "stem"]):
+            target_cells.append("Progenitors")
 
         # Modalities
         modalities = ["scRNA"]
         has_spatial = any(w in prompt_lower for w in ["spatial", "空间", "visium", "stereoseq", "merfish"])
         if has_spatial:
             modalities.append("spatial")
+        if any(w in prompt_lower for w in ["perturb", "crispr", "ko", "knockout", "敲除", "cko"]):
+            modalities.append("perturbation")
 
-        # Prior-guided mode detection (e.g. if user mentions specific gene axis like "TREM2", "APOE", "DAM")
-        is_prior_guided = any(w in prompt_lower for w in ["dam假说", "prior", "基于", "trem2-apoe", "trem2", "apoe"])
+        # Prior-guided mode detection
+        is_kat8 = any(w in prompt_lower for w in ["kat8", "mof", "myst1", "h4k16ac", "组蛋白乙酰化"])
+        is_dam = any(w in prompt_lower for w in ["dam假说", "prior", "基于", "trem2-apoe", "trem2", "apoe"])
+        is_prior_guided = is_kat8 or is_dam or ("prior" in prompt_lower)
         user_hypotheses = []
-        if is_prior_guided:
+        if is_kat8:
+            user_hypotheses.append("Kat8 (Mof) H4K16ac epigenetic loss impairs cell cycle progression and lineage differentiation")
+        elif is_dam:
             user_hypotheses.append("DAM subpopulation regulation via TREM2-APOE axis")
 
         manifest = StudyManifest(
