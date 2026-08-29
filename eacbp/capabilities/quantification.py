@@ -5,6 +5,7 @@ into an AnnData/SCData count matrix with cell-level and donor-level metadata.
 '''
 
 import os
+import sys
 import shutil
 import subprocess
 from pathlib import Path
@@ -60,7 +61,12 @@ class FASTQQuantificationCapability(BaseCapability):
         samples = manifest_data.get("samples", {})
         
         # 2. Check if external CLI tool (kb / STAR) should be run
-        kb_available = shutil.which("kb") is not None
+        py_bin_dir = str(Path(sys.executable).parent)
+        if py_bin_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = py_bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+        kb_bin = shutil.which("kb") or str(Path(sys.executable).parent / "kb")
+        kb_available = Path(kb_bin).exists() or shutil.which("kb") is not None
         h5ad_output_path = contract.parameters.get("output_h5ad_path", None)
 
         sc_data = None
@@ -105,8 +111,9 @@ class FASTQQuantificationCapability(BaseCapability):
                     s_h5ad = s_out / "counts_unfiltered" / "adata.h5ad"
                     
                     if not s_h5ad.exists():
+                        print(f"  [FASTQQuantificationCapability] Running real kb count alignment for sample: {s_name}...")
                         cmd = [
-                            "kb", "count",
+                            kb_bin, "count",
                             "-i", str(resolved_idx),
                             "-g", str(resolved_t2g),
                             "-x", chemistry if chemistry in ("10xv2", "10xv3") else "10xv3",
@@ -122,9 +129,9 @@ class FASTQQuantificationCapability(BaseCapability):
                         
                         try:
                             res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                        except Exception as e:
-                            # Log and proceed
-                            pass
+                            print(f"  [FASTQQuantificationCapability] Sample {s_name} successfully aligned!")
+                        except subprocess.CalledProcessError as e:
+                            print(f"  [FASTQQuantificationCapability] Warning: kb count error on {s_name}: {e.stderr[:300] if e.stderr else e}")
                             
                     if s_h5ad.exists():
                         s_adata = ad.read_h5ad(str(s_h5ad))
@@ -134,6 +141,7 @@ class FASTQQuantificationCapability(BaseCapability):
                         s_adata.obs["batch"] = f"batch_{len(sample_adatas)+1}"
                         s_adata.obs_names = [f"{s_name}_{b}" for b in s_adata.obs_names]
                         sample_adatas.append(s_adata)
+                        print(f"  [FASTQQuantificationCapability] Loaded sample {s_name}: {s_adata.shape[0]} cells x {s_adata.shape[1]} genes")
 
                 if sample_adatas:
                     if len(sample_adatas) == 1:
