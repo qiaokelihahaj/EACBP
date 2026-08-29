@@ -140,6 +140,10 @@ def run_fastq_to_biology(
             "include_cci": True,
             "n_cells": n_cells,
             "n_genes": n_genes,
+            "threads": 16,
+            "work_dir": str(output_dir / f"kb_quant_{study_id}"),
+            "index_path": "/public/home/qiaoke/eacbp_project/references/index.idx",
+            "t2g_path": "/public/home/qiaoke/eacbp_project/references/t2g.txt",
         }
     )
 

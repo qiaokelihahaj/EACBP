@@ -6,36 +6,40 @@
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
 #SBATCH --output=/public/home/qiaoke/eacbp_project/current/logs/slurm-fastq-%j.out
 #SBATCH --error=/public/home/qiaoke/eacbp_project/current/logs/slurm-fastq-%j.err
 
 set -euo pipefail
 
-PROJECT_ROOT=""
-PYTHON=""
-FASTQ_DIR="/public/home/qiaoke/data/P9kat8pr单细胞数据/Data/Data/CleanData"
+PROJECT_ROOT="${REMOTE_PROJECT_ROOT:-/public/home/qiaoke/eacbp_project/current}"
+PYTHON="${REMOTE_PYTHON:-/public/home/qiaoke/.local/share/mamba/envs/perturb-seq/bin/python}"
+FASTQ_DIR="/public/home/qiaoke/data"
 
-cd ""
-[[ -x "" ]] || {
-  echo "Missing environment Python: " >&2
+cd "$PROJECT_ROOT"
+[[ -x "$PYTHON" ]] || {
+  echo "Missing environment Python: $PYTHON" >&2
   exit 2
 }
 
-mkdir -p "/logs" "/outputs/reports"
+mkdir -p "$PROJECT_ROOT/logs" "$PROJECT_ROOT/outputs/reports"
 
-export PYTHONPATH=""
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=""
-export OMP_NUM_THREADS=""
-export MKL_NUM_THREADS=""
-export OPENBLAS_NUM_THREADS=""
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
+export PATH="/public/home/qiaoke/.local/share/mamba/envs/perturb-seq/bin:$PATH"
 
 echo "=== [1/3] Verifying Environment ==="
-"" scripts/verify_environment.py
+"$PYTHON" scripts/verify_environment.py
 
-echo "=== [2/3] Running Full FASTQ-to-Biology Autonomous Pipeline ==="
-"" scripts/run_fastq_to_biology_pipeline.py --fastq-dir "" --target-gene "Kat8"
+echo "=== [2/3] Submitting Full FASTQ-to-Biology Autonomous Pipeline ==="
+"$PYTHON" scripts/run_fastq_to_biology_pipeline.py \
+  --fastq-dir "$FASTQ_DIR" \
+  --target-gene "Kat8" \
+  --output-dir "$PROJECT_ROOT/outputs"
 
 echo "=== [3/3] Execution Finished. Scientific report ready in outputs/reports/ ==="
