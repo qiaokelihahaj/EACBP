@@ -36,7 +36,7 @@ class PayloadSerializer:
             else:
                 raise TypeError(f"Cannot serialize Table payload of type {type(payload)}")
 
-        elif artifact_type in (ArtifactType.JSON, ArtifactType.GENE_LIST):
+        elif artifact_type in (ArtifactType.JSON, ArtifactType.GENE_LIST, ArtifactType.FASTQ):
             with open(target_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, default=str)
 
@@ -110,7 +110,7 @@ class PayloadSerializer:
         if artifact_type == ArtifactType.TABLE:
             return pd.read_csv(target_path, index_col=0)
 
-        elif artifact_type in (ArtifactType.JSON, ArtifactType.GENE_LIST):
+        elif artifact_type in (ArtifactType.JSON, ArtifactType.GENE_LIST, ArtifactType.FASTQ):
             with open(target_path, "r", encoding="utf-8") as f:
                 return json.load(f)
 
@@ -168,6 +168,7 @@ class ArtifactStorageBackend:
 
     def _get_path_for_uri(self, uri: ArtifactURI, artifact_type: ArtifactType) -> Path:
         ext_map = {
+            ArtifactType.FASTQ: ".json",
             ArtifactType.ANNDATA: ".h5ad",
             ArtifactType.SPATIAL_DATA: ".h5ad",
             ArtifactType.TABLE: ".csv",

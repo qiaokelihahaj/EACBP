@@ -38,9 +38,15 @@ class SideEffectValidator:
                 
                 # Check cell count mutation if filter_cells is forbidden
                 if "filter_cells" in contract.forbidden_operations:
-                    in_n_cells = getattr(in_data, "n_obs", None) or (len(in_data.get("obs", [])) if isinstance(in_data, dict) else None)
-                    out_n_cells = getattr(out_data, "n_obs", None) or (len(out_data.get("obs", [])) if isinstance(out_data, dict) else None)
-                    if in_n_cells is not None and out_n_cells is not None and in_n_cells != out_n_cells:
+                    in_n_cells = getattr(in_data, "n_obs", None)
+                    if in_n_cells is None and isinstance(in_data, dict) and ("obs" in in_data or "X" in in_data):
+                        in_n_cells = len(in_data.get("obs", [])) if "obs" in in_data else getattr(in_data.get("X"), "shape", [0])[0]
+
+                    out_n_cells = getattr(out_data, "n_obs", None)
+                    if out_n_cells is None and isinstance(out_data, dict) and ("obs" in out_data or "X" in out_data):
+                        out_n_cells = len(out_data.get("obs", [])) if "obs" in out_data else getattr(out_data.get("X"), "shape", [0])[0]
+
+                    if in_n_cells is not None and in_n_cells > 0 and out_n_cells is not None and in_n_cells != out_n_cells:
                         return False, f"POLICY VIOLATION: Cell count changed from {in_n_cells} to {out_n_cells} despite 'filter_cells' being forbidden."
 
                 # Check cluster label tampering if recluster is forbidden

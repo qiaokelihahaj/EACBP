@@ -15,9 +15,15 @@ from eacbp.capabilities.deg import DifferentialAbundanceCapability, Differential
 from eacbp.capabilities.trajectory import TrajectoryCapability
 
 
+from eacbp.capabilities.quantification import FASTQQuantificationCapability
+
+
 def create_default_capability_registry() -> CapabilityRegistry:
     """Instantiates and registers all standard built-in single-cell capabilities."""
     reg = CapabilityRegistry()
+    reg.register(FASTQQuantificationCapability(implementation_id="kb_python_v1"))
+    reg.register(FASTQQuantificationCapability(implementation_id="starsolo_v1"))
+    reg.register(FASTQQuantificationCapability(implementation_id="sc_quant_v1"))
     reg.register(DatasetAuditCapability())
     reg.register(QCCapability())
     reg.register(NormalizationCapability())
@@ -47,5 +53,6 @@ __all__ = [
     "DifferentialAbundanceCapability",
     "DifferentialExpressionCapability",
     "TrajectoryCapability",
+    "FASTQQuantificationCapability",
     "create_default_capability_registry",
 ]

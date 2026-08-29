@@ -18,13 +18,45 @@ class ComputationalDAGPlanner:
         tasks = []
 
         # =========================================================================
+        # Stage 00: FASTQ Upstream Quantification (if raw FASTQ provided)
+        # =========================================================================
+        has_fastq = (
+            manifest.data.has_raw_fastq
+            or "FASTQ" in manifest.data.modalities
+            or (manifest.data.raw_artifact_uri and manifest.data.raw_artifact_uri.startswith("fastq://"))
+            or current_state.get("has_fastq", False)
+        )
+        if has_fastq:
+            quant_in = manifest.data.raw_artifact_uri or f"fastq://{sid}/raw_reads/v1"
+            quant_out = f"adata://{sid}/raw/v1"
+            tasks.append(TaskContract(
+                task_id="task_000_quant",
+                capability="quantification",
+                method=current_state.get("quant_tool", "kb_python_v1"),
+                input_artifacts=[quant_in],
+                allowed_operations=["kb_count_alignment", "sc_quant_demultiplex", "umi_deduplication", "gene_annotation_mapping"],
+                forbidden_operations=["filter_cells", "normalize", "recluster"],
+                parameters={
+                    "chemistry": manifest.data.chemistry,
+                    "species": manifest.biological_design.species,
+                    "target_gene": current_state.get("target_gene", "Kat8"),
+                    "random_seed": manifest.reproducibility.random_seed,
+                },
+                expected_outputs=[quant_out],
+                validation_requirements=["finite_expression_check"],
+            ))
+            base_raw_adata = quant_out
+        else:
+            base_raw_adata = manifest.data.raw_artifact_uri or f"adata://{sid}/raw/v1"
+
+        # =========================================================================
         # Stage 0: Dataset Audit
         # =========================================================================
         tasks.append(TaskContract(
             task_id="task_001_audit",
             capability="dataset_audit",
             method="sc_audit_v1",
-            input_artifacts=[manifest.data.raw_artifact_uri or f"adata://{sid}/raw/v1"],
+            input_artifacts=[base_raw_adata],
             allowed_operations=["audit_metadata", "assess_replication", "assess_batches"],
             forbidden_operations=["filter_cells", "normalize", "recluster"],
             expected_outputs=[f"table://{sid}/dataset_audit/v1"],
@@ -38,7 +70,7 @@ class ComputationalDAGPlanner:
             task_id="task_002_qc",
             capability="qc",
             method="sc_qc_v1",
-            input_artifacts=[manifest.data.raw_artifact_uri or f"adata://{sid}/raw/v1"],
+            input_artifacts=[base_raw_adata],
             allowed_operations=["filter_low_quality_cells", "mitochondrial_filtering"],
             forbidden_operations=["normalize", "recluster", "infer_trajectory"],
             parameters={"min_genes": 10, "max_mito_pct": 20.0},
@@ -227,6 +259,37 @@ class ComputationalDAGPlanner:
                 expected_outputs=[f"table://{sid}/spatial_cci/v1"],
                 validation_requirements=["fdr_correction_check"],
             ))
+        else:
+            # Standard non-spatial cell-cell communication
+            include_cci = (
+                "communication" in manifest.data.modalities
+                or "cci" in manifest.data.modalities
+                or current_state.get("include_cci", False)
+                or current_state.get("run_cell_communication", False)
+            )
+            if include_cci:
+                tasks.append(TaskContract(
+                    task_id="task_010_cell_cell_communication",
+                    capability="cell_cell_communication",
+                    method="cci_ligand_receptor_v1",
+                    input_artifacts=[f"adata://{sid}/annotated/v4"],
+                    allowed_operations=[
+                        "load_lr_database",
+                        "calculate_spatial_contact_density",
+                        "compute_spatial_cci_score",
+                        "run_spatial_permutation_test",
+                        "extract_spatial_proximity",
+                        "match_ligand_receptor_pairs",
+                        "score_spatial_interactions",
+                        "permutation_testing",
+                        "evaluate_cell_cell_communication",
+                        "ligand_receptor_cci",
+                    ],
+                    forbidden_operations=["filter_cells", "recluster", "normalize"],
+                    parameters={"fdr_threshold": 0.05, "n_permutations": 100, "random_seed": manifest.reproducibility.random_seed},
+                    expected_outputs=[f"table://{sid}/spatial_cci/v1"],
+                    validation_requirements=["fdr_correction_check"],
+                ))
 
         # =========================================================================
         # Stage 12-14: External Agent Adapters (SpaCell, GeneAgent, ChatCell)

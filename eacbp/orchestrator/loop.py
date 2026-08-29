@@ -245,8 +245,25 @@ class ScientificOrchestrator:
         cap = contract.capability
         out_uris = result.output_artifacts
 
+        # 0. FASTQ Quantification Evidence
+        if cap == "quantification":
+            n_cells = result.metrics.get("n_cells_quantified", 0)
+            n_genes = result.metrics.get("n_genes_detected", 0)
+            engine = result.metrics.get("quant_engine", "sc_quantifier")
+            evidence_list.append(EvidenceNode(
+                evidence_id=f"E_quant_{task_id}",
+                type=EvidenceType.DATASET_AUDIT,
+                polarity=EvidencePolarity.SUPPORTING,
+                strength=EvidenceStrength.STRONG,
+                score=0.95,
+                summary=f"FASTQ reads quantified via {engine}: {n_cells} cells, {n_genes} genes detected.",
+                source_task_id=task_id,
+                source_artifact_uris=out_uris,
+                metrics=result.metrics,
+            ))
+
         # 1. Dataset Audit Evidence
-        if cap == "dataset_audit":
+        elif cap == "dataset_audit":
             n_cells = result.metrics.get("n_cells", 0)
             min_reps = result.metrics.get("min_replicates", 1)
             evidence_list.append(EvidenceNode(
@@ -666,4 +683,23 @@ class ScientificOrchestrator:
                 claim_type=ClaimType.MECHANISTIC_HYPOTHESIS,
                 causal_status="in_silico_perturbed",
                 support_evidence_ids=perturb_eids,
+            )
+
+        # Claim 5: Cell-Cell Communication Interaction Claim (C105)
+        cci_eids = [eid for eid in all_eids if "cci" in eid or "communication" in eid]
+        if cci_eids:
+            if is_kat8:
+                c105_stmt = "Cell-cell communication analysis reveals altered ligand-receptor signaling and niche interactions in response to Kat8 disruption."
+            elif is_ad:
+                c105_stmt = "Cell-cell communication analysis demonstrates significant ligand-receptor signaling shifts across reactive microenvironments."
+            else:
+                c105_stmt = "Ligand-receptor communication analysis reveals significant intercellular interaction networks across annotated single-cell subpopulations."
+
+            self.claim_engine.create_claim(
+                claim_id="C105_cell_cell_communication",
+                statement=c105_stmt,
+                language_tier=LanguageTier.LEVEL_2_STATISTICAL_INFERENCE,
+                claim_type=ClaimType.REGULATORY,
+                causal_status="observational",
+                support_evidence_ids=cci_eids,
             )

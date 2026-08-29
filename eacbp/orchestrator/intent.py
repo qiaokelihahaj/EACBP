@@ -57,11 +57,17 @@ class IntentParser:
 
         # Modalities
         modalities = ["scRNA"]
+        has_fastq = any(w in prompt_lower for w in ["fastq", "fq", "cleandata", "双端测序", "测序数据", "原始测序", "raw reads"])
+        if has_fastq:
+            modalities.append("FASTQ")
+
         has_spatial = any(w in prompt_lower for w in ["spatial", "空间", "visium", "stereoseq", "merfish"])
         if has_spatial:
             modalities.append("spatial")
         if any(w in prompt_lower for w in ["perturb", "crispr", "ko", "knockout", "敲除", "cko"]):
             modalities.append("perturbation")
+        if any(w in prompt_lower for w in ["communication", "cci", "cellchat", "细胞通讯", "配体受体", "ligand-receptor", "lr"]):
+            modalities.append("communication")
 
         # Prior-guided mode detection
         is_kat8 = any(w in prompt_lower for w in ["kat8", "mof", "myst1", "h4k16ac", "组蛋白乙酰化"])
@@ -72,6 +78,8 @@ class IntentParser:
             user_hypotheses.append("Kat8 (Mof) H4K16ac epigenetic loss impairs cell cycle progression and lineage differentiation")
         elif is_dam:
             user_hypotheses.append("DAM subpopulation regulation via TREM2-APOE axis")
+
+        default_raw_uri = f"fastq://{study_id}/raw_reads/v1" if has_fastq else f"adata://{study_id}/raw/v1"
 
         manifest = StudyManifest(
             study_id=study_id,
@@ -91,7 +99,8 @@ class IntentParser:
             ),
             data=DataSpec(
                 modalities=modalities,
-                raw_artifact_uri=raw_artifact_uri or f"adata://{study_id}/raw/v1",
+                raw_artifact_uri=raw_artifact_uri or default_raw_uri,
+                has_raw_fastq=has_fastq,
                 has_spatial_coordinates=has_spatial,
                 has_rna_velocity=False,
             ),

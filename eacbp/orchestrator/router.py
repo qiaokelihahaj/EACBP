@@ -22,6 +22,9 @@ class CapabilityRouter:
         current_state: Dict[str, Any],
     ) -> str:
         # Layer 1: Hard constraints & data specifications
+        if capability_name in ("quantification", "fastq_quantification"):
+            return current_state.get("quant_tool", "kb_python_v1")
+
         if capability_name == "trajectory_inference":
             if manifest.data.has_rna_velocity:
                 return "cellrank"

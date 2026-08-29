@@ -242,6 +242,14 @@ class CellCellCommunicationCapability(BaseCapability):
 
         data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
         
+        # Parameters
+        k_neighbors = int(contract.parameters.get("k_neighbors", 6))
+        n_permutations = int(contract.parameters.get("n_permutations", 200))
+        fdr_threshold = float(contract.parameters.get("fdr_threshold", 0.05))
+        cell_type_col = contract.parameters.get("cell_type_col", "cell_type")
+        custom_lr_pairs = contract.parameters.get("custom_lr_pairs", None)
+        random_seed = int(contract.parameters.get("random_seed", 42))
+
         # Spatial coordinates
         coords = None
         if "spatial" in data.obsm:
@@ -254,27 +262,21 @@ class CellCellCommunicationCapability(BaseCapability):
             coords = data.obs[["x", "y"]].values
 
         if coords is None:
-            raise ValueError("Spatial coordinates not found for Cell-Cell Communication analysis.")
-
-        validated_coords = validate_spatial_coordinates(coords, data.n_obs)
-
-        # Parameters
-        k_neighbors = int(contract.parameters.get("k_neighbors", 6))
-        n_permutations = int(contract.parameters.get("n_permutations", 200))
-        fdr_threshold = float(contract.parameters.get("fdr_threshold", 0.05))
-        cell_type_col = contract.parameters.get("cell_type_col", "cell_type")
-        custom_lr_pairs = contract.parameters.get("custom_lr_pairs", None)
-        random_seed = int(contract.parameters.get("random_seed", 42))
-
-        # Spatial connectivity graph safely loaded
-        if "spatial_connectivities" in data.obsm and isinstance(data.obsm["spatial_connectivities"], np.ndarray):
-            W = np.asarray(data.obsm["spatial_connectivities"], dtype=np.float32)
-        elif "spatial_connectivities" in data.uns and isinstance(data.uns["spatial_connectivities"], np.ndarray):
-            W = np.asarray(data.uns["spatial_connectivities"], dtype=np.float32)
-        elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and isinstance(data.obsp["spatial_connectivities"], np.ndarray):
-            W = np.asarray(data.obsp["spatial_connectivities"], dtype=np.float32)
+            # Non-spatial standard single-cell CCI (CellChat / CellPhoneDB style)
+            W = np.ones((data.n_obs, data.n_obs), dtype=np.float32) / float(max(1, data.n_obs))
+            is_spatial = False
         else:
-            W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors)
+            validated_coords = validate_spatial_coordinates(coords, data.n_obs)
+            is_spatial = True
+            # Spatial connectivity graph safely loaded
+            if "spatial_connectivities" in data.obsm and isinstance(data.obsm["spatial_connectivities"], np.ndarray):
+                W = np.asarray(data.obsm["spatial_connectivities"], dtype=np.float32)
+            elif "spatial_connectivities" in data.uns and isinstance(data.uns["spatial_connectivities"], np.ndarray):
+                W = np.asarray(data.uns["spatial_connectivities"], dtype=np.float32)
+            elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and isinstance(data.obsp["spatial_connectivities"], np.ndarray):
+                W = np.asarray(data.obsp["spatial_connectivities"], dtype=np.float32)
+            else:
+                W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors)
 
         # Run Spatial CCI Computation
         cci_df = compute_spatial_cci(

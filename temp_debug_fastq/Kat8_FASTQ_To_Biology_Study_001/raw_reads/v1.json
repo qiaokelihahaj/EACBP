@@ -1,0 +1,10 @@
+{
+  "samples": {
+    "P12K8_con": {
+      "R1": "f1.fq",
+      "R2": "f2.fq"
+    }
+  },
+  "chemistry": "10xv3",
+  "species": "mus_musculus"
+}

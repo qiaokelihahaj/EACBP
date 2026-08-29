@@ -25,8 +25,11 @@ class ExperimentalDesign(BaseModel):
 
 
 class DataSpec(BaseModel):
-    modalities: List[str] = Field(default_factory=lambda: ["scRNA"], description="Data modalities, e.g., ['scRNA', 'spatial']")
+    modalities: List[str] = Field(default_factory=lambda: ["scRNA"], description="Data modalities, e.g., ['scRNA', 'spatial', 'FASTQ']")
     raw_artifact_uri: Optional[str] = Field(None, description="URI of the initial raw data artifact")
+    has_raw_fastq: bool = Field(False, description="Whether raw paired-end FASTQ reads are provided for quantification")
+    fastq_paths: Dict[str, Dict[str, str]] = Field(default_factory=dict, description="Mapping of sample ID to R1/R2 fastq file paths")
+    chemistry: str = Field("10xv3", description="Single-cell chemistry, e.g., 10xv3, 10xv2")
     has_spatial_coordinates: bool = Field(False, description="Whether spatial 2D/3D coordinates are present")
     has_rna_velocity: bool = Field(False, description="Whether spliced/unspliced velocity layers are present")
     has_multiple_timepoints: bool = Field(False, description="Whether temporal longitudinal series are present")

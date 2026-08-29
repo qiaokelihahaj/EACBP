@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 
 class ArtifactType(str, Enum):
+    FASTQ = "FASTQ"
     ANNDATA = "AnnData"
     SPATIAL_DATA = "SpatialData"
     TABLE = "Table"
