@@ -1,4 +1,4 @@
-﻿'''
+'''
 EACBP Autonomous FASTQ-to-Biology Scientific OS Pipeline Runner.
 Executes end-to-end single-cell transcriptomics study directly from raw FASTQ reads:
   1. FASTQ Quantification (kb-python / STARsolo / native SC quantifier)
@@ -76,16 +76,28 @@ def run_fastq_to_biology(
     # 3. Register Raw FASTQ Artifact
     samples = {}
     if fastq_dir and fastq_dir.exists():
-        print(f"\n[Plane 2: Compute] Scanning raw FASTQ files in: {fastq_dir}")
-        for sample_folder in fastq_dir.glob("*"):
-            if sample_folder.is_dir():
-                s_name = sample_folder.name
-                fqs = list(sample_folder.glob("**/*.fastq.gz")) + list(sample_folder.glob("**/*.fq.gz"))
-                r1 = [str(f) for f in fqs if "_R1" in f.name or "_1." in f.name]
-                r2 = [str(f) for f in fqs if "_R2" in f.name or "_2." in f.name]
-                if r1 and r2:
-                    samples[s_name] = {"R1": r1[0], "R2": r2[0]}
-                    print(f"  Found sample '{s_name}': R1={Path(r1[0]).name}, R2={Path(r2[0]).name}")
+        print(f"\n[Plane 2: Compute] Scanning raw FASTQ files recursively in: {fastq_dir}")
+        all_fqs = list(fastq_dir.rglob("*.fastq.gz")) + list(fastq_dir.rglob("*.fq.gz"))
+        print(f"  Discovered {len(all_fqs)} total FASTQ sequencing files.")
+        
+        # Group by sample (e.g. P12K8_con, P12K8_cKO)
+        sample_names = set()
+        for fq in all_fqs:
+            for part in fq.parts:
+                if any(k in part.lower() for k in ["con", "cko", "k8", "p12", "sample"]):
+                    sample_names.add(part)
+        
+        for s_name in sorted(sample_names):
+            s_fqs = [f for f in all_fqs if s_name in f.parts and "cdna" in str(f).lower()]
+            if not s_fqs:
+                s_fqs = [f for f in all_fqs if s_name in f.parts]
+            r1 = [str(f) for f in s_fqs if "_R1" in f.name or "_1." in f.name]
+            r2 = [str(f) for f in s_fqs if "_R2" in f.name or "_2." in f.name]
+            if r1 and r2:
+                samples[s_name] = {"R1": r1[0], "R2": r2[0]}
+                sz1 = Path(r1[0]).stat().st_size / 1e9 if Path(r1[0]).exists() else 0.0
+                sz2 = Path(r2[0]).stat().st_size / 1e9 if Path(r2[0]).exists() else 0.0
+                print(f"  Matched Sample '{s_name}': R1={Path(r1[0]).name} ({sz1:.1f} GB), R2={Path(r2[0]).name} ({sz2:.1f} GB)")
 
     if not samples:
         print(f"\n[Plane 2: Compute] Initializing FASTQ manifest for {study_id}...")
