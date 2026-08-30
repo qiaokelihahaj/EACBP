@@ -12,13 +12,16 @@ class SCData:
 
     def __init__(
         self,
-        X: np.ndarray,
+        X: Any,
         obs: pd.DataFrame,
         var: pd.DataFrame,
         obsm: Optional[Dict[str, np.ndarray]] = None,
         uns: Optional[Dict[str, Any]] = None,
     ):
-        self.X = np.asarray(X, dtype=np.float32)
+        if hasattr(X, "tocsr"):
+            self.X = X.tocsr()
+        else:
+            self.X = np.asarray(X, dtype=np.float32)
         self.obs = obs.copy()
         self.var = var.copy()
         self.obsm = obsm or {}
@@ -108,9 +111,16 @@ class SCData:
 
         # Handle sparse or dense matrix
         X = adata.X
-        if hasattr(X, "toarray"):
-            X = X.toarray()
-        X = np.asarray(X, dtype=np.float32)
+        if hasattr(X, "tocsr"):
+            X = X.tocsr()
+            n_counts = np.asarray(X.sum(axis=1)).flatten()
+            n_genes = np.asarray((X > 0).sum(axis=1)).flatten()
+            n_cells_per_gene = np.asarray((X > 0).sum(axis=0)).flatten()
+        else:
+            X = np.asarray(X, dtype=np.float32)
+            n_counts = np.sum(X, axis=1)
+            n_genes = np.sum(X > 0, axis=1)
+            n_cells_per_gene = np.sum(X > 0, axis=0)
 
         obs = adata.obs.copy()
         var = adata.var.copy()
@@ -119,15 +129,15 @@ class SCData:
         if "cell_id" not in obs.columns:
             obs["cell_id"] = obs.index.astype(str)
         if "n_counts" not in obs.columns:
-            obs["n_counts"] = np.sum(X, axis=1)
+            obs["n_counts"] = n_counts
         if "n_genes" not in obs.columns:
-            obs["n_genes"] = np.sum(X > 0, axis=1)
+            obs["n_genes"] = n_genes
 
         # Ensure essential columns exist in var
         if "gene_name" not in var.columns:
             var["gene_name"] = var.index.astype(str)
         if "n_cells" not in var.columns:
-            var["n_cells"] = np.sum(X > 0, axis=0)
+            var["n_cells"] = n_cells_per_gene
 
         obsm_dict = {}
         for k in adata.obsm.keys():

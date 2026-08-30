@@ -88,7 +88,16 @@ class ClusteringCapability(BaseCapability):
 
         data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
         
-        emb = data.obsm.get("X_pca", data.X[:, :min(20, data.n_vars)])
+        emb = data.obsm.get("X_pca", None)
+        if emb is None:
+            emb = data.X[:, :min(20, data.n_vars)]
+            if hasattr(emb, "toarray"):
+                emb = emb.toarray()
+        else:
+            if hasattr(emb, "toarray"):
+                emb = emb.toarray()
+            emb = np.asarray(emb, dtype=np.float32)
+
         k_clusters = contract.parameters.get("k_clusters", 4)
         seed = contract.parameters.get("random_seed", 42)
 
@@ -97,8 +106,8 @@ class ClusteringCapability(BaseCapability):
         silhouette = calculate_silhouette(emb, labels)
 
         # 2D UMAP-like mock projection for visualization
-        u1 = emb[:, 0] + np.sin(emb[:, 1]) * 0.5
-        u2 = emb[:, 1] + np.cos(emb[:, 0]) * 0.5
+        u1 = emb[:, 0] + np.sin(emb[:, 1] if emb.shape[1] > 1 else emb[:, 0]) * 0.5
+        u2 = emb[:, 1] if emb.shape[1] > 1 else emb[:, 0] + np.cos(emb[:, 0]) * 0.5
         umap_coords = np.column_stack([u1, u2])
 
         # Automatic marker-guided cell type identification

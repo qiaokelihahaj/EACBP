@@ -15,12 +15,26 @@ from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
 
 
-def compute_pca(X: np.ndarray, n_components: int = 30) -> np.ndarray:
-    """Standard SVD / PCA dimensionality reduction."""
-    X_centered = X - np.mean(X, axis=0, keepdims=True)
-    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
-    k = min(n_components, X.shape[0], X.shape[1])
-    return U[:, :k] * S[:k]
+def compute_pca(X: Any, n_components: int = 30) -> np.ndarray:
+    """Fast PCA dimensionality reduction compatible with sparse and dense matrices using scipy."""
+    if hasattr(X, "tocsr"):
+        X_sp = X.tocsr().astype(np.float32)
+        k = min(n_components, max(1, X_sp.shape[0] - 2), max(1, X_sp.shape[1] - 2))
+        try:
+            from scipy.sparse.linalg import svds
+            u, s, vt = svds(X_sp, k=k)
+            return u[:, ::-1] * s[::-1]
+        except Exception:
+            X_dense = X_sp.toarray()
+            X_centered = X_dense - np.mean(X_dense, axis=0, keepdims=True)
+            u, s, vt = np.linalg.svd(X_centered, full_matrices=False)
+            return u[:, :k] * s[:k]
+    else:
+        X_dense = np.asarray(X, dtype=np.float32)
+        X_centered = X_dense - np.mean(X_dense, axis=0, keepdims=True)
+        u, s, vt = np.linalg.svd(X_centered, full_matrices=False)
+        k = min(n_components, X_dense.shape[0], X_dense.shape[1])
+        return u[:, :k] * s[:k]
 
 
 def calculate_batch_mixing_score(embedding: np.ndarray, batches: np.ndarray, k: int = 15) -> float:

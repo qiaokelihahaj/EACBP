@@ -55,8 +55,8 @@ class DifferentialAbundanceCapability(BaseCapability):
         obs = data.obs
 
         cond_col = "condition" if "condition" in obs.columns else obs.columns[0]
-        mouse_col = "mouse_id" if "mouse_id" in obs.columns else "sample_id"
-        state_col = contract.parameters.get("state_col", "microglia_state" if "microglia_state" in obs.columns else "leiden")
+        mouse_col = next((c for c in ["mouse_id", "sample_id", "sample", "donor", "donor_id"] if c in obs.columns), obs.columns[0])
+        state_col = contract.parameters.get("state_col", "cell_type" if "cell_type" in obs.columns else "microglia_state" if "microglia_state" in obs.columns else "leiden")
 
         # Compute state proportions per donor mouse
         ct_table = pd.crosstab([obs[mouse_col], obs[cond_col]], obs[state_col], normalize="index")
@@ -145,19 +145,19 @@ class DifferentialExpressionCapability(BaseCapability):
         gene_names = data.var["gene_name"].values if "gene_name" in data.var.columns else np.array([f"G_{i}" for i in range(data.n_vars)])
 
         cond_col = "condition" if "condition" in obs.columns else obs.columns[0]
-        mouse_col = "mouse_id" if "mouse_id" in obs.columns else None
+        mouse_col = next((c for c in ["mouse_id", "sample_id", "sample", "donor", "donor_id"] if c in obs.columns), None)
         
-        conditions = obs[cond_col].unique()
+        conditions = list(obs[cond_col].unique())
         if len(conditions) < 2:
             raise ValueError(f"Need at least 2 conditions for DEG, found: {conditions}")
 
-        cond_ad = "AD" if "AD" in conditions else conditions[0]
-        cond_ctrl = "control" if "control" in conditions else conditions[1]
+        cond_ad = "cKO" if "cKO" in conditions else "AD" if "AD" in conditions else conditions[0]
+        cond_ctrl = "control" if "control" in conditions else "con" if "con" in conditions else conditions[1]
 
         # Audit biological replicates
         if mouse_col:
-            n_reps_ad = obs[obs[cond_col] == cond_ad][mouse_col].nunique()
-            n_reps_ctrl = obs[obs[cond_col] == cond_ctrl][mouse_col].nunique()
+            n_reps_ad = int(obs[obs[cond_col] == cond_ad][mouse_col].nunique())
+            n_reps_ctrl = int(obs[obs[cond_col] == cond_ctrl][mouse_col].nunique())
         else:
             n_reps_ad, n_reps_ctrl = 1, 1
 
@@ -169,8 +169,8 @@ class DifferentialExpressionCapability(BaseCapability):
             donors_ad = obs[obs[cond_col] == cond_ad][mouse_col].unique()
             donors_ctrl = obs[obs[cond_col] == cond_ctrl][mouse_col].unique()
 
-            bulk_ad = np.array([data.X[obs[mouse_col] == d].mean(axis=0) for d in donors_ad])
-            bulk_ctrl = np.array([data.X[obs[mouse_col] == d].mean(axis=0) for d in donors_ctrl])
+            bulk_ad = np.array([np.asarray(data.X[obs[mouse_col] == d].mean(axis=0)).flatten() for d in donors_ad])
+            bulk_ctrl = np.array([np.asarray(data.X[obs[mouse_col] == d].mean(axis=0)).flatten() for d in donors_ctrl])
 
             mean_ad = np.mean(bulk_ad, axis=0)
             mean_ctrl = np.mean(bulk_ctrl, axis=0)
@@ -201,16 +201,18 @@ class DifferentialExpressionCapability(BaseCapability):
             cells_ad = data.X[mask_ad]
             cells_ctrl = data.X[mask_ctrl]
 
-            mean_ad = np.mean(cells_ad, axis=0)
-            mean_ctrl = np.mean(cells_ctrl, axis=0)
+            mean_ad = np.asarray(cells_ad.mean(axis=0)).flatten()
+            mean_ctrl = np.asarray(cells_ctrl.mean(axis=0)).flatten()
             log2_fc = np.log2((mean_ad + 1e-4) / (mean_ctrl + 1e-4))
 
-            # Wilcoxon / Mann-Whitney U test per gene
+            # Welch / t-test per gene for speed & safety on sparse columns
             p_vals = []
             for j in range(data.n_vars):
                 try:
-                    u_stat, p = stats.mannwhitneyu(cells_ad[:, j], cells_ctrl[:, j], alternative="two-sided")
-                    p_vals.append(p)
+                    v_ad = cells_ad[:, j].toarray().flatten() if hasattr(cells_ad, "toarray") else cells_ad[:, j]
+                    v_ctrl = cells_ctrl[:, j].toarray().flatten() if hasattr(cells_ctrl, "toarray") else cells_ctrl[:, j]
+                    _, p = stats.ttest_ind(v_ad, v_ctrl, equal_var=False)
+                    p_vals.append(p if not np.isnan(p) else 1.0)
                 except Exception:
                     p_vals.append(1.0)
             p_vals = np.array(p_vals)

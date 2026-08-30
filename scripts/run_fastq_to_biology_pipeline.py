@@ -46,6 +46,10 @@ def run_fastq_to_biology(
     output_dir = output_dir or PROJECT_ROOT / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     storage_dir = output_dir / "artifacts_fastq_to_biology"
+    if storage_dir.exists():
+        import shutil
+        shutil.rmtree(storage_dir)
+    storage_dir.mkdir(parents=True, exist_ok=True)
     reports_dir = output_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
