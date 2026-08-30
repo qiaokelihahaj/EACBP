@@ -55,7 +55,7 @@ class PayloadSerializer:
                     f.write(bytes(payload))
 
         elif artifact_type in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA):
-            # Check if AnnData is available and object is AnnData
+            # Write standard h5ad artifact
             try:
                 import anndata as ad
                 if isinstance(payload, ad.AnnData):
@@ -64,7 +64,21 @@ class PayloadSerializer:
                         data = f.read()
                         hasher.update(data)
                     return f"sha256:{hasher.hexdigest()}", len(data)
-            except ImportError:
+                elif hasattr(payload, "to_anndata"):
+                    payload.to_anndata().write_h5ad(target_path)
+                    with open(target_path, "rb") as f:
+                        data = f.read()
+                        hasher.update(data)
+                    return f"sha256:{hasher.hexdigest()}", len(data)
+                elif isinstance(payload, dict) and ("X" in payload or "obs" in payload):
+                    from eacbp.capabilities.sc_data import SCData
+                    sc_inst = SCData.from_dict(payload)
+                    sc_inst.to_anndata().write_h5ad(target_path)
+                    with open(target_path, "rb") as f:
+                        data = f.read()
+                        hasher.update(data)
+                    return f"sha256:{hasher.hexdigest()}", len(data)
+            except (ImportError, Exception):
                 pass
 
             # Fallback lightweight AnnData dictionary / custom serializer
@@ -74,10 +88,12 @@ class PayloadSerializer:
                     if k == "obsm" and isinstance(v, dict):
                         for obsm_k, obsm_v in v.items():
                             npz_dict[f"__obsm__{obsm_k}"] = np.asarray(obsm_v, dtype=np.float32)
+                    elif hasattr(v, "tocsr"):
+                        import scipy.sparse as sp
+                        npz_dict[k] = v.toarray()
                     elif isinstance(v, (np.ndarray, list)):
                         npz_dict[k] = np.asarray(v)
                     elif isinstance(v, pd.DataFrame):
-                        # Convert dataframe to records
                         npz_dict[f"__df__{k}"] = np.array(json.dumps(v.to_dict(orient="records"), default=str))
                     elif isinstance(v, dict):
                         npz_dict[f"__dict__{k}"] = np.array(json.dumps(v, default=str))
@@ -126,7 +142,8 @@ class PayloadSerializer:
             try:
                 import anndata as ad
                 if target_path.suffix == ".h5ad":
-                    return ad.read_h5ad(target_path)
+                    from eacbp.capabilities.sc_data import SCData
+                    return SCData.from_anndata(ad.read_h5ad(target_path))
             except (ImportError, Exception):
                 pass
 
