@@ -81,7 +81,7 @@ class NormalizationCapability(BaseCapability):
                 "n_cells": norm_data.n_obs,
                 "n_genes": norm_data.n_vars,
                 "n_hvg": int(hvg_mask.sum()),
-                "mean_expression": float(np.mean(log_X)),
+                "mean_expression": mean_expr,
             }
         )
 
