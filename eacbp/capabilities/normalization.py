@@ -33,25 +33,37 @@ class NormalizationCapability(BaseCapability):
         target_sum = contract.parameters.get("target_sum", 10000.0)
         n_top_genes = contract.parameters.get("n_top_genes", 300)
 
-        # 1. Total count normalization
-        counts_per_cell = data.X.sum(axis=1, keepdims=True)
-        counts_per_cell[counts_per_cell == 0] = 1.0
-        norm_X = (data.X / counts_per_cell) * target_sum
+        # 1. Total count normalization & Log1p transformation
+        if hasattr(data.X, "tocsr"):
+            import scanpy as sc
+            adata = data.to_anndata()
+            sc.pp.normalize_total(adata, target_sum=target_sum)
+            sc.pp.log1p(adata)
+            sc.pp.highly_variable_genes(adata, n_top_genes=min(n_top_genes, adata.n_vars), subset=False)
+            norm_data = SCData.from_anndata(adata)
+            norm_data.uns["normalization"] = {"target_sum": target_sum, "log1p": True}
+            hvg_mask = norm_data.var["highly_variable"].values if "highly_variable" in norm_data.var.columns else np.ones(data.n_vars, dtype=bool)
+            mean_expr = float(norm_data.X.data.mean()) if hasattr(norm_data.X, "data") and len(norm_data.X.data) > 0 else 0.0
+        else:
+            counts_per_cell = data.X.sum(axis=1, keepdims=True)
+            counts_per_cell[counts_per_cell == 0] = 1.0
+            norm_X = (data.X / counts_per_cell) * target_sum
 
-        # 2. Log1p transformation
-        log_X = np.log1p(norm_X)
+            # 2. Log1p transformation
+            log_X = np.log1p(norm_X)
 
-        # 3. Find Highly Variable Genes (HVG) based on variance
-        gene_variances = np.var(log_X, axis=0)
-        top_hvg_indices = np.argsort(gene_variances)[::-1][:min(n_top_genes, data.n_vars)]
-        hvg_mask = np.zeros(data.n_vars, dtype=bool)
-        hvg_mask[top_hvg_indices] = True
+            # 3. Find Highly Variable Genes (HVG) based on variance
+            gene_variances = np.var(log_X, axis=0)
+            top_hvg_indices = np.argsort(gene_variances)[::-1][:min(n_top_genes, data.n_vars)]
+            hvg_mask = np.zeros(data.n_vars, dtype=bool)
+            hvg_mask[top_hvg_indices] = True
 
-        norm_data = data.copy()
-        norm_data.X = log_X
-        norm_data.var["highly_variable"] = hvg_mask
-        norm_data.var["variance"] = gene_variances
-        norm_data.uns["normalization"] = {"target_sum": target_sum, "log1p": True}
+            norm_data = data.copy()
+            norm_data.X = log_X
+            norm_data.var["highly_variable"] = hvg_mask
+            norm_data.var["variance"] = gene_variances
+            norm_data.uns["normalization"] = {"target_sum": target_sum, "log1p": True}
+            mean_expr = float(np.mean(log_X))
 
         uri_obj = ArtifactURI.parse(in_uri)
         out_uri = f"adata://{uri_obj.study_id}/normalized/v2"

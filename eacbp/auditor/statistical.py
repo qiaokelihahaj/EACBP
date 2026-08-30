@@ -170,7 +170,10 @@ class StatisticalValidator(BaseAuditor):
             # Check expression non-negativity for AnnData output
             if meta.type == ArtifactType.ANNDATA:
                 data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-                x_min = float(np.min(data.X))
+                if hasattr(data.X, "tocsr"):
+                    x_min = float(np.min(data.X.data)) if len(data.X.data) > 0 else 0.0
+                else:
+                    x_min = float(np.min(data.X))
                 report.add_check(
                     name="perturbation_shift_bounds_check",
                     passed=(x_min >= 0.0),

@@ -33,14 +33,24 @@ class TrajectoryCapability(BaseCapability):
         meta, payload = registry.get(in_uri)
 
         data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-        emb = data.obsm.get("X_pca", data.X[:, :min(10, data.n_vars)])
+        emb = data.obsm.get("X_pca", None)
+        if emb is None:
+            emb = data.X[:, :min(10, data.n_vars)]
+            if hasattr(emb, "toarray"):
+                emb = emb.toarray()
+        else:
+            if hasattr(emb, "toarray"):
+                emb = emb.toarray()
+            emb = np.asarray(emb, dtype=np.float32)
+
         gene_names = data.var["gene_name"].values if "gene_name" in data.var.columns else np.array([f"G_{i}" for i in range(data.n_vars)])
 
         # Determine root: e.g. state M1 (homeostatic) or lowest Apoe expression
         root_idx = 0
         if "Apoe" in list(gene_names):
             apoe_idx = list(gene_names).index("Apoe")
-            root_idx = int(np.argmin(data.X[:, apoe_idx]))
+            apoe_col = data.X[:, apoe_idx].toarray().flatten() if hasattr(data.X, "toarray") else data.X[:, apoe_idx]
+            root_idx = int(np.argmin(apoe_col))
 
         # Pseudotime: geodesic distance on PCA graph from root
         dists_from_root = cdist(emb[[root_idx]], emb)[0]
@@ -66,7 +76,7 @@ class TrajectoryCapability(BaseCapability):
         # Dynamic genes correlated with pseudotime
         dynamic_genes = []
         for j in range(min(50, data.n_vars)):
-            g_expr = data.X[:, j]
+            g_expr = data.X[:, j].toarray().flatten() if hasattr(data.X, "toarray") else data.X[:, j]
             r, p = stats.spearmanr(pseudotime, g_expr)
             if not np.isnan(r) and p < 0.01:
                 dynamic_genes.append({

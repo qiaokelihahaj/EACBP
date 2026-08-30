@@ -60,9 +60,13 @@ class ComputationalValidator(BaseAuditor):
             )
 
             # Check NaNs / Infs in X
-            x_arr = np.asarray(data.X, dtype=np.float32)
-            nan_count = int(np.isnan(x_arr).sum())
-            inf_count = int(np.isinf(x_arr).sum())
+            if hasattr(data.X, "tocsr"):
+                nan_count = int(np.isnan(data.X.data).sum())
+                inf_count = int(np.isinf(data.X.data).sum())
+            else:
+                x_arr = np.asarray(data.X, dtype=np.float32)
+                nan_count = int(np.isnan(x_arr).sum())
+                inf_count = int(np.isinf(x_arr).sum())
             report.add_check(
                 name="expression_finite_values",
                 passed=(nan_count == 0 and inf_count == 0),

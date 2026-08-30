@@ -159,7 +159,7 @@ class GeneticPerturbationCapability(BaseCapability):
         meta, payload = registry.get(in_uri)
 
         data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-        X = data.X.copy()
+        X = data.X.toarray() if hasattr(data.X, "toarray") else data.X.copy()
         n_cells, n_genes = X.shape
 
         # Resolve gene names

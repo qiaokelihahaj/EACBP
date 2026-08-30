@@ -140,7 +140,7 @@ class CompoundPerturbationCapability(BaseCapability):
         # Handle input either as SCData or Table
         if isinstance(payload, SCData) or (isinstance(payload, dict) and "X" in payload):
             data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-            X = data.X.copy()
+            X = data.X.toarray() if hasattr(data.X, "toarray") else data.X.copy()
             obs = data.obs.copy()
             n_cells, n_genes = X.shape
             

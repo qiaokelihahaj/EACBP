@@ -124,7 +124,10 @@ class QCCapability(BaseCapability):
         max_mito_pct = contract.parameters.get("max_mito_pct", 20.0)
 
         obs = data.obs
-        n_genes_expressed = (data.X > 0).sum(axis=1)
+        if hasattr(data.X, "tocsr"):
+            n_genes_expressed = np.asarray((data.X > 0).sum(axis=1)).flatten()
+        else:
+            n_genes_expressed = np.asarray((data.X > 0).sum(axis=1)).flatten()
         mito_pct = obs["percent_mito"].values if "percent_mito" in obs.columns else np.zeros(data.n_obs)
 
         # Quality mask

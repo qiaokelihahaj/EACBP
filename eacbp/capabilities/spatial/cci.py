@@ -136,7 +136,10 @@ def compute_spatial_cci(
     for ct in unique_cell_types:
         mask = (labels == ct)
         if mask.sum() > 0:
-            mean_expr[ct] = np.mean(data.X[mask], axis=0)
+            if hasattr(data.X, "tocsr"):
+                mean_expr[ct] = np.asarray(data.X[mask].mean(axis=0)).flatten()
+            else:
+                mean_expr[ct] = np.asarray(np.mean(data.X[mask], axis=0)).flatten()
         else:
             mean_expr[ct] = np.zeros(data.n_vars)
 
