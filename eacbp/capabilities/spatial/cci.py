@@ -7,6 +7,7 @@ and spatial permutation significance testing with FDR correction.
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
 from eacbp.schemas.artifact import ArtifactType
@@ -16,7 +17,7 @@ from eacbp.capabilities.spatial.domain import (
     validate_spatial_coordinates,
     build_spatial_neighborhood_graph,
 )
-from eacbp.capabilities.spatial.autocorrelation import benjamini_hochberg
+from eacbp.numerics import benjamini_hochberg
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
 
@@ -68,8 +69,11 @@ def calculate_spatial_contact_density(
             if n_b == 0:
                 continue
             
-            sub_w = W[np.ix_(mask_a, mask_b)]
-            total_edges = float(np.sum(sub_w))
+            if sparse.issparse(W):
+                total_edges = float(W[mask_a][:, mask_b].sum())
+            else:
+                sub_w = W[np.ix_(mask_a, mask_b)]
+                total_edges = float(np.sum(sub_w))
             w_density = total_edges / float(n_a * n_b)
             densities[(a, b)] = float(w_density)
             
@@ -88,7 +92,7 @@ def compute_spatial_cci(
     """
     Computes proximity-weighted ligand-receptor interaction scores and permutation p-values.
     """
-    np.random.seed(random_seed)
+    rng = np.random.default_rng(random_seed)
     
     # 1. Determine cell type annotations
     obs = data.obs
@@ -96,10 +100,8 @@ def compute_spatial_cci(
         labels = obs[cell_type_col].astype(str).values
     elif "spatial_domain" in obs.columns:
         labels = obs["spatial_domain"].astype(str).values
-    elif "cell_type_ground_truth" in obs.columns:
-        labels = obs["cell_type_ground_truth"].astype(str).values
-    elif "leiden" in obs.columns:
-        labels = obs["leiden"].astype(str).values
+    elif "cluster" in obs.columns:
+        labels = obs["cluster"].astype(str).values
     else:
         labels = np.array(["CellType_All"] * data.n_obs)
 
@@ -181,7 +183,7 @@ def compute_spatial_cci(
 
     n_perms = max(10, n_permutations)
     for _ in range(n_perms):
-        perm_labels = np.random.permutation(labels)
+        perm_labels = rng.permutation(labels)
         perm_densities = calculate_spatial_contact_density(perm_labels, unique_cell_types, W)
         
         for k, inter in enumerate(interactions):
@@ -266,18 +268,22 @@ class CellCellCommunicationCapability(BaseCapability):
 
         if coords is None:
             # Non-spatial standard single-cell CCI (CellChat / CellPhoneDB style)
+            # Keep the old global-contact fallback for small non-spatial
+            # inputs.  Large spatial inputs always use the sparse kNN path.
+            if data.n_obs > 2000:
+                raise ValueError("CCI without spatial coordinates is limited to 2000 cells; provide coordinates for sparse kNN contacts")
             W = np.ones((data.n_obs, data.n_obs), dtype=np.float32) / float(max(1, data.n_obs))
             is_spatial = False
         else:
             validated_coords = validate_spatial_coordinates(coords, data.n_obs)
             is_spatial = True
             # Spatial connectivity graph safely loaded
-            if "spatial_connectivities" in data.obsm and isinstance(data.obsm["spatial_connectivities"], np.ndarray):
-                W = np.asarray(data.obsm["spatial_connectivities"], dtype=np.float32)
-            elif "spatial_connectivities" in data.uns and isinstance(data.uns["spatial_connectivities"], np.ndarray):
-                W = np.asarray(data.uns["spatial_connectivities"], dtype=np.float32)
-            elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and isinstance(data.obsp["spatial_connectivities"], np.ndarray):
-                W = np.asarray(data.obsp["spatial_connectivities"], dtype=np.float32)
+            if "spatial_connectivities" in data.obsm and (isinstance(data.obsm["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsm["spatial_connectivities"])):
+                W = data.obsm["spatial_connectivities"]
+            elif "spatial_connectivities" in data.uns and (isinstance(data.uns["spatial_connectivities"], np.ndarray) or sparse.issparse(data.uns["spatial_connectivities"])):
+                W = data.uns["spatial_connectivities"]
+            elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and (isinstance(data.obsp["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsp["spatial_connectivities"])):
+                W = data.obsp["spatial_connectivities"]
             else:
                 W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors)
 

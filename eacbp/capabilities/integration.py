@@ -37,14 +37,21 @@ def compute_pca(X: Any, n_components: int = 30) -> np.ndarray:
         return u[:, :k] * s[:k]
 
 
-def calculate_batch_mixing_score(embedding: np.ndarray, batches: np.ndarray, k: int = 15) -> float:
+def calculate_batch_mixing_score(
+    embedding: np.ndarray,
+    batches: np.ndarray,
+    k: int = 15,
+    random_seed: int = 42,
+) -> float:
     """Calculates average fraction of nearest neighbors from different batches."""
-    if len(np.unique(batches)) <= 1 or embedding.shape[0] < k:
+    if len(np.unique(batches)) <= 1 or embedding.shape[0] <= 1:
         return 1.0
+    k = min(max(1, int(k)), embedding.shape[0] - 1)
     
     # Subsample if too large for speed
     n = embedding.shape[0]
-    indices = np.random.choice(n, size=min(n, 300), replace=False) if n > 300 else np.arange(n)
+    rng = np.random.default_rng(random_seed)
+    indices = rng.choice(n, size=min(n, 300), replace=False) if n > 300 else np.arange(n)
     dists = cdist(embedding[indices], embedding)
     
     mixing_scores = []
@@ -58,16 +65,31 @@ def calculate_batch_mixing_score(embedding: np.ndarray, batches: np.ndarray, k: 
 
 
 class IntegrationCapability(BaseCapability):
-    """Evaluates batch effects and performs integration (e.g. Harmony-like or No-Correction)."""
+    """Evaluate batch mixing and apply deterministic batch mean centering.
 
-    def __init__(self, implementation_id: str = "harmony"):
+    The previous implementation exposed the mean-shift calculation as
+    ``harmony``.  Harmony is an iterative soft-clustering algorithm and is
+    not implemented here.  ``harmony`` is therefore accepted only as a
+    compatibility request alias; ``method_used`` is always the honest
+    ``batch_mean_centering_v1`` identifier.
+    """
+
+    def __init__(self, implementation_id: str = "batch_mean_centering_v1"):
+        requested_id = implementation_id
+        canonical_id = "no_correction_v1" if implementation_id in {"no_correction", "no_correction_v1"} else "batch_mean_centering_v1"
         super().__init__(
             capability_name="integration",
-            implementation_id=implementation_id,
+            implementation_id=canonical_id,
             implementation_type=ImplementationType.PYTHON_TOOL,
             accepts_types=[ArtifactType.ANNDATA],
             output_types=[ArtifactType.ANNDATA],
         )
+        self.requested_implementation_id = requested_id
+        self.legacy_aliases = {
+            "harmony": "batch_mean_centering_v1",
+            "harmony_v1": "batch_mean_centering_v1",
+            "no_correction": "no_correction_v1",
+        }
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
@@ -88,10 +110,12 @@ class IntegrationCapability(BaseCapability):
         batch_col = "batch" if "batch" in data.obs.columns else None
         batches = data.obs[batch_col].values if batch_col else np.array(["b1"] * data.n_obs)
 
-        pre_mixing = calculate_batch_mixing_score(pca_emb, batches)
+        seed = int(contract.parameters.get("random_seed", 42))
+        pre_mixing = calculate_batch_mixing_score(pca_emb, batches, random_seed=seed)
 
-        if self.implementation_id == "harmony" and batch_col:
-            # Batch alignment adjustment on PCA space
+        if self.implementation_id == "batch_mean_centering_v1" and batch_col:
+            # Per-batch mean centering in PCA space.  This is deliberately a
+            # simple deterministic correction, not Harmony.
             adjusted_pca = pca_emb.copy()
             unique_batches = np.unique(batches)
             global_mean = np.mean(adjusted_pca, axis=0, keepdims=True)
@@ -100,17 +124,19 @@ class IntegrationCapability(BaseCapability):
                 batch_mean = np.mean(adjusted_pca[mask], axis=0, keepdims=True)
                 adjusted_pca[mask] -= 0.8 * (batch_mean - global_mean)
             integrated_emb = adjusted_pca
-            method_desc = "harmony_pca_alignment"
+            method_desc = "batch_mean_centering_pca"
         else:
             integrated_emb = pca_emb
             method_desc = "no_correction_baseline"
 
-        post_mixing = calculate_batch_mixing_score(integrated_emb, batches)
+        post_mixing = calculate_batch_mixing_score(integrated_emb, batches, random_seed=seed)
 
         integrated_data = data.copy()
         integrated_data.obsm["X_pca"] = integrated_emb
         integrated_data.uns["integration"] = {
             "method": self.implementation_id,
+            "requested_method": self.requested_implementation_id,
+            "algorithm": "per_batch_pca_mean_centering" if self.implementation_id == "batch_mean_centering_v1" else "identity",
             "pre_batch_mixing": pre_mixing,
             "post_batch_mixing": post_mixing,
         }
@@ -126,7 +152,7 @@ class IntegrationCapability(BaseCapability):
             created_by_task=contract.task_id,
             operation=f"batch_integration_{self.implementation_id}",
             parent_uris=[in_uri],
-            parameters={"method": self.implementation_id, "n_components": n_comps},
+            parameters={"method": self.implementation_id, "requested_method": self.requested_implementation_id, "n_components": n_comps, "random_seed": seed},
             summary_metrics={
                 "n_cells": integrated_data.n_obs,
                 "pre_batch_mixing": pre_mixing,
@@ -146,6 +172,6 @@ class IntegrationCapability(BaseCapability):
             metrics={
                 "pre_batch_mixing": pre_mixing,
                 "post_batch_mixing": post_mixing,
-                "batch_correction_applied": self.implementation_id == "harmony",
+                "batch_correction_applied": self.implementation_id == "batch_mean_centering_v1",
             }
         )

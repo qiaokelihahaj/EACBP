@@ -37,8 +37,16 @@ def test_fastq_quantification_capability(tmp_path):
     study_id = "test_quant_study_001"
     fastq_manifest = {
         "samples": {
-            "P12K8_con": {"R1": "fake_con_R1.fq.gz", "R2": "fake_con_R2.fq.gz"},
-            "P12K8_cKO": {"R1": "fake_cko_R1.fq.gz", "R2": "fake_cko_R2.fq.gz"},
+            "P12K8_con": {
+                "R1": "fake_con_R1.fq.gz",
+                "R2": "fake_con_R2.fq.gz",
+                "metadata": {"donor": "con_01", "condition": "con", "batch": "batch_1"},
+            },
+            "P12K8_cKO": {
+                "R1": "fake_cko_R1.fq.gz",
+                "R2": "fake_cko_R2.fq.gz",
+                "metadata": {"donor": "cko_01", "condition": "cKO", "batch": "batch_1"},
+            },
         },
         "chemistry": "10xv3",
         "species": "mus_musculus",
@@ -61,7 +69,7 @@ def test_fastq_quantification_capability(tmp_path):
         input_artifacts=[in_uri],
         allowed_operations=["kb_count_alignment", "sc_quant_demultiplex", "umi_deduplication", "gene_annotation_mapping"],
         forbidden_operations=["filter_cells", "normalize", "recluster"],
-        parameters={"chemistry": "10xv3", "species": "mus_musculus", "target_gene": "Kat8", "n_cells": 300, "n_genes": 80},
+        parameters={"chemistry": "10xv3", "species": "mus_musculus", "target_gene": "Kat8", "n_cells": 300, "n_genes": 80, "mode": "demo"},
         expected_outputs=[f"adata://{study_id}/raw/v1"],
     )
 
@@ -147,8 +155,16 @@ def test_full_fastq_to_biology_autonomous_pipeline(tmp_path):
     # Register initial FASTQ reads artifact
     fastq_manifest = {
         "samples": {
-            "P12K8_con": {"R1": "/data/P12K8_con_R1.fq.gz", "R2": "/data/P12K8_con_R2.fq.gz"},
-            "P12K8_cKO": {"R1": "/data/P12K8_cKO_R1.fq.gz", "R2": "/data/P12K8_cKO_R2.fq.gz"},
+            "P12K8_con": {
+                "R1": "/data/P12K8_con_R1.fq.gz",
+                "R2": "/data/P12K8_con_R2.fq.gz",
+                "metadata": {"donor": "con_01", "condition": "con", "batch": "batch_1"},
+            },
+            "P12K8_cKO": {
+                "R1": "/data/P12K8_cKO_R1.fq.gz",
+                "R2": "/data/P12K8_cKO_R2.fq.gz",
+                "metadata": {"donor": "cko_01", "condition": "cKO", "batch": "batch_1"},
+            },
         },
         "chemistry": "10xv3",
         "species": "mus_musculus",
@@ -171,11 +187,14 @@ def test_full_fastq_to_biology_autonomous_pipeline(tmp_path):
             "include_knowledge": True,
             "include_perturbation": True,
             "include_cci": True,
+            "mode": "demo",
             "n_cells": 300,
             "n_genes": 100,
         }
     )
 
+    assert summary["status"] == "success", summary["failures"]
+    assert summary["is_simulated"] is True
     assert summary["tasks_executed"] >= 11
     assert summary["artifacts_created"] >= 14
     assert summary["claims_count"] >= 4
@@ -185,10 +204,10 @@ def test_full_fastq_to_biology_autonomous_pipeline(tmp_path):
         assert report.overall_passed is True, f"Task {report.target_task_id} failed audit: {[c.message for c in report.checks if not c.passed]}"
 
     # Verify claims synthesized
-    claim_ids = list(orchestrator.evidence_graph.claim_nodes.keys())
-    assert "C101_microglia_state_transition" in claim_ids
-    assert "C102_dam_marker_expression" in claim_ids
-    assert "C103_knowledge_pathway_convergence" in claim_ids
+    claims = summary["claims"]
+    assert len(claims) >= 4
+    assert all(claim.get("support_evidence_ids") for claim in claims)
+    assert all("C101_" not in claim["claim_id"] for claim in claims)
 
     # Generate and verify markdown report
     report_gen = ScientificReportGenerator(

@@ -137,6 +137,14 @@ class BaseAgentAdapter(BaseCapability, ABC):
     @staticmethod
     def _hash_ndarray(arr: np.ndarray, hasher: Any) -> None:
         """Deterministically hashes a numpy ndarray."""
+        if hasattr(arr, "tocsr"):
+            csr = arr.tocsr(copy=True)
+            csr.sort_indices()
+            hasher.update(b"__CSR__")
+            hasher.update(str(csr.shape).encode())
+            for component in (csr.data, csr.indices, csr.indptr):
+                BaseAgentAdapter._hash_ndarray(component, hasher)
+            return
         hasher.update(b"__NDARRAY__")
         hasher.update(str(arr.shape).encode("utf-8"))
         hasher.update(str(arr.dtype).encode("utf-8"))
@@ -188,6 +196,11 @@ class BaseAgentAdapter(BaseCapability, ABC):
             self._hash_ndarray(obj.X, hasher)
             self._hash_dataframe(obj.obs, hasher)
             self._hash_dataframe(obj.var, hasher)
+            for slot in ("layers", "varm", "varp"):
+                self._hash_recursive(getattr(obj, slot, {}), hasher, depth + 1)
+            raw = getattr(obj, "raw", None)
+            if raw is not None:
+                self._hash_recursive(raw.to_adata() if hasattr(raw, "to_adata") else raw, hasher, depth + 1)
             if hasattr(obj, "obsm") and obj.obsm:
                 hasher.update(b"__OBSM__")
                 for k in sorted(obj.obsm.keys(), key=lambda x: str(x)):
@@ -207,6 +220,12 @@ class BaseAgentAdapter(BaseCapability, ABC):
             self._hash_dataframe(obj, hasher)
         elif isinstance(obj, pd.Series):
             self._hash_series(obj, hasher)
+        elif hasattr(obj, "tocsr"):
+            self._hash_ndarray(obj, hasher)
+        elif hasattr(obj, "X") and hasattr(obj, "obs") and hasattr(obj, "var"):
+            self._hash_ndarray(obj.X, hasher)
+            self._hash_dataframe(obj.obs, hasher)
+            self._hash_dataframe(obj.var, hasher)
         elif isinstance(obj, np.ndarray):
             self._hash_ndarray(obj, hasher)
         elif isinstance(obj, dict):

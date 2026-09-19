@@ -335,7 +335,8 @@ def test_knowledge_engine_discovery_mode(sample_study_manifest):
     # Claim synthesis
     claim = engine.synthesize_claim(report, claim_id="C_discovery_001")
     assert isinstance(claim, ClaimNode)
-    assert claim.language_tier == LanguageTier.LEVEL_3_SUPPORTED_INTERPRETATION
+    assert claim.language_tier == LanguageTier.LEVEL_4_HYPOTHESIS
+    assert "Unverified" in claim.statement
     assert claim.causal_status == "observational"
     assert len(claim.support_evidence_ids) == len(report.evidence_nodes)
 

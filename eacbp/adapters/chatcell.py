@@ -234,11 +234,15 @@ class ChatCellAdapter(BaseAgentAdapter):
 
         # 4. Register output artifacts
         # Artifact 1: State Transition Table
-        out_table_uri = self._generate_output_uri(
-            study_id=study_id,
-            stage="chatcell_state_transitions",
-            scheme="table",
-            version="v1",
+        out_table_uri = (
+            contract.expected_outputs[0]
+            if contract.expected_outputs
+            else self._generate_output_uri(
+                study_id=study_id,
+                stage="chatcell_state_transitions",
+                scheme="table",
+                version="v1",
+            )
         )
         self._register_versioned_artifact(
             registry=registry,
@@ -258,11 +262,15 @@ class ChatCellAdapter(BaseAgentAdapter):
         )
 
         # Artifact 2: Dialogue JSON
-        out_json_uri = self._generate_output_uri(
-            study_id=study_id,
-            stage="chatcell_dialogue",
-            scheme="json",
-            version="v1",
+        out_json_uri = (
+            contract.expected_outputs[1]
+            if len(contract.expected_outputs) > 1
+            else self._generate_output_uri(
+                study_id=study_id,
+                stage="chatcell_dialogue",
+                scheme="json",
+                version="v1",
+            )
         )
         json_payload = {
             "query": query,

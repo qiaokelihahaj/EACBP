@@ -15,6 +15,7 @@ class TaskStatus(str, Enum):
     METHOD_FAILURE = "method_failure"
     SCIENTIFIC_FAILURE = "scientific_failure"
     POLICY_VIOLATION = "policy_violation"
+    BLOCKED = "blocked"
 
 
 class ExecutionFailureType(str, Enum):
@@ -28,16 +29,17 @@ class ExecutionFailureType(str, Enum):
 
 
 class RetryPolicy(BaseModel):
-    max_execution_retry: int = Field(2, description="Max retries for execution / runtime failures")
-    max_method_retry: int = Field(2, description="Max retries for method-level algorithm fallback")
+    max_execution_retry: int = Field(2, ge=0, description="Max retries for execution / runtime failures")
+    max_method_retry: int = Field(2, ge=0, description="Max retries for method-level algorithm fallback")
     fallback_methods: List[str] = Field(default_factory=list, description="Ordered list of alternative fallback methods")
-    require_human_after: int = Field(4, description="Escalate to human review after N cumulative attempts")
+    require_human_after: int = Field(4, ge=1, description="Maximum attempts before recording a failure requiring review")
 
 
 class TaskContract(BaseModel):
     task_id: str = Field(..., description="Unique task identifier, e.g., task_018")
     capability: str = Field(..., description="Target capability name, e.g., trajectory_inference")
     method: Optional[str] = Field(None, description="Requested method implementation, e.g., cellrank, paga")
+    depends_on: List[str] = Field(default_factory=list)
     input_artifacts: List[str] = Field(default_factory=list, description="Input artifact URIs, e.g., ['adata://AD/microglia/v4']")
     
     # Contract bounds preventing agent rogue upstream alterations

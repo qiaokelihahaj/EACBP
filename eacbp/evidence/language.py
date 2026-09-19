@@ -24,7 +24,7 @@ class LanguageEnforcer:
     @staticmethod
     def audit_statement(statement: str, tier: LanguageTier, causal_status: str) -> Tuple[bool, Optional[str]]:
         """Audits whether a statement overclaims causality in observational studies."""
-        if causal_status == "observational" and tier in (LanguageTier.LEVEL_1_OBSERVATION, LanguageTier.LEVEL_2_STATISTICAL_INFERENCE):
+        if causal_status != "experimental_perturbed":
             for pattern in FORBIDDEN_CAUSAL_VERBS_OBSERVATIONAL:
                 if re.search(pattern, statement, re.IGNORECASE):
                     return False, (

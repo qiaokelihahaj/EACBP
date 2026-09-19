@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from scipy import stats
+from scipy import sparse
 
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
 from eacbp.schemas.artifact import ArtifactType
@@ -25,6 +26,9 @@ from eacbp.capabilities.base import BaseCapability, ImplementationType
 from eacbp.capabilities.sc_data import SCData
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
+
+
+MAX_COMPOUND_ELEMENTS = 20_000_000
 
 
 # Built-in reference compound signatures (log2FC profiles for known mechanisms)
@@ -90,6 +94,15 @@ def compute_cmap_cosine_discordance(
         cosine_similarity: float in [-1.0, 1.0]
         p_value: empirical significance of reversal score
     """
+    disease_sig = np.asarray(disease_sig, dtype=np.float32)
+    drug_sig = np.asarray(drug_sig, dtype=np.float32)
+    if disease_sig.ndim != 1 or drug_sig.ndim != 1 or disease_sig.shape != drug_sig.shape:
+        raise ValueError("Disease and drug signatures must be one-dimensional vectors with equal length")
+    if not np.isfinite(disease_sig).all() or not np.isfinite(drug_sig).all():
+        raise ValueError("Disease and drug signatures must contain only finite values")
+    if int(n_permutations) < 1:
+        raise ValueError("n_permutations must be at least 1")
+
     norm_dis = np.linalg.norm(disease_sig)
     norm_drug = np.linalg.norm(drug_sig)
 
@@ -100,17 +113,17 @@ def compute_cmap_cosine_discordance(
     discordance_score = float(-cosine_sim)
 
     # Permutation test
-    np.random.seed(random_seed)
+    rng = np.random.default_rng(random_seed)
     perm_scores = []
     
-    for _ in range(n_permutations):
-        shuffled_drug = np.random.permutation(drug_sig)
+    for _ in range(int(n_permutations)):
+        shuffled_drug = rng.permutation(drug_sig)
         p_sim = np.dot(disease_sig, shuffled_drug) / (norm_dis * norm_drug)
         perm_scores.append(-p_sim)
 
     perm_scores = np.array(perm_scores)
     # One-tailed p-value for reversal: how often null score >= observed discordance
-    p_val = float((np.sum(perm_scores >= discordance_score) + 1.0) / (n_permutations + 1.0))
+    p_val = float((np.sum(perm_scores >= discordance_score) + 1.0) / (int(n_permutations) + 1.0))
 
     return discordance_score, cosine_sim, p_val
 
@@ -136,11 +149,20 @@ class CompoundPerturbationCapability(BaseCapability):
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
         meta, payload = registry.get(in_uri)
+        params = contract.parameters
+        simulation_mode = str(params.get("mode", "real")).strip().lower()
+        if simulation_mode not in {"real", "demo", "simulation", "simulated"}:
+            raise ValueError("mode must be one of: real, demo, simulation")
 
         # Handle input either as SCData or Table
         if isinstance(payload, SCData) or (isinstance(payload, dict) and "X" in payload):
             data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-            X = data.X.toarray() if hasattr(data.X, "toarray") else data.X.copy()
+            n_cells, n_genes = data.X.shape
+            if int(n_cells) * int(n_genes) > MAX_COMPOUND_ELEMENTS:
+                raise ValueError(
+                    f"Compound counterfactual simulation is limited to {MAX_COMPOUND_ELEMENTS:,} expression elements; subset the input"
+                )
+            X = data.X.toarray() if hasattr(data.X, "toarray") else np.asarray(data.X, dtype=np.float32).copy()
             obs = data.obs.copy()
             n_cells, n_genes = X.shape
             
@@ -151,93 +173,209 @@ class CompoundPerturbationCapability(BaseCapability):
             else:
                 gene_names = np.array([f"Gene_{i}" for i in range(n_genes)], dtype=str)
         else:
-            # If input is a DEG table
+            # A DEG table has gene-level summaries and cannot supply the cell
+            # states needed for a counterfactual.  Never manufacture a fixed
+            # 100-cell all-ones matrix.  An explicit demo may provide the
+            # actual expression matrix and labels through the contract.
             deg_df = payload if isinstance(payload, pd.DataFrame) else pd.DataFrame(payload)
+            if "gene" not in deg_df.columns:
+                raise ValueError("Compound perturbation table input requires a 'gene' column")
+            expression_matrix = params.get("expression_matrix")
+            obs_input = params.get("obs")
+            if expression_matrix is None or obs_input is None:
+                raise ValueError(
+                    "A DEG table does not contain cell-level expression or state labels; "
+                    "provide an AnnData/SCData input or explicitly provide expression_matrix and obs"
+                )
+            if simulation_mode not in {"demo", "simulation", "simulated"}:
+                raise ValueError(
+                    "DEG-table counterfactuals require explicit mode='demo' or mode='simulation'"
+                )
             gene_names = np.array(deg_df["gene"].values, dtype=str)
-            n_genes = len(gene_names)
-            n_cells = 100
-            X = np.ones((n_cells, n_genes), dtype=np.float32)
-            obs = pd.DataFrame({"cell_id": [f"c_{i}" for i in range(n_cells)], "condition": ["AD"] * 50 + ["control"] * 50})
+            if isinstance(expression_matrix, pd.DataFrame):
+                if set(gene_names).issubset(expression_matrix.columns):
+                    X = expression_matrix.loc[:, list(gene_names)].to_numpy(dtype=np.float32)
+                else:
+                    X = expression_matrix.to_numpy(dtype=np.float32)
+            else:
+                X = np.asarray(expression_matrix, dtype=np.float32)
+            if X.ndim != 2 or X.shape[1] != len(gene_names):
+                raise ValueError(
+                    "expression_matrix must be a 2D cells x DEG-genes matrix with one column per gene"
+                )
+            obs = obs_input.copy(deep=True) if isinstance(obs_input, pd.DataFrame) else pd.DataFrame(obs_input)
+            if len(obs) != X.shape[0]:
+                raise ValueError("obs length must match expression_matrix rows")
+            n_cells, n_genes = X.shape
             data = SCData(X=X, obs=obs, var=pd.DataFrame({"gene_name": gene_names}))
 
         gene_name_to_idx = {g: i for i, g in enumerate(gene_names)}
 
         # Contract Parameters
-        params = contract.parameters
         compound_name = str(params.get("compound_name", "Anti_Inflammatory_Small_Molecule"))
         dosage = float(params.get("dosage", params.get("scale_factor", 1.0)))
         n_perms = int(params.get("n_permutations", 500))
         custom_drug_sig = params.get("drug_signature", None)
         custom_disease_sig = params.get("disease_signature", None)
+        signature_conditions = None
+
+        # State labels are required for a state transition result.  They are
+        # also a valid source for a disease signature when no separate
+        # condition column is present (for example Homeostatic vs DAM states).
+        state_col = (
+            "microglia_state" if "microglia_state" in obs.columns
+            else ("cluster" if "cluster" in obs.columns else ("condition" if "condition" in obs.columns else None))
+        )
+        if state_col is None and "state_labels" in params:
+            state_labels = params["state_labels"]
+            if len(state_labels) != n_cells:
+                raise ValueError("state_labels length must match expression matrix rows")
+            obs = obs.copy(deep=True)
+            obs["state_labels"] = list(state_labels)
+            state_col = "state_labels"
 
         # 1. Determine Disease Signature s_disease (1 x N_genes)
         disease_sig = np.zeros(n_genes, dtype=np.float32)
+        disease_signature_source = None
+        disease_signature_measured = False
         if custom_disease_sig is not None:
             if isinstance(custom_disease_sig, dict):
+                unknown = set(custom_disease_sig).difference(gene_name_to_idx)
+                if len(unknown) == len(custom_disease_sig):
+                    raise ValueError("disease_signature contains no genes present in the input")
                 for g, val in custom_disease_sig.items():
                     if g in gene_name_to_idx:
                         disease_sig[gene_name_to_idx[g]] = float(val)
-            elif len(custom_disease_sig) == n_genes:
-                disease_sig = np.asarray(custom_disease_sig, dtype=np.float32)
-        else:
-            # Compute from condition in obs: AD vs Control
-            cond_col = "condition" if "condition" in obs.columns else None
-            if cond_col and len(obs[cond_col].unique()) >= 2:
-                conditions = obs[cond_col].unique()
-                cond_ad = "AD" if "AD" in conditions else conditions[0]
-                cond_ctrl = "control" if "control" in conditions else conditions[1]
-
-                mean_ad = np.mean(X[obs[cond_col] == cond_ad], axis=0)
-                mean_ctrl = np.mean(X[obs[cond_col] == cond_ctrl], axis=0)
-                disease_sig = np.log2((mean_ad + 1e-3) / (mean_ctrl + 1e-3)).astype(np.float32)
             else:
-                # Fallback: variance-weighted difference
-                disease_sig = (X[0] - np.mean(X, axis=0)).astype(np.float32)
+                disease_sig_array = np.asarray(custom_disease_sig, dtype=np.float32)
+                if disease_sig_array.ndim != 1 or len(disease_sig_array) != n_genes:
+                    raise ValueError("disease_signature must have one value per input gene")
+                disease_sig = disease_sig_array
+            if not np.isfinite(disease_sig).all():
+                raise ValueError("disease_signature contains non-finite values")
+            disease_signature_source = str(params.get("disease_signature_source", "user_provided_unverified"))
+            disease_signature_measured = bool(params.get("disease_signature_measured", False))
+            signature_conditions = {"source": disease_signature_source}
+        else:
+            cond_col = "condition" if "condition" in obs.columns else None
+            cond_a = params.get("condition_a")
+            cond_b = params.get("condition_b")
+            if cond_col is not None:
+                conditions = list(obs[cond_col].dropna().unique())
+                if cond_a is None or cond_b is None:
+                    normalized = {str(value).strip().lower(): value for value in conditions}
+                    disease_keys = ("ad", "disease", "case", "treated", "cko", "mutant")
+                    control_keys = ("control", "ctrl", "healthy", "wt", "wildtype", "con")
+                    cond_a = next((normalized[key] for key in disease_keys if key in normalized), None)
+                    cond_b = next((normalized[key] for key in control_keys if key in normalized), None)
+                if cond_a is not None and cond_b is not None and cond_a != cond_b:
+                    mask_a = (obs[cond_col] == cond_a).values
+                    mask_b = (obs[cond_col] == cond_b).values
+                    if mask_a.any() and mask_b.any():
+                        mean_a = np.mean(X[mask_a], axis=0)
+                        mean_b = np.mean(X[mask_b], axis=0)
+                        disease_sig = np.log2((mean_a + 1e-3) / (mean_b + 1e-3)).astype(np.float32)
+                        disease_signature_source = "observed_condition_contrast"
+                        disease_signature_measured = True
+                        signature_conditions = {"condition_a": str(cond_a), "condition_b": str(cond_b)}
+
+            if disease_signature_source is None and state_col is not None:
+                labels = obs[state_col].astype(str)
+                disease_mask = labels.str.lower().map(
+                    lambda value: any(token in value for token in ("dam", "disease", "case", "ad", "m3", "cko", "mutant"))
+                ).to_numpy()
+                control_mask = labels.str.lower().map(
+                    lambda value: any(token in value for token in ("homeo", "control", "healthy", "wt", "m1", "con"))
+                ).to_numpy()
+                if disease_mask.any() and control_mask.any():
+                    disease_sig = np.log2(
+                        (np.mean(X[disease_mask], axis=0) + 1e-3)
+                        / (np.mean(X[control_mask], axis=0) + 1e-3)
+                    ).astype(np.float32)
+                    disease_signature_source = "observed_state_contrast"
+                    disease_signature_measured = True
+                    signature_conditions = {
+                        "disease_states": sorted(labels[disease_mask].unique().tolist()),
+                        "control_states": sorted(labels[control_mask].unique().tolist()),
+                    }
+
+            if disease_signature_source is None:
+                raise ValueError(
+                    "Disease signature requires an explicit disease_signature or two observed, semantically labelled groups; "
+                    "a single unlabeled cohort cannot define disease"
+                )
 
         # 2. Determine Drug Perturbation Signature s_drug (1 x N_genes)
         drug_sig = np.zeros(n_genes, dtype=np.float32)
+        drug_signature_source = None
+        drug_signature_verified = False
         if custom_drug_sig is not None:
             if isinstance(custom_drug_sig, dict):
+                unknown = set(custom_drug_sig).difference(gene_name_to_idx)
+                if len(unknown) == len(custom_drug_sig):
+                    raise ValueError("drug_signature contains no genes present in the input")
                 for g, val in custom_drug_sig.items():
                     if g in gene_name_to_idx:
                         drug_sig[gene_name_to_idx[g]] = float(val)
-            elif len(custom_drug_sig) == n_genes:
-                drug_sig = np.asarray(custom_drug_sig, dtype=np.float32)
+            else:
+                drug_sig_array = np.asarray(custom_drug_sig, dtype=np.float32)
+                if drug_sig_array.ndim != 1 or len(drug_sig_array) != n_genes:
+                    raise ValueError("drug_signature must have one value per input gene")
+                drug_sig = drug_sig_array
+            if not np.isfinite(drug_sig).all():
+                raise ValueError("drug_signature contains non-finite values")
+            drug_signature_source = str(params.get("drug_signature_source", "user_provided_unverified"))
+            drug_signature_verified = bool(params.get("drug_signature_verified", False))
         elif compound_name in REFERENCE_COMPOUND_DATABASE:
             ref_dict = REFERENCE_COMPOUND_DATABASE[compound_name]
             for g, val in ref_dict.items():
                 if g in gene_name_to_idx:
                     drug_sig[gene_name_to_idx[g]] = float(val)
+            drug_signature_source = "local_reference_unverified"
+            drug_signature_verified = False
         else:
-            # Synthetic reversal signature matching inverse of top disease genes
-            top_dis_idx = np.argsort(np.abs(disease_sig))[-min(10, n_genes):]
-            for idx in top_dis_idx:
-                drug_sig[idx] = -1.5 * np.sign(disease_sig[idx])
+            raise ValueError("Unknown compound requires an explicit drug_signature; no reversal signature is synthesized")
+
+        if not np.isfinite(drug_sig).all() or np.linalg.norm(drug_sig) < 1e-8:
+            raise ValueError("Drug signature has no finite values for genes present in the input")
 
         # 3. Compute CMAP Cosine Discordance Score
         reversal_score, cosine_sim, p_val = compute_cmap_cosine_discordance(
             disease_sig=disease_sig,
             drug_sig=drug_sig,
             n_permutations=n_perms,
-            random_seed=42,
+            random_seed=int(params.get("random_seed", 42)),
+        )
+        signature_provenance_verified = bool(
+            disease_signature_measured and drug_signature_verified
+        )
+        therapeutic_potential = bool(
+            signature_provenance_verified and reversal_score > 0.30 and p_val < 0.05
         )
 
         # 4. Simulate Counterfactual Treatment & Cell State Transitions
         # X_drug = max(0, X + dosage * drug_sig)
-        X_drug = np.maximum(0.0, X + dosage * drug_sig).astype(np.float32)
+        # Signatures are log2 fold-change profiles, so apply them as fold
+        # changes to the measured baseline rather than adding them as raw
+        # counts.  The operation remains explicitly counterfactual.
+        fold_change = np.power(2.0, dosage * drug_sig, dtype=np.float32)
+        X_drug = np.maximum(0.0, X * fold_change[np.newaxis, :]).astype(np.float32)
 
-        # Identify Cell States (e.g. microglia_state, leiden, or condition)
-        state_col = (
-            "microglia_state" if "microglia_state" in obs.columns
-            else ("leiden" if "leiden" in obs.columns else ("condition" if "condition" in obs.columns else None))
-        )
+        # Identify Cell States (e.g. microglia_state, cluster, or condition)
+        if state_col is None:
+            raise ValueError(
+                "Compound counterfactual transitions require an observed state column "
+                "(microglia_state, cluster, condition) or explicit state_labels"
+            )
+        state_values = obs[state_col].astype(str)
+        unique_states = list(dict.fromkeys(state_values.dropna().tolist()))
+        if len(unique_states) < 2:
+            raise ValueError("At least two observed states are required for transition inference")
 
-        if state_col:
-            unique_states = [str(s) for s in obs[state_col].unique()]
-        else:
-            unique_states = ["State_0", "State_1"]
-            obs["inferred_state"] = ["State_0" if i < n_cells // 2 else "State_1" for i in range(n_cells)]
-            state_col = "inferred_state"
+        if int(n_cells) * int(max(1, len(unique_states))) * int(n_genes) > MAX_COMPOUND_ELEMENTS:
+            raise ValueError(
+                f"Compound transition probabilities exceed the {MAX_COMPOUND_ELEMENTS:,}-element resource limit; reduce cells/states/genes"
+            )
 
         n_states = len(unique_states)
         state_to_idx = {s: i for i, s in enumerate(unique_states)}
@@ -245,7 +383,7 @@ class CompoundPerturbationCapability(BaseCapability):
         # Compute baseline centroids for each state
         centroids = []
         for s in unique_states:
-            mask = (obs[state_col] == s).values
+            mask = (state_values == s).values
             if np.sum(mask) > 0:
                 centroids.append(np.mean(X[mask], axis=0))
             else:
@@ -270,23 +408,25 @@ class CompoundPerturbationCapability(BaseCapability):
         # Compute State-to-State Transition Probability Matrix T (K x K)
         T_mat = np.zeros((n_states, n_states), dtype=np.float32)
         for u_idx, u_state in enumerate(unique_states):
-            u_mask = (obs[state_col] == u_state).values
+            u_mask = (state_values == u_state).values
             if np.sum(u_mask) > 0:
                 T_mat[u_idx, :] = np.mean(trans_probs[u_mask], axis=0)
             else:
                 T_mat[u_idx, u_idx] = 1.0
 
         # Compute disease-to-healthy transition rate
-        disease_transition_rate = 0.0
-        dam_states = [s for s in unique_states if "DAM" in s or "M3" in s or "AD" in s]
-        homeo_states = [s for s in unique_states if "Homeo" in s or "M1" in s or "control" in s]
+        disease_transition_rate = None
+        disease_transition_available = False
+        dam_states = [str(params["source_state"])] if params.get("source_state") is not None else []
+        homeo_states = [str(params["target_state"])] if params.get("target_state") is not None else []
+        if any(s not in state_to_idx for s in dam_states + homeo_states):
+            raise ValueError("Requested transition states must occur in the observed state column")
 
         if dam_states and homeo_states:
             dam_u = state_to_idx[dam_states[0]]
             homeo_v = state_to_idx[homeo_states[0]]
             disease_transition_rate = float(T_mat[dam_u, homeo_v])
-        elif n_states >= 2:
-            disease_transition_rate = float(T_mat[0, 1])
+            disease_transition_available = True
 
         # Transition Matrix DataFrame
         trans_df = pd.DataFrame(
@@ -350,6 +490,14 @@ class CompoundPerturbationCapability(BaseCapability):
             "p_value": p_val,
             "transition_matrix": T_mat.tolist(),
             "disease_transition_rate": disease_transition_rate,
+            "disease_transition_available": disease_transition_available,
+            "signature_conditions": signature_conditions,
+            "disease_signature_source": disease_signature_source,
+            "disease_signature_measured": disease_signature_measured,
+            "drug_signature_source": drug_signature_source,
+            "drug_signature_verified": drug_signature_verified,
+            "simulation_mode": simulation_mode,
+            "input_artifact_uri": in_uri,
         }
 
         # Register artifacts
@@ -373,7 +521,15 @@ class CompoundPerturbationCapability(BaseCapability):
                 "p_value": p_val,
                 "disease_transition_rate": disease_transition_rate,
                 "top_reversed_genes": top_reversed_genes[:5],
-                "therapeutic_potential": bool(reversal_score > 0.30 and p_val < 0.05),
+                "therapeutic_potential": therapeutic_potential,
+                "therapeutic_signal_unverified": bool(reversal_score > 0.30 and p_val < 0.05 and not signature_provenance_verified),
+                "disease_signature_source": disease_signature_source,
+                "disease_signature_measured": disease_signature_measured,
+                "drug_signature_source": drug_signature_source,
+                "drug_signature_verified": drug_signature_verified,
+                "signature_provenance_verified": signature_provenance_verified,
+                "disease_transition_available": disease_transition_available,
+                "simulation_mode": simulation_mode,
             }
         )
 
@@ -390,6 +546,13 @@ class CompoundPerturbationCapability(BaseCapability):
                 "compound_name": compound_name,
                 "reversal_score": reversal_score,
                 "cells_shifted": n_cells,
+                "disease_transition_available": disease_transition_available,
+                "disease_signature_source": disease_signature_source,
+                "disease_signature_measured": disease_signature_measured,
+                "drug_signature_source": drug_signature_source,
+                "drug_signature_verified": drug_signature_verified,
+                "signature_provenance_verified": signature_provenance_verified,
+                "simulation_mode": simulation_mode,
             }
         )
 
@@ -413,7 +576,14 @@ class CompoundPerturbationCapability(BaseCapability):
                 "p_value": p_val,
                 "disease_transition_rate": disease_transition_rate,
                 "top_reversed_genes": top_reversed_genes[:5],
-                "therapeutic_potential": bool(reversal_score > 0.30 and p_val < 0.05),
+                "therapeutic_potential": therapeutic_potential,
+                "therapeutic_signal_unverified": bool(reversal_score > 0.30 and p_val < 0.05 and not signature_provenance_verified),
+                "disease_signature_source": disease_signature_source,
+                "disease_signature_measured": disease_signature_measured,
+                "drug_signature_source": drug_signature_source,
+                "drug_signature_verified": drug_signature_verified,
+                "disease_transition_available": disease_transition_available,
+                "simulation_mode": simulation_mode,
             }
         )
 
@@ -423,7 +593,7 @@ def generate_compound_perturbation_evidence(
     result: TaskResult,
     compound_name: str,
     reversal_score: float,
-    transition_rate: float,
+    transition_rate: Optional[float],
     p_value: float = 0.01,
 ) -> EvidenceNode:
     """
@@ -432,6 +602,45 @@ def generate_compound_perturbation_evidence(
     """
     out_uris = result.output_artifacts
     task_id = contract.task_id
+
+    transition_available = bool(
+        result.metrics.get("disease_transition_available", transition_rate is not None)
+    )
+    disease_source = result.metrics.get("disease_signature_source", "unspecified")
+    drug_source = result.metrics.get("drug_signature_source", "unspecified")
+    source_verified = bool(result.metrics.get("signature_provenance_verified", False))
+    if transition_rate is None or not transition_available:
+        return EvidenceNode(
+            evidence_id=f"E_compound_{compound_name}_{task_id}",
+            type=EvidenceType.PERTURBATION,
+            polarity=EvidencePolarity.NEUTRAL,
+            strength=EvidenceStrength.INSUFFICIENT,
+            score=0.0,
+            summary=(
+                f"In silico compound simulation with {compound_name} produced a transcriptomic "
+                "counterfactual, but disease-to-homeostatic transition was not estimable "
+                "from the available state labels."
+            ),
+            source_task_id=task_id,
+            source_artifact_uris=out_uris,
+            metrics={
+                "compound_name": compound_name,
+                "reversal_score": reversal_score,
+                "transition_rate": None,
+                "disease_transition_available": False,
+                "disease_signature_source": disease_source,
+                "drug_signature_source": drug_source,
+                "source_verified": source_verified,
+                "in_silico_confidence_cap": 0.50,
+            },
+            biological_context={
+                "compound": compound_name,
+                "causal_status": "in_silico_perturbed",
+                "state_claim": "not_estimable",
+            },
+            is_simulated=True,
+            source_verified=source_verified,
+        )
 
     # Quantitative score calibrated and capped at 0.50
     normalized_score = max(0.10, min(0.50, float(max(0.0, reversal_score))))
@@ -444,10 +653,11 @@ def generate_compound_perturbation_evidence(
     polarity = EvidencePolarity.SUPPORTING if reversal_score > 0 else EvidencePolarity.CONTRADICTING
     action = "therapeutic reversal" if reversal_score > 0 else "disease exacerbation"
 
+    verification_note = "verified signature sources" if source_verified else "unverified local/provided signature sources"
     summary = (
         f"In silico compound simulation with {compound_name} predicts {action} of disease signature "
         f"(CMAP discordance score: {reversal_score:.2f}, p-val: {p_value:.3f}, "
-        f"counterfactual homeostatic transition rate: {transition_rate*100:.1f}%)."
+        f"counterfactual homeostatic transition rate: {transition_rate*100:.1f}%; {verification_note})."
     )
 
     return EvidenceNode(
@@ -465,9 +675,15 @@ def generate_compound_perturbation_evidence(
             "transition_rate": transition_rate,
             "p_value": p_value,
             "in_silico_confidence_cap": 0.50,
+            "disease_signature_source": disease_source,
+            "drug_signature_source": drug_source,
+            "source_verified": source_verified,
         },
         biological_context={
             "compound": compound_name,
             "causal_status": "in_silico_perturbed",
+            "signature_source_status": "verified" if source_verified else "unverified",
         },
+        is_simulated=True,
+        source_verified=source_verified,
     )

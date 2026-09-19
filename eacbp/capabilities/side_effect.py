@@ -51,8 +51,9 @@ class SideEffectValidator:
 
                 # Check cluster label tampering if recluster is forbidden
                 if "recluster" in contract.forbidden_operations and hasattr(in_data, "obs") and hasattr(out_data, "obs"):
-                    if "leiden" in in_data.obs.columns and "leiden" in out_data.obs.columns:
-                        if not in_data.obs["leiden"].equals(out_data.obs["leiden"]):
-                            return False, f"POLICY VIOLATION: Cluster assignments 'leiden' were modified despite 'recluster' being forbidden."
+                    for column in ("cluster", "leiden", "louvain", "cell_type"):
+                        if column in in_data.obs.columns:
+                            if column not in out_data.obs.columns or not in_data.obs[column].equals(out_data.obs[column]):
+                                return False, f"POLICY VIOLATION: Cluster assignments '{column}' were modified despite 'recluster' being forbidden."
 
         return True, None

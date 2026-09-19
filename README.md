@@ -1,230 +1,206 @@
-# EACBP: Evidence-aware Agentic Computational Biology Platform
+# EACBP
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-92%20passed%20(100%25)-brightgreen.svg)]()
+Evidence-aware computational biology workflows in Python.
 
-> **Core Philosophy**: EACBP is not a monolithic "single-cell AutoGPT", but an **Evidence-aware Scientific Workflow Operating System**. It grounds computational biology analysis in auditable task DAGs, immutable data artifacts, independent statistical/biological auditing, plug-and-play agent adapters with strict contract guardrails, multi-source knowledge verification, in silico perturbation simulation, and a multi-hop traceable scientific claim engine.
+EACBP combines explicit task contracts, versioned local artifacts, independent audits, and evidence-linked Markdown reports. Real-data orchestration uses the standard library-backed methods; explicit demos use lightweight baselines. The knowledge sources remain local curated fixtures. This is a research workflow, not a validated clinical pipeline.
 
-$$
-\boxed{
-\text{Scientific Question}
-\rightarrow
-\text{Auditable Task DAG}
-\rightarrow
-\text{Capability Invocation}
-\rightarrow
-\text{Data Artifacts}
-\rightarrow
-\text{Statistical/Biological Evidence}
-\rightarrow
-\text{Traceable Claims}
-}
-$$
+## Architecture
 
----
+Current code-based architecture map, review findings, and improvement priorities (Chinese): [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md).
 
-## 🏛️ System Architecture: 6 Planes, 2 DAGs, 1 Protocol
+Runtime configuration separation, task execution helpers, and durable artifact audit access are described in [ARCHITECTURE_OPTIMIZATION.md](ARCHITECTURE_OPTIMIZATION.md). The earlier architecture review is historical; its resolved findings are marked at the top.
 
-```text
-                         User / API / UI
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 Scientific Orchestrator                     │
-│                                                             │
-│ Intent Parser → Study Planner → Dynamic DAG Manager → Router│
-│                       │                │                    │
-│                       ▼                ▼                    │
-│                Scientific Policy    Capability Registry     │
-└───────────────────────┬─────────────────────────────────────┘
-                        │
-        ┌───────────────┼─────────────────────┐
-        ▼               ▼                     ▼
- Knowledge Plane   Compute Plane       Model/Simulation Plane
-        │               │                     │
- Literature       scRNA / scATAC        Genetic Perturbation (CRISPR)
- GO / Reactome    Spatial Transcript.   Compound Response (CMAP)
- Dual-Mode KG     Trajectory / GRN      Agent Adapters (SpaCell, ChatCell, GeneAgent)
-        │               │                     │
-        └───────────────┼─────────────────────┘
-                        ▼
-                Scientific Auditor (Author != Reviewer)
-         ┌──────────────┼──────────────┐
-         ▼              ▼              ▼
-   Computational   Statistical      Biological
-   Validator       Validator        Validator
-         └──────────────┼──────────────┘
-                        ▼
-                  Claim Engine (4-Tier Language Protocol)
-                        ▼
-            Traceable Report / Notebook / Manuscript
+Capability declarations, multi-target branches, execution events, and conservative transaction cleanup are described in [ARCHITECTURE_P2.md](ARCHITECTURE_P2.md).
 
-=============================================================
-             Data / State / Provenance Plane
-=============================================================
- AnnData | SpatialData | Tables | Figures | Lineage | Artifacts
- Immutable Versioning (v1->v2->v3) | Strict Task Contracts
-=============================================================
+The installed `eacbp` CLI (`plan`, `run`, `resume`, `inspect`, `cleanup`, `report`) and verified evidence snapshots are described in [ARCHITECTURE_P3.md](ARCHITECTURE_P3.md). `python -m eacbp` provides the same commands from a source environment.
+
+`StudyManifest → dependency-ordered TaskContracts → CapabilityRegistry → Artifacts → ScientificAuditor → EvidenceGraph → ClaimEngine → report`
+
+- `schemas/`: study, task, artifact and evidence contracts.
+- `orchestrator/`: conservative intent parsing, explicit dependencies, routing, audit gates, task journals and resume.
+- `capabilities/`: quantification, QC, normalization, clustering, donor/cell-level statistics, root-distance ordering, spatial analysis and simulations.
+- `artifact/`: immutable version files, persistent metadata/lineage and read-time SHA-256 validation.
+- `adapters/`: local SpaCell/ChatCell/GeneAgent-style computations with contract checks; no external agent service is connected.
+- `knowledge/`: local curated literature and biological dictionaries. Records are not independently verified online.
+- `auditor/`, `evidence/`, `report/`: checks, admitted evidence, constrained claims and provenance.
+
+## Installation and tests
+
+```sh
+python -m pip install ".[dev,standard,fate]"
+python -m pytest -q
 ```
 
----
+AnnData/Scanpy are required for full single-cell processing. CI is configured for tests and wheel builds on Windows/Linux with Python 3.11/3.12/3.13. Local test results do not establish that remote CI or real FASTQ alignment has run.
 
-## 🔒 The Four Architectural Invariants
+## Real data and demo data
 
-1. **Raw data immutable**: Input datasets are read-only and strictly immutable.
-2. **Every computation creates an Artifact**: Every operation produces a versioned, hashed, reproducible artifact with exact lineage (`adata://<study>/<name>/v<N>`). In-place overwriting is prohibited.
-3. **Every scientific claim requires Evidence**: Assertions cannot be generated from raw LLM hallucinations. Claims are backed by linked evidence nodes with explicit confidence and 4-tier language calibration.
-4. **Executor cannot certify itself**: The Scientific Auditor operates independently from execution to eliminate self-confirmation bias (*Author $\neq$ Reviewer*).
+FASTQ quantification defaults to `mode="real"`. Real mode requires valid sample metadata, every FASTQ pair, the selected executable (kb-python or STAR), and explicit references. Missing dependencies, invalid inputs and alignment failures return a structured failure. STARsolo preserves all lanes and reads its own run's filtered Matrix Market output; raw output must be explicitly requested with `use_raw_counts=True`. Missing filtered output never silently falls back to raw or a previous run.
 
----
+Only explicit `mode="demo"` may generate synthetic data. Synthetic origin propagates through artifact lineage, evidence and report labels. Demo statistical outputs are demonstrations, not biological measurements.
 
-## 🔬 Calibrated 4-Tier Scientific Language Protocol
+Use the script help for the current command-line interface:
 
-EACBP strictly enforces epistemic calibration in all generated conclusions:
-
-| Tier | Language Level | Example Statement | Evidence Requirement |
-| :--- | :--- | :--- | :--- |
-| **Level 1** | **Observation** | *"APOE expression increased along pseudotime."* | Descriptive metrics |
-| **Level 2** | **Statistical inference** | *"APOE showed significant association with pseudotime ($p < 10^{-4}$)."* | Validated statistical test (FDR controlled) |
-| **Level 3** | **Supported interpretation** | *"This pattern is consistent with an AD-associated microglial state."* | Statistical evidence + Literature/Biological prior |
-| **Level 4** | **Hypothesis** | *"APOE may participate in driving this microglial transition."* | Prospective hypothesis (observational / in silico perturbation) |
-
----
-
-## 📁 Repository Structure
-
-```text
-EACBP/
-├── pyproject.toml                     # Project configuration & test paths
-├── README.md                          # Platform documentation
-├── eacbp/
-│   ├── schemas/                       # Unified Schema Protocol
-│   │   ├── study.py                   # StudyManifest, BiologicalDesign, ExperimentalDesign
-│   │   ├── task.py                    # TaskContract, TaskResult, TaskStatus
-│   │   ├── artifact.py                # ArtifactMetadata, ArtifactRef, LineageNode
-│   │   └── evidence.py                # EvidenceNode, ClaimNode, LanguageTier, ConfidenceScore
-│   ├── artifact/                      # Data, State & Provenance Plane
-│   │   ├── uri.py                     # Canonical URI parser (adata://, table://, fig://)
-│   │   ├── storage.py                 # File-system storage backend & SHA-256 validation
-│   │   ├── lineage.py                 # Lineage Graph & branch comparison (v4a vs v4b)
-│   │   └── registry.py                # ArtifactRegistry interface
-│   ├── capabilities/                  # Capability Registry & Compute Plane
-│   │   ├── base.py                    # BaseCapability, ImplementationType
-│   │   ├── registry.py                # Global CapabilityRegistry
-│   │   ├── side_effect.py             # SideEffectValidator (deterministic state hashing)
-│   │   ├── sc_data.py                 # SCData container (AnnData & Spatial-compatible)
-│   │   ├── qc.py                      # Dataset audit & QC filtering
-│   │   ├── normalization.py           # Library size scaling, log1p & HVG selection
-│   │   ├── integration.py             # Harmony & No-correction batch integration
-│   │   ├── clustering.py              # PCA, KNN, Leiden clustering & marker annotation
-│   │   ├── subset.py                  # Subpopulation extraction (e.g. Microglia)
-│   │   ├── deg.py                     # Pseudobulk Wald/t-test vs Cell-level test
-│   │   ├── trajectory.py              # PAGA/DPT pseudotime & stability analysis
-│   │   ├── spatial/                   # Spatial Single-Cell Analytics
-│   │   │   ├── domain.py              # Spatial graph smoothing & domain clustering
-│   │   │   ├── deg.py                 # Moran's I & Geary's C spatial autocorrelation
-│   │   │   └── cci.py                 # Contact-density & proximity cell-cell interaction
-│   │   └── perturbation/              # In Silico Perturbation Simulation
-│   │       ├── genetic.py             # CRISPR knockout / overexpression via GRN propagation
-│   │       └── compound.py            # Drug response & CMAP discordance state shifting
-│   ├── adapters/                      # External Agent Adapter Plane
-│   │   ├── base.py                    # BaseAgentAdapter with deterministic contract guardrails
-│   │   ├── spacell_adapter.py         # SpaCellAgent adapter
-│   │   ├── chatcell_adapter.py        # ChatCell dialogue & state query adapter
-│   │   └── gene_adapter.py            # GeneAgent pathway & function adapter
-│   ├── knowledge/                     # Multi-Source Knowledge Engine Plane
-│   │   ├── literature.py              # PubMed & bioRxiv retriever
-│   │   ├── databases.py               # GO ORA, Reactome & NCBI Gene retriever
-│   │   └── engine.py                  # Discovery Mode vs Prior-Guided Mode controller
-│   ├── auditor/                       # Independent Scientific Auditor Plane
-│   │   ├── base.py                    # BaseAuditor, ValidationReport, ValidationCheck
-│   │   ├── computational.py           # Matrix dimensions, non-finite values (NaN/Inf)
-│   │   ├── statistical.py             # Pseudoreplication, FDR, Moran's I, Perturbation bounds
-│   │   └── biological.py              # Marker coherence & disease consistency
-│   ├── evidence/                      # Evidence & Claim Plane
-│   │   ├── graph.py                   # EvidenceDAG (5-Pillar Evidence Graph)
-│   │   ├── confidence.py              # 3D Confidence scoring with contradiction penalty
-│   │   ├── language.py                # 4-Tier Language protocol enforcer
-│   │   └── claim.py                   # ClaimEngine synthesis
-│   ├── orchestrator/                  # Scientific Orchestrator Plane
-│   │   ├── intent.py                  # Natural language intent parser
-│   │   ├── policy.py                  # Scientific policies & Stop Rules
-│   │   ├── router.py                  # 3-Tier Router (Hard constraints -> Policy -> LLM)
-│   │   ├── dag.py                     # Dynamic Computational DAG planner
-│   │   └── loop.py                    # Full execution orchestration loop
-│   └── report/                        # Traceability & Reporting Plane
-│       ├── provenance.py              # Multi-hop sentence-to-data provenance resolver
-│       └── markdown_report.py         # 4-tier structured scientific report generator
-└── tests/                             # 13 test suites (92 tests, 100% pass rate)
-    ├── test_schemas.py                # Schema serialization tests
-    ├── test_artifacts.py              # Immutability, lineage & branch tests
-    ├── test_capabilities.py           # Capability execution tests
-    ├── test_spatial.py                # Spatial domain, Moran's I, DEG & CCI tests
-    ├── test_adapters.py               # External agent adapter execution tests
-    ├── test_adversarial_guardrails.py # Interception of rogue mutations & tampering
-    ├── test_adversarial_stress.py     # Extreme mathematical stress & boundary audits
-    ├── test_knowledge.py              # PubMed, bioRxiv, GO/Reactome ORA & Dual-mode tests
-    ├── test_perturbation.py           # CRISPR KO, GRN propagation & drug response tests
-    ├── test_auditors.py               # Computational & statistical audits
-    ├── test_evidence_graph.py         # Confidence calculator & language enforcer tests
-    ├── test_orchestrator.py           # Dynamic DAG planning & routing tests
-    └── test_end_to_end_study.py       # Full scRNA + Spatial + Perturbation simulated studies
+```sh
+python scripts/run_fastq_to_biology_pipeline.py --help
+python scripts/run_kat8_study.py --help
+python scripts/run_standard_study.py --help
 ```
 
----
+Script output is isolated by study/run directory. Starting another run never deletes an earlier artifact tree. Real sequencing inputs must preserve every lane and carry explicit condition/donor metadata; a filename alone is not an experimental design.
 
-## 🚀 Quickstart & Example
+`scripts/run_standard_study.py` is a compatibility adapter around
+`eacbp.cli.run_study`. It keeps the historical flags and
+`outputs/runs/<study-id>/<uuid>/` layout, while `run_config.json`, the artifact
+registry, evidence snapshots, reports, and resume behavior come from the same
+package lifecycle as `eacbp run`. Tests that need isolated scratch output
+should use a short, scoped `.pytest_temp_<topic>` directory (for example
+`.pytest_temp_rf`) and `-p no:cacheprovider`; these directories
+are ignored without hiding source or research `temp*` directories.
+
+Descriptor callbacks use the documented signatures `validator(contract, result,
+registry)` and `evidence_extractor(contract, result, report, registry)`; shorter
+or keyword-only callbacks need an explicit wrapper. Parameter-model compatibility
+with Pydantic, dataclasses, and callables remains available. `ScientificPolicy`
+is deprecated and retained for existing imports; runtime policy lives in the
+router and independent auditors.
+
+The generic h5ad entry point has no default disease or cell type:
+
+```sh
+python scripts/run_standard_study.py --data study.h5ad --species homo_sapiens --tissue kidney --root-cell-id CELL_ID --paga
+```
+
+Omit `--root-cell-id` when no justified trajectory root is available; that branch is then omitted. Use `--condition-a/--condition-b` for an explicit contrast, `--marker-reference markers.json` for annotation, and `--terminal-states terminals.json` for CellRank. FASTQ CLI supports `--quant-tool starsolo_v1 --star-bin STAR --genome-dir INDEX --whitelist-path WHITELIST` (with `--sample-manifest`); `--gtf-path` is optional when the index already contains annotation.
+
+## Implemented methods
+
+| Capability | Actual local implementation |
+|---|---|
+| Normalization | Library-size normalization, log1p; preserves counts layer |
+| Integration | PCA batch-mean centering or no correction |
+| Clustering | Lloyd K-means and marker-score annotation |
+| Display embedding | First two embedding coordinates; not UMAP |
+| Differential expression | Donor count aggregation, library normalization and Welch tests; explicitly exploratory cell-level fallback |
+| Trajectory-like ordering | Root-relative Euclidean embedding distance, reproducible subsampling and FDR-adjusted Spearman associations |
+| Spatial analysis | Nearest-neighbor spatial graph, spatial autocorrelation and proximity-weighted ligand/receptor scores |
+| Perturbation | Bounded in-silico network/compound models; no experimental causal confirmation |
+
+The table above describes the explicit `baseline` profile. The `standard` profile calls actual third-party libraries:
+
+| Method ID | Implementation |
+|---|---|
+| `harmonypy_v1` | Harmony soft clustering and batch correction using harmonypy 0.0.10 |
+| `scanpy_leiden_umap_v1` | Scanpy neighbor graph, Leiden via leidenalg, and UMAP |
+| `scanpy_dpt_v1` | Scanpy diffusion map and diffusion pseudotime; optional PAGA graph |
+| `cellrank_fate_v1` | CellRank kernel and GPCCA estimator fate probabilities with supplied terminal cells |
+
+For a single batch, the planner selects `no_correction_v1`. Standard clustering retains existing `cell_type` annotations or uses an explicit `marker_reference` dictionary; it never substitutes ground truth annotations. Without a reference it returns named clusters. DPT requires `root_cell_id`; without it, automatic trajectory analysis is omitted and reported. PAGA additionally requires an observed grouping. DPT ordering alone is not a validated trajectory stability result.
 
 ```python
-from eacbp.orchestrator.intent import IntentParser
-from eacbp.orchestrator.loop import ScientificOrchestrator
-from eacbp.artifact.registry import ArtifactRegistry
-from eacbp.capabilities.sc_data import SCData
-from eacbp.schemas.artifact import ArtifactType
-from eacbp.report.markdown_report import ScientificReportGenerator
-
-# 1. Initialize Registry & Orchestrator
-registry = ArtifactRegistry(storage_dir=".artifacts")
-orchestrator = ScientificOrchestrator(artifact_registry=registry)
-
-# 2. Parse User Intent into a Structured Study Manifest
-prompt = "Investigate spatial DAM localization and in silico Trem2 knockout in Alzheimer's mouse brain."
-manifest = IntentParser.parse_prompt_to_manifest(prompt, study_id="AD_spatial_001")
-
-# 3. Ingest Raw Dataset (Single-cell + Spatial coordinates)
-raw_data = SCData.create_synthetic_ad_study(n_cells=1200, n_genes=500, n_ad_mice=6, n_ctrl_mice=6, has_spatial=True)
-raw_uri = "adata://AD_spatial_001/raw/v1"
-manifest.data.raw_artifact_uri = raw_uri
-registry.register(
-    uri_str=raw_uri,
-    payload=raw_data.to_dict(),
-    artifact_type=ArtifactType.SPATIAL_DATA,
-    study_id="AD_spatial_001",
-    created_by_task="task_000_ingest",
-    operation="raw_data_ingest",
-)
-
-# 4. Execute Full Workflow Loop
-study_results = orchestrator.run_study(manifest)
-print(f"Executed {study_results['tasks_executed']} tasks, generated {study_results['claims_count']} verified claims.")
-
-# 5. Generate Evidence-Grounded Scientific Report
-report_gen = ScientificReportGenerator(
-    manifest=manifest,
-    evidence_graph=orchestrator.evidence_graph,
-    artifact_registry=registry,
-    task_history=orchestrator.task_history,
-)
-report_markdown = report_gen.generate_markdown()
-print(report_markdown)
+summary = orchestrator.run_study(manifest, {
+    "method_profile": "standard",
+    "capability_parameters": {
+        "clustering": {"marker_reference": {"RequestedType": ["GENE1", "GENE2"]}},
+        "trajectory_inference": {"root_cell_id": "actual_cell_id", "run_paga": True},
+    },
+    # Optional: IDs must occur in the analyzed population.
+    "cellrank_terminal_states": {"FateA": ["terminal_cell_a"], "FateB": ["terminal_cell_b"]},
+})
 ```
 
----
+CellRank uses DPT pseudotime in this pipeline. Its standalone capability can also accept an explicit row-stochastic `obsp['transition_matrix']` with `kernel='precomputed'`. It does not infer RNA velocity from raw spliced/unspliced counts. Fate probabilities are conditional on the supplied transition model and terminal states.
 
-## 🧪 Running Tests
+Historical identifiers such as `harmony`, `leiden_knn_v1`, `paga_dpt` and `cellrank` may be recognized as migration aliases. Returned method identifiers describe the actual algorithm. They do not connect those named third-party algorithms. Legacy Leiden/UMAP output fields are opt-in and labelled as aliases.
 
-```bash
-# Run pytest test suite across all 92 unit and integration tests
-.venv/Scripts/pytest -v --basetemp=.pytest_temp
+## Evidence and failure policy
+
+- Failed execution/audits do not contribute evidence. Dependent tasks become blocked; independent branches can continue.
+- Empty or missing support IDs cannot produce admitted claims. Statistical inference requires audited adjusted-significance evidence. Level 3 additionally requires verified knowledge support.
+- Nonsignificant results and empty dynamic-gene tables are valid scientific outcomes, not a reason to fabricate findings.
+- Claims restate specific results; disease/target keywords do not automatically generate marker, mechanism or plaque-location conclusions.
+- Curated knowledge has no invented p values and supplies explicitly unverified contextual hypotheses.
+- Confidence values are heuristic summaries, not calibrated probabilities.
+
+## Resume and provenance
+
+Reuse the same registry directory and pass `current_state={..., "resume": True}` to `run_study`, with the same manifest and settings. A successful saved task is reused only when its contract and input hashes match and its output files still pass integrity checks. Strict reproducibility also fingerprints package source and installed dependencies. Restored outputs are audited again. Each computation attempt writes into a private transaction directory. A successful attempt publishes all artifact metadata and its recovery receipt in one atomic index replacement. A crash before publication leaves no public outputs and the attempt can run again; a crash after publication reuses the receipt even if the study journal was not saved. Evidence is admitted only after the audited checkpoint is saved. A new invocation resets in-memory state and evidence.
+
+Transaction directories contain the actual payloads of committed artifacts and must not be deleted wholesale. Uncommitted attempts remain on disk for diagnosis but are invisible through the public registry; automatic garbage collection is not implemented. Atomic publication applies to orchestrated task artifacts, not external programs' side effects or direct individual `register()` calls. Older runs that published partial outputs without transaction receipts still require a separate run directory.
+
+Metadata audit adapts the remaining plan: missing or ambiguous contrasts omit automatic differential statistics and their consumers; insufficient donors omit abundance inference. Explicit invalid contrasts fail. With no requested cell type the workflow analyzes all cells; an absent requested cell type fails rather than silently selecting another population. Omitted branches and reasons appear in the report.
+
+The task journal uses an OS process lock and atomic replacement. Artifact hashes detect payload changes relative to the local metadata index; this is not a tamper-proof external signature of the entire filesystem. An older artifact directory without an index is not silently reconstructed as trusted data.
+
+## Scope and migration
+
+### Advanced biological analysis
+
+`--advanced` on `scripts/run_standard_study.py` selects actual PyDESeq2 donor-level DEG and donor leave-one-out sensitivity. Install `.[advanced-statistics]`. Donor counts, pairing and covariates must describe biological samples. Inadequate leave-one-out replication produces an explicit skip, not a robustness claim. Statistical null estimates remain missing, with a reason.
+
+`--analysis-config config.json` accepts `capability_parameters`, `method_overrides`, `analysis_extensions`, and `advanced_analysis`. For example:
+
+```json
+{
+  "advanced_analysis": true,
+  "capability_parameters": {
+    "deg": {"condition_a": "treated", "condition_b": "control", "donor_col": "donor", "paired": true}
+  },
+  "analysis_extensions": {
+    "functional_activity": {
+      "network_path": "C:/data/network.csv",
+      "network_source": "Explicit curated resource",
+      "network_version": "1",
+      "tmin": 5
+    }
+  }
+}
 ```
+
+The local network needs `source`, `target`, and `weight` columns and must match the study species. Its contents enter the resume signature. Functional activity is inferred through decoupler and compared at the donor level, not a direct protein-activity measurement. Scrublet and local CellTypist have independent QC audits. LIANA supports donor-specific inference, audited condition comparisons, reports and resume. CellBender is available with explicit external inputs and an installed runtime. See [BIOINFORMATICS_IMPLEMENTATION.md](BIOINFORMATICS_IMPLEMENTATION.md) for verification evidence and limits.
+
+Install `.[advanced-qc]` for Scrublet and CellTypist. In `analysis_extensions`, enable `doublet_detection` with a library `batch_key` (use `null` only for an explicitly single-library input), and enable `cell_annotation` with a local `model_path`. CellTypist keeps reference labels in `cell_type_celltypist`, records unknown/conflicting labels, and preserves existing labels by default. These QC observations do not add mechanism or causal support. For downstream communication using the reference labels, select the corresponding `cell_type_col` explicitly. See [ADVANCED_QC.md](ADVANCED_QC.md) for the label-conflict policy and parameters.
+
+CellBender runs in the environment where the orchestrator runs; a Windows process cannot directly execute a Linux binary path. With EACBP and CellBender installed in a Linux/WSL runtime, an example configuration is:
+
+```json
+{
+  "analysis_extensions": {
+    "background_removal": {
+      "unfiltered_input_path": "/data/raw_feature_bc_matrix.h5",
+      "executable": "/opt/cellbender/bin/cellbender",
+      "output_path": "/data/run/corrected.h5",
+      "run_cwd": "/data/run",
+      "extra_args": ["--expected-cells", "500", "--total-droplets-included", "2000", "--cpu-threads", "4"]
+    }
+  }
+}
+```
+
+Choose the droplet/cell settings for the actual dataset, create the run directory first, and use a fresh output path. The explicit input must include empty droplets; the imported target artifact can contain a subset of the same cell/gene IDs. The planner runs background removal before QC and normalizes `corrected_counts` while retaining raw `counts`. Input, executable and any explicitly supplied existing `--checkpoint` file are hashed; the output destination is not hashed as an input. The independent audit re-reads and maps the actual external output. Report/log warnings remain visible, and CLI success does not certify biological correction quality. A real public-example run passed the adapter, full workflow and resume checks, while retaining ELBO convergence warnings.
+
+To enable LIANA, include an explicit local resource in the analysis configuration:
+
+```json
+{
+  "analysis_extensions": {
+    "liana_communication": {
+      "lr_resource_path": "/absolute/path/ligand_receptor.csv",
+      "lr_resource_version": "your-resource-version",
+      "lr_resource_source": "your-resource-citation",
+      "cell_type_col": "reference_cell_type",
+      "donor_col": "donor_id",
+      "condition_col": "condition",
+      "condition_a": "treated",
+      "condition_b": "control",
+      "min_cells": 5
+    }
+  }
+}
+```
+
+The resource must contain `ligand` and `receptor` columns appropriate for the manifest species; no resource is downloaded automatically. Each donor-condition group needs at least two cell types meeting `min_cells`. Set `paired: true` for repeated donors. Condition comparisons use donor ranks with BH adjustment separately for each score; LIANA ranks themselves are not FDR. Interactions that cannot be evaluated because genes are absent are recorded with the missing genes in artifact metadata and task metrics, and checked independently. They are not evidence that communication is absent. These outputs describe inferred communication and cannot establish signaling or causality.
+
+There is no bundled web UI, multi-user execution service or live PubMed/NCBI connector. Current simulations, marker references and statistical models require domain-specific validation on real data. Very large unsupported workloads fail explicitly instead of allocating unbounded dense matrices.
+
+`PROJECT.md`, `TEST_INFRA.md`, and `TEST_READY.md` contain historical planning material; this README and executable tests describe current behavior. See `REPAIR_NOTES.md` for the corrective changes and remaining validation limits.

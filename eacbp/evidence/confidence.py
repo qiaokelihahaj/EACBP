@@ -43,6 +43,10 @@ class ConfidenceCalculator:
         EvidenceType.TRAJECTORY_STABILITY: 0.75,
         EvidenceType.ROOT_SENSITIVITY: 0.75,
         EvidenceType.PERTURBATION: 0.35,
+        EvidenceType.FUNCTIONAL_ACTIVITY: 0.90,
+        EvidenceType.SENSITIVITY_ANALYSIS: 0.80,
+        EvidenceType.CELL_COMMUNICATION: 0.60,
+        EvidenceType.CELL_ANNOTATION: 0.60,
     }
 
     @classmethod
@@ -58,6 +62,10 @@ class ConfidenceCalculator:
         mech_scores = []
         causal_scores = []
 
+        # Collapse overlapping input origins within each dimension. A conservative
+        # minimum prevents repeated analyses of one matrix from increasing a
+        # dimension's score. This remains a heuristic, not a probability model.
+        grouped = {"association": [], "mechanistic": [], "causal": []}
         for ev in supporting_evidence:
             # Strength weight * score
             base_score = cls.STRENGTH_WEIGHTS.get(ev.strength, 0.6) * ev.score
@@ -70,18 +78,52 @@ class ConfidenceCalculator:
                 EvidenceType.QC_METRICS,
                 EvidenceType.DATASET_AUDIT,
                 EvidenceType.CLUSTERING_STABILITY,
+                EvidenceType.CELL_ANNOTATION,
             ):
-                assoc_scores.append(base_score)
+                dimension = "association"
             elif ev.type in (
                 EvidenceType.TRAJECTORY_STABILITY,
                 EvidenceType.ROOT_SENSITIVITY,
                 EvidenceType.PATHWAY_ENRICHMENT,
                 EvidenceType.LITERATURE_SUPPORT,
                 EvidenceType.SPATIAL_LOCALIZATION,
+                EvidenceType.FUNCTIONAL_ACTIVITY,
+                EvidenceType.CELL_COMMUNICATION,
             ):
-                mech_scores.append(base_score)
+                dimension = "mechanistic"
             elif ev.type == EvidenceType.PERTURBATION:
-                causal_scores.append(base_score)
+                dimension = "causal"
+            else:
+                # Sensitivity describes reliability, and supplies no extra
+                # independent support or causal credit.
+                continue
+            origins = set(ev.data_origin_uris) or {"task:" + ev.source_task_id}
+            score = base_score
+            remaining = []
+            for existing_origins, existing_score in grouped[dimension]:
+                if origins & existing_origins:
+                    origins |= existing_origins
+                    score = min(score, existing_score)
+                else:
+                    remaining.append((existing_origins, existing_score))
+            # A newly merged group can bridge previously disjoint roots.
+            changed = True
+            while changed:
+                changed = False
+                kept = []
+                for existing_origins, existing_score in remaining:
+                    if origins & existing_origins:
+                        origins |= existing_origins
+                        score = min(score, existing_score)
+                        changed = True
+                    else:
+                        kept.append((existing_origins, existing_score))
+                remaining = kept
+            grouped[dimension] = remaining + [(origins, score)]
+
+        assoc_scores = [score for _, score in grouped["association"]]
+        mech_scores = [score for _, score in grouped["mechanistic"]]
+        causal_scores = [score for _, score in grouped["causal"]]
 
         # Average dimensions
         assoc_conf = float(sum(assoc_scores) / len(assoc_scores)) if assoc_scores else 0.0

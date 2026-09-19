@@ -1,3 +1,5 @@
+> **Historical planning document:** Claims of completion, exact test counts, algorithm names and validation verdicts below describe earlier plans and are not current guarantees. See README.md, REPAIR_NOTES.md and the executable regression tests.
+
 # Project: Evidence-aware Agentic Computational Biology Platform (EACBP) Scientific Workflow OS (Phases V3–V5)
 
 ## Architecture Overview

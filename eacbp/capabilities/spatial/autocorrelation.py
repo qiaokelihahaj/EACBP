@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy import stats
+from scipy import sparse
 
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
 from eacbp.schemas.artifact import ArtifactType
@@ -19,25 +20,7 @@ from eacbp.capabilities.spatial.domain import (
 )
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
-
-
-def benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
-    """Calculates Benjamini-Hochberg FDR adjusted p-values."""
-    p_values = np.asarray(p_values, dtype=float)
-    n = len(p_values)
-    if n == 0:
-        return np.array([])
-    sorted_indices = np.argsort(p_values)
-    sorted_p = p_values[sorted_indices]
-    fdr = np.zeros(n)
-    curr_min = 1.0
-    for i in range(n - 1, -1, -1):
-        rank = i + 1
-        adj = (sorted_p[i] * n) / rank
-        curr_min = min(curr_min, adj)
-        fdr[i] = min(curr_min, 1.0)
-    rev_indices = np.argsort(sorted_indices)
-    return fdr[rev_indices]
+from eacbp.numerics import benjamini_hochberg
 
 
 def calculate_morans_i(
@@ -54,6 +37,8 @@ def calculate_morans_i(
     Returns:
         Tuple of (moran_i, expected_i, var_i, z_score, p_value)
     """
+    if sparse.issparse(x):
+        x = x.toarray()
     x = np.asarray(x, dtype=float).ravel()
     N = len(x)
     if N < 4:
@@ -66,20 +51,24 @@ def calculate_morans_i(
     if denom <= 1e-15:
         return 0.0, -1.0 / (N - 1), 0.0, 0.0, 1.0
     
-    S0 = float(np.sum(W))
+    is_sparse = sparse.issparse(W)
+    S0 = float(W.sum()) if is_sparse else float(np.sum(W))
     if S0 <= 1e-15:
         return 0.0, -1.0 / (N - 1), 0.0, 0.0, 1.0
     
-    numerator = float(np.dot(z, np.dot(W, z)))
+    numerator = float(np.dot(z, W.dot(z) if is_sparse else np.dot(W, z)))
     I = float((N / S0) * (numerator / denom))
     
     expected_I = -1.0 / (N - 1)
     
     W_plus_WT = W + W.T
-    S1 = 0.5 * float(np.sum(W_plus_WT ** 2))
-    
-    row_col_sums = np.sum(W, axis=1) + np.sum(W, axis=0)
-    S2 = float(np.sum(row_col_sums ** 2))
+    if is_sparse:
+        S1 = 0.5 * float(W_plus_WT.multiply(W_plus_WT).sum())
+        row_col_sums = np.asarray(W.sum(axis=1)).ravel() + np.asarray(W.sum(axis=0)).ravel()
+    else:
+        S1 = 0.5 * float(np.sum(W_plus_WT ** 2))
+        row_col_sums = np.sum(W, axis=1) + np.sum(W, axis=0)
+    S2 = float(np.sum(np.asarray(row_col_sums).ravel() ** 2))
     
     b2 = float((N * np.sum(z ** 4)) / (denom ** 2))
     
@@ -115,6 +104,8 @@ def calculate_gearys_c(
     Returns:
         Tuple of (geary_c, expected_c, var_c, z_score, p_value)
     """
+    if sparse.issparse(x):
+        x = x.toarray()
     x = np.asarray(x, dtype=float).ravel()
     N = len(x)
     if N < 4:
@@ -127,23 +118,34 @@ def calculate_gearys_c(
     if denom <= 1e-15:
         return 1.0, 1.0, 0.0, 0.0, 1.0
     
-    S0 = float(np.sum(W))
+    is_sparse = sparse.issparse(W)
+    S0 = float(W.sum()) if is_sparse else float(np.sum(W))
     if S0 <= 1e-15:
         return 1.0, 1.0, 0.0, 0.0, 1.0
     
     x_sq = x ** 2
-    row_sums = np.sum(W, axis=1)
-    col_sums = np.sum(W, axis=0)
-    diff_sq_sum = float(np.sum(x_sq * row_sums) + np.sum(x_sq * col_sums) - 2.0 * np.dot(x, np.dot(W, x)))
+    if is_sparse:
+        row_sums = np.asarray(W.sum(axis=1)).ravel()
+        col_sums = np.asarray(W.sum(axis=0)).ravel()
+        Wx = W.dot(x)
+    else:
+        row_sums = np.sum(W, axis=1)
+        col_sums = np.sum(W, axis=0)
+        Wx = np.dot(W, x)
+    diff_sq_sum = float(np.sum(x_sq * row_sums) + np.sum(x_sq * col_sums) - 2.0 * np.dot(x, Wx))
     
     C = float(((N - 1) / (2.0 * S0)) * (diff_sq_sum / denom))
     expected_C = 1.0
     
     # Analytical variance under randomization hypothesis (Cliff & Ord 1981 / Anselin 1995 / PySAL)
     W_plus_WT = W + W.T
-    S1 = 0.5 * float(np.sum(W_plus_WT ** 2))
-    row_col_sums = np.sum(W, axis=1) + np.sum(W, axis=0)
-    S2 = float(np.sum(row_col_sums ** 2))
+    if is_sparse:
+        S1 = 0.5 * float(W_plus_WT.multiply(W_plus_WT).sum())
+        row_col_sums = np.asarray(W.sum(axis=1)).ravel() + np.asarray(W.sum(axis=0)).ravel()
+    else:
+        S1 = 0.5 * float(np.sum(W_plus_WT ** 2))
+        row_col_sums = np.sum(W, axis=1) + np.sum(W, axis=0)
+    S2 = float(np.sum(np.asarray(row_col_sums).ravel() ** 2))
     b2 = float((N * np.sum(z ** 4)) / (denom ** 2))
     
     s02 = S0 * S0
@@ -220,12 +222,12 @@ class SpatialDEGCapability(BaseCapability):
         target_genes = contract.parameters.get("target_genes", None)
 
         # Build or retrieve spatial connectivity graph safely
-        if "spatial_connectivities" in data.obsm and isinstance(data.obsm["spatial_connectivities"], np.ndarray):
-            W = np.asarray(data.obsm["spatial_connectivities"], dtype=np.float32)
-        elif "spatial_connectivities" in data.uns and isinstance(data.uns["spatial_connectivities"], np.ndarray):
-            W = np.asarray(data.uns["spatial_connectivities"], dtype=np.float32)
-        elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and isinstance(data.obsp["spatial_connectivities"], np.ndarray):
-            W = np.asarray(data.obsp["spatial_connectivities"], dtype=np.float32)
+        if "spatial_connectivities" in data.obsm and (isinstance(data.obsm["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsm["spatial_connectivities"])):
+            W = data.obsm["spatial_connectivities"]
+        elif "spatial_connectivities" in data.uns and (isinstance(data.uns["spatial_connectivities"], np.ndarray) or sparse.issparse(data.uns["spatial_connectivities"])):
+            W = data.uns["spatial_connectivities"]
+        elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and (isinstance(data.obsp["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsp["spatial_connectivities"])):
+            W = data.obsp["spatial_connectivities"]
         else:
             W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors)
 

@@ -65,6 +65,7 @@ def test_full_kat8_cko_study_pipeline(tmp_path):
         n_con_mice=4,
         random_seed=42,
     )
+    raw_data.uns.update({"is_simulated": True, "data_origin": "synthetic_demo"})
 
     raw_uri = f"adata://{study_id}/raw/v1"
     manifest.data.raw_artifact_uri = raw_uri
@@ -76,6 +77,7 @@ def test_full_kat8_cko_study_pipeline(tmp_path):
         study_id=study_id,
         created_by_task="task_000_ingest",
         operation="raw_kat8_data_ingest",
+        summary_metrics={"is_simulated": True, "data_origin": "synthetic_demo"},
     )
 
     # 3. Run Autonomous Study
@@ -86,11 +88,14 @@ def test_full_kat8_cko_study_pipeline(tmp_path):
             "target_genes": ["Kat8", "Kansl1", "Cdkn1a", "Bax", "Cdk1", "Top2a"],
             "include_knowledge": True,
             "include_perturbation": True,
+            "mode": "demo",
         }
     )
 
     # 4. Verify Execution
     assert study_summary["study_id"] == study_id
+    assert study_summary["status"] == "success", study_summary["failures"]
+    assert study_summary["is_simulated"] is True
     assert study_summary["tasks_executed"] >= 8
     assert study_summary["artifacts_created"] >= 8
     assert study_summary["evidence_nodes_count"] >= 3

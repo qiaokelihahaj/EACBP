@@ -2,7 +2,8 @@
 SCData: Single-Cell Data container supporting AnnData interoperability and standalone matrices.
 """
 
-from typing import Dict, Any, Optional, List
+from copy import deepcopy
+from typing import Dict, Any, Optional, List, Mapping
 import numpy as np
 import pandas as pd
 
@@ -17,20 +18,108 @@ class SCData:
         var: pd.DataFrame,
         obsm: Optional[Dict[str, np.ndarray]] = None,
         uns: Optional[Dict[str, Any]] = None,
+        layers: Optional[Dict[str, Any]] = None,
+        raw: Optional[Any] = None,
+        obsp: Optional[Dict[str, Any]] = None,
+        varm: Optional[Dict[str, Any]] = None,
+        varp: Optional[Dict[str, Any]] = None,
     ):
         if hasattr(X, "tocsr"):
-            self.X = X.tocsr()
+            self.X = X.tocsr(copy=True)
         else:
-            self.X = np.asarray(X, dtype=np.float32)
-        self.obs = obs.copy()
-        self.var = var.copy()
-        self.obsm = obsm or {}
-        self.uns = uns or {}
+            self.X = np.asarray(X, dtype=np.float32).copy()
+        self.obs = obs.copy(deep=True) if isinstance(obs, pd.DataFrame) else pd.DataFrame(obs)
+        self.var = var.copy(deep=True) if isinstance(var, pd.DataFrame) else pd.DataFrame(var)
+        self.obsm = {k: self._copy_value(v) for k, v in (obsm or {}).items()}
+        self.uns = deepcopy(uns) if uns is not None else {}
+        self.layers = {k: self._copy_value(v) for k, v in (layers or {}).items()}
+        self.raw = self._normalize_raw(raw)
+        self.obsp = {k: self._copy_value(v) for k, v in (obsp or {}).items()}
+        self.varm = {k: self._copy_value(v) for k, v in (varm or {}).items()}
+        self.varp = {k: self._copy_value(v) for k, v in (varp or {}).items()}
 
         if len(self.obs) != self.X.shape[0]:
             raise ValueError(f"obs length ({len(self.obs)}) does not match X rows ({self.X.shape[0]})")
         if len(self.var) != self.X.shape[1]:
             raise ValueError(f"var length ({len(self.var)}) does not match X cols ({self.X.shape[1]})")
+        self._validate_slots()
+
+    @staticmethod
+    def _copy_value(value: Any) -> Any:
+        """Copy dense, sparse, pandas, and nested slot values safely."""
+        if hasattr(value, "copy"):
+            try:
+                return value.copy(deep=True)
+            except TypeError:
+                try:
+                    return value.copy()
+                except TypeError:
+                    pass
+        return deepcopy(value)
+
+    @classmethod
+    def _normalize_raw(cls, raw: Any) -> Optional[Dict[str, Any]]:
+        if raw is None:
+            return None
+        if isinstance(raw, Mapping):
+            normalized = deepcopy(dict(raw))
+        elif hasattr(raw, "X") and hasattr(raw, "var"):
+            normalized = {
+                "X": cls._copy_value(raw.X),
+                "var": raw.var.copy(deep=True),
+                "varm": {
+                    key: cls._copy_value(value)
+                    for key, value in getattr(raw, "varm", {}).items()
+                },
+            }
+            if hasattr(raw, "uns"):
+                normalized["uns"] = deepcopy(dict(raw.uns))
+        else:
+            raise TypeError(
+                "raw must be an AnnData.Raw/AnnData-like object or a dictionary"
+            )
+        if "X" not in normalized or "var" not in normalized:
+            raise ValueError("raw must contain X and var")
+        if not isinstance(normalized["var"], pd.DataFrame):
+            normalized["var"] = pd.DataFrame(normalized["var"])
+        normalized["X"] = cls._copy_value(normalized["X"])
+        normalized["varm"] = {
+            key: cls._copy_value(value)
+            for key, value in normalized.get("varm", {}).items()
+        }
+        if "uns" in normalized:
+            normalized["uns"] = deepcopy(normalized["uns"])
+        return normalized
+
+    @staticmethod
+    def _slot_shape(value: Any) -> tuple:
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            shape = np.asarray(value).shape
+        return tuple(shape)
+
+    def _validate_slots(self) -> None:
+        for key, value in self.layers.items():
+            if self._slot_shape(value) != self.shape:
+                raise ValueError(f"layers[{key!r}] shape does not match X: {self._slot_shape(value)}")
+        for key, value in self.obsm.items():
+            if len(self._slot_shape(value)) == 0 or self._slot_shape(value)[0] != self.n_obs:
+                raise ValueError(f"obsm[{key!r}] first dimension does not match n_obs")
+        for key, value in self.obsp.items():
+            if self._slot_shape(value) != (self.n_obs, self.n_obs):
+                raise ValueError(f"obsp[{key!r}] must be n_obs by n_obs")
+        for key, value in self.varm.items():
+            if len(self._slot_shape(value)) == 0 or self._slot_shape(value)[0] != self.n_vars:
+                raise ValueError(f"varm[{key!r}] first dimension does not match n_vars")
+        for key, value in self.varp.items():
+            if self._slot_shape(value) != (self.n_vars, self.n_vars):
+                raise ValueError(f"varp[{key!r}] must be n_vars by n_vars")
+        if self.raw is not None:
+            raw_shape = self._slot_shape(self.raw["X"])
+            if len(raw_shape) != 2 or raw_shape[0] != self.n_obs:
+                raise ValueError("raw.X first dimension does not match n_obs")
+            if len(self.raw["var"]) != raw_shape[1]:
+                raise ValueError("raw.var length does not match raw.X columns")
 
     @property
     def n_obs(self) -> int:
@@ -47,32 +136,132 @@ class SCData:
     def copy(self) -> "SCData":
         return SCData(
             X=self.X.copy(),
-            obs=self.obs.copy(),
-            var=self.var.copy(),
-            obsm={k: v.copy() for k, v in self.obsm.items()},
-            uns={k: v for k, v in self.uns.items()},
+            obs=self.obs.copy(deep=True),
+            var=self.var.copy(deep=True),
+            obsm={k: self._copy_value(v) for k, v in self.obsm.items()},
+            uns=deepcopy(self.uns),
+            layers={k: self._copy_value(v) for k, v in self.layers.items()},
+            raw=deepcopy(self.raw),
+            obsp={k: self._copy_value(v) for k, v in self.obsp.items()},
+            varm={k: self._copy_value(v) for k, v in self.varm.items()},
+            varp={k: self._copy_value(v) for k, v in self.varp.items()},
         )
 
     def subset_obs(self, mask: np.ndarray) -> "SCData":
+        mask_array = np.asarray(mask)
+        if mask_array.ndim != 1:
+            raise ValueError("obs mask must be one-dimensional")
+        if mask_array.dtype == bool:
+            if len(mask_array) != self.n_obs:
+                raise ValueError("boolean obs mask length does not match n_obs")
+            positions = np.flatnonzero(mask_array)
+        else:
+            positions = mask_array.astype(int, copy=False)
+            if np.any(positions < 0) or np.any(positions >= self.n_obs):
+                raise IndexError("obs subset positions are outside the valid range")
+
+        def subset_rows(value: Any) -> Any:
+            if hasattr(value, "iloc") and isinstance(value, pd.DataFrame):
+                return value.iloc[positions].copy(deep=True)
+            try:
+                return self._copy_value(value[positions])
+            except (IndexError, TypeError):
+                return self._copy_value(np.asarray(value)[positions])
+
+        def subset_pairwise(value: Any) -> Any:
+            if hasattr(value, "iloc") and isinstance(value, pd.DataFrame):
+                return value.iloc[positions, positions].copy(deep=True)
+            if hasattr(value, "tocsr"):
+                return value[positions][:, positions].copy()
+            array = np.asarray(value)
+            return array[np.ix_(positions, positions)].copy()
+
+        subset_raw = None
+        if self.raw is not None:
+            subset_raw = deepcopy(self.raw)
+            subset_raw["X"] = subset_rows(subset_raw["X"])
+            if "obs" in subset_raw and isinstance(subset_raw["obs"], pd.DataFrame):
+                subset_raw["obs"] = subset_raw["obs"].iloc[positions].copy(deep=True)
         return SCData(
-            X=self.X[mask],
-            obs=self.obs.iloc[mask].copy().reset_index(drop=True),
-            var=self.var.copy(),
-            obsm={k: v[mask] for k, v in self.obsm.items()},
-            uns=self.uns.copy(),
+            X=subset_rows(self.X),
+            obs=self.obs.iloc[positions].copy(deep=True),
+            var=self.var.copy(deep=True),
+            obsm={k: subset_rows(v) for k, v in self.obsm.items()},
+            uns=deepcopy(self.uns),
+            layers={k: subset_rows(v) for k, v in self.layers.items()},
+            raw=subset_raw,
+            obsp={k: subset_pairwise(v) for k, v in self.obsp.items()},
+            varm={k: self._copy_value(v) for k, v in self.varm.items()},
+            varp={k: self._copy_value(v) for k, v in self.varp.items()},
+        )
+
+    def subset_var(self, mask: np.ndarray) -> "SCData":
+        """Subset variables while keeping layers and pairwise slots aligned."""
+        mask_array = np.asarray(mask)
+        if mask_array.ndim != 1:
+            raise ValueError("var mask must be one-dimensional")
+        if mask_array.dtype == bool:
+            if len(mask_array) != self.n_vars:
+                raise ValueError("boolean var mask length does not match n_vars")
+            positions = np.flatnonzero(mask_array)
+        else:
+            positions = mask_array.astype(int, copy=False)
+            if np.any(positions < 0) or np.any(positions >= self.n_vars):
+                raise IndexError("var subset positions are outside the valid range")
+
+        def subset_cols(value: Any) -> Any:
+            if hasattr(value, "iloc") and isinstance(value, pd.DataFrame):
+                return value.iloc[:, positions].copy(deep=True)
+            if hasattr(value, "tocsr"):
+                return value[:, positions].copy()
+            return np.asarray(value)[:, positions].copy()
+
+        def subset_rows(value: Any) -> Any:
+            if hasattr(value, "iloc") and isinstance(value, pd.DataFrame):
+                return value.iloc[positions].copy(deep=True)
+            return self._copy_value(value[positions])
+
+        def subset_pairwise(value: Any) -> Any:
+            if hasattr(value, "tocsr"):
+                return value[positions][:, positions].copy()
+            array = np.asarray(value)
+            return array[np.ix_(positions, positions)].copy()
+
+        # AnnData.raw is an immutable snapshot in the original variable space;
+        # its columns may be a superset or use a different ordering, so a
+        # current-X variable subset must leave raw completely intact.
+        subset_raw = deepcopy(self.raw)
+        return SCData(
+            X=self.X[:, positions],
+            obs=self.obs.copy(deep=True),
+            var=self.var.iloc[positions].copy(deep=True),
+            obsm={k: self._copy_value(v) for k, v in self.obsm.items()},
+            uns=deepcopy(self.uns),
+            layers={k: subset_cols(v) for k, v in self.layers.items()},
+            raw=subset_raw,
+            obsp={k: self._copy_value(v) for k, v in self.obsp.items()},
+            varm={k: subset_rows(v) for k, v in self.varm.items()},
+            varp={k: subset_pairwise(v) for k, v in self.varp.items()},
         )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "X": self.X,
-            "obs": self.obs,
-            "var": self.var,
-            "obsm": self.obsm,
-            "uns": self.uns,
+            "X": self._copy_value(self.X),
+            "obs": self.obs.copy(deep=True),
+            "var": self.var.copy(deep=True),
+            "obsm": {k: self._copy_value(v) for k, v in self.obsm.items()},
+            "uns": deepcopy(self.uns),
+            "layers": {k: self._copy_value(v) for k, v in self.layers.items()},
+            "raw": deepcopy(self.raw),
+            "obsp": {k: self._copy_value(v) for k, v in self.obsp.items()},
+            "varm": {k: self._copy_value(v) for k, v in self.varm.items()},
+            "varp": {k: self._copy_value(v) for k, v in self.varp.items()},
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SCData":
+        if isinstance(data, cls):
+            return data.copy()
         obs = data["obs"] if isinstance(data["obs"], pd.DataFrame) else pd.DataFrame(data["obs"])
         var = data["var"] if isinstance(data["var"], pd.DataFrame) else pd.DataFrame(data["var"])
         return cls(
@@ -81,18 +270,40 @@ class SCData:
             var=var,
             obsm=data.get("obsm", {}),
             uns=data.get("uns", {}),
+            layers=data.get("layers", {}),
+            raw=data.get("raw"),
+            obsp=data.get("obsp", {}),
+            varm=data.get("varm", {}),
+            varp=data.get("varp", {}),
         )
 
     def to_anndata(self):
         """Converts SCData to scanpy/anndata AnnData instance."""
         import anndata as ad
         adata = ad.AnnData(
-            X=self.X,
-            obs=self.obs,
-            var=self.var,
-            obsm=self.obsm,
-            uns=self.uns,
+            X=self._copy_value(self.X),
+            obs=self.obs.copy(deep=True),
+            var=self.var.copy(deep=True),
+            obsm={k: self._copy_value(v) for k, v in self.obsm.items()},
+            layers={k: self._copy_value(v) for k, v in self.layers.items()},
+            uns=deepcopy(self.uns),
         )
+        adata.obsp = {k: self._copy_value(v) for k, v in self.obsp.items()}
+        adata.varm = {k: self._copy_value(v) for k, v in self.varm.items()}
+        if hasattr(adata, "varp"):
+            adata.varp = {k: self._copy_value(v) for k, v in self.varp.items()}
+        if self.raw is not None:
+            raw_kwargs = {
+                "X": self._copy_value(self.raw["X"]),
+                "var": self.raw["var"].copy(deep=True),
+                "varm": {
+                    k: self._copy_value(v)
+                    for k, v in self.raw.get("varm", {}).items()
+                },
+            }
+            if "uns" in self.raw:
+                raw_kwargs["uns"] = deepcopy(self.raw["uns"])
+            adata.raw = ad.AnnData(**raw_kwargs)
         return adata
 
     @classmethod
@@ -104,20 +315,20 @@ class SCData:
     ) -> "SCData":
         """Builds SCData directly from an anndata.AnnData object."""
         if max_cells is not None and adata.n_obs > max_cells:
-            np.random.seed(random_seed)
-            sub_idx = np.random.choice(adata.n_obs, size=max_cells, replace=False)
+            rng = np.random.default_rng(random_seed)
+            sub_idx = rng.choice(adata.n_obs, size=max_cells, replace=False)
             sub_idx.sort()
             adata = adata[sub_idx].copy()
 
         # Handle sparse or dense matrix
         X = adata.X
         if hasattr(X, "tocsr"):
-            X = X.tocsr()
+            X = X.tocsr(copy=True)
             n_counts = np.asarray(X.sum(axis=1)).flatten()
             n_genes = np.asarray((X > 0).sum(axis=1)).flatten()
             n_cells_per_gene = np.asarray((X > 0).sum(axis=0)).flatten()
         else:
-            X = np.asarray(X, dtype=np.float32)
+            X = np.asarray(X, dtype=np.float32).copy()
             n_counts = np.sum(X, axis=1)
             n_genes = np.sum(X > 0, axis=1)
             n_cells_per_gene = np.sum(X > 0, axis=0)
@@ -141,9 +352,23 @@ class SCData:
 
         obsm_dict = {}
         for k in adata.obsm.keys():
-            obsm_dict[k] = np.asarray(adata.obsm[k])
+            obsm_dict[k] = cls._copy_value(adata.obsm[k])
 
-        uns_dict = dict(adata.uns) if hasattr(adata, "uns") else {}
+        uns_dict = deepcopy(dict(adata.uns)) if hasattr(adata, "uns") else {}
+        layers_dict = {
+            k: cls._copy_value(adata.layers[k]) for k in adata.layers.keys()
+            if k is not None  # AnnData 0.13 exposes X as the None layer.
+        }
+        obsp_dict = {
+            k: cls._copy_value(adata.obsp[k]) for k in adata.obsp.keys()
+        }
+        varm_dict = {
+            k: cls._copy_value(adata.varm[k]) for k in adata.varm.keys()
+        }
+        varp_dict = {
+            k: cls._copy_value(adata.varp[k]) for k in adata.varp.keys()
+        } if hasattr(adata, "varp") else {}
+        raw_dict = cls._normalize_raw(adata.raw) if getattr(adata, "raw", None) is not None else None
 
         return cls(
             X=X,
@@ -151,6 +376,11 @@ class SCData:
             var=var,
             obsm=obsm_dict,
             uns=uns_dict,
+            layers=layers_dict,
+            raw=raw_dict,
+            obsp=obsp_dict,
+            varm=varm_dict,
+            varp=varp_dict,
         )
 
     @classmethod
@@ -260,7 +490,12 @@ class SCData:
             "n_cells": (X > 0).sum(axis=0),
         })
 
-        return cls(X=X, obs=obs, var=var)
+        return cls(
+            X=X,
+            obs=obs,
+            var=var,
+            uns={"is_simulated": True, "data_origin": "synthetic"},
+        )
 
     @classmethod
     def create_synthetic_kat8_study(
@@ -362,4 +597,9 @@ class SCData:
             "n_cells": (X > 0).sum(axis=0),
         })
 
-        return cls(X=X, obs=obs, var=var)
+        return cls(
+            X=X,
+            obs=obs,
+            var=var,
+            uns={"is_simulated": True, "data_origin": "synthetic"},
+        )

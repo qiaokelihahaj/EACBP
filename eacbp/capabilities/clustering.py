@@ -16,10 +16,20 @@ from eacbp.artifact.uri import ArtifactURI
 
 
 def simple_kmeans(X: np.ndarray, k: int = 4, max_iter: int = 50, random_seed: int = 42) -> np.ndarray:
-    """Deterministic K-Means clustering algorithm for KNN graph / embedding partitions."""
-    np.random.seed(random_seed)
+    """Run a small, deterministic Lloyd K-means implementation.
+
+    This helper is deliberately named after the algorithm that is actually
+    implemented.  It does not construct a KNN graph and must not be reported
+    as Leiden (the old public ``leiden_knn_v1`` name is handled as a caller
+    compatibility alias by the registry).
+    """
+    X = np.asarray(X, dtype=np.float32)
     n_samples = X.shape[0]
-    initial_idx = np.random.choice(n_samples, size=k, replace=False)
+    if n_samples == 0:
+        return np.zeros(0, dtype=int)
+    k = min(max(1, int(k)), n_samples)
+    rng = np.random.default_rng(random_seed)
+    initial_idx = rng.choice(n_samples, size=k, replace=False)
     centroids = X[initial_idx].copy()
 
     labels = np.zeros(n_samples, dtype=int)
@@ -36,14 +46,15 @@ def simple_kmeans(X: np.ndarray, k: int = 4, max_iter: int = 50, random_seed: in
     return labels
 
 
-def calculate_silhouette(X: np.ndarray, labels: np.ndarray) -> float:
+def calculate_silhouette(X: np.ndarray, labels: np.ndarray, random_seed: int = 42) -> float:
     """Calculates approximate average silhouette score across clusters."""
     unique_labels = np.unique(labels)
     if len(unique_labels) <= 1:
         return 0.0
     
     n = X.shape[0]
-    sample_indices = np.random.choice(n, size=min(n, 200), replace=False) if n > 200 else np.arange(n)
+    rng = np.random.default_rng(random_seed)
+    sample_indices = rng.choice(n, size=min(n, 200), replace=False) if n > 200 else np.arange(n)
     dists = cdist(X[sample_indices], X)
     
     sil_scores = []
@@ -71,16 +82,27 @@ def calculate_silhouette(X: np.ndarray, labels: np.ndarray) -> float:
 
 
 class ClusteringCapability(BaseCapability):
-    """Performs community detection (e.g. Leiden/KNN) and marker-guided cell annotation."""
+    """K-means clustering plus marker-score annotation.
 
-    def __init__(self):
+    Earlier releases exposed this simplified calculation as
+    ``leiden_knn_v1`` and wrote ``leiden``/``X_umap`` fields.  Those names
+    were scientifically misleading.  The constructor accepts that old ID as
+    a compatibility alias, while ``implementation_id`` and ``method_used``
+    always describe the calculation performed here.
+    """
+
+    def __init__(self, implementation_id: str = "kmeans_marker_embedding_v1"):
         super().__init__(
             capability_name="clustering",
-            implementation_id="leiden_knn_v1",
+            # ``leiden_knn_v1`` remains an accepted request alias in the
+            # registry, but this object reports the real implementation.
+            implementation_id="kmeans_marker_embedding_v1",
             implementation_type=ImplementationType.PYTHON_TOOL,
             accepts_types=[ArtifactType.ANNDATA],
             output_types=[ArtifactType.ANNDATA],
         )
+        self.requested_implementation_id = implementation_id
+        self.legacy_aliases = {"leiden_knn_v1": self.implementation_id}
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
@@ -101,21 +123,21 @@ class ClusteringCapability(BaseCapability):
         k_clusters = contract.parameters.get("k_clusters", 4)
         seed = contract.parameters.get("random_seed", 42)
 
-        # Community clustering
+        # This is K-means; no graph/community algorithm is involved.
         labels = simple_kmeans(emb, k=k_clusters, random_seed=seed)
-        silhouette = calculate_silhouette(emb, labels)
+        silhouette = calculate_silhouette(emb, labels, random_seed=seed)
 
-        # 2D UMAP-like mock projection for visualization
+        # A deterministic two-coordinate display projection.  It is not UMAP.
         u1 = emb[:, 0] + np.sin(emb[:, 1] if emb.shape[1] > 1 else emb[:, 0]) * 0.5
         u2 = emb[:, 1] if emb.shape[1] > 1 else emb[:, 0] + np.cos(emb[:, 0]) * 0.5
-        umap_coords = np.column_stack([u1, u2])
+        display_coords = np.column_stack([u1, u2]).astype(np.float32)
 
         # Automatic marker-guided cell type identification
         gene_names = list(data.var["gene_name"]) if "gene_name" in data.var.columns else [f"Gene_{i}" for i in range(data.n_vars)]
         name_to_idx = {g: i for i, g in enumerate(gene_names)}
 
         cluster_annotations = {}
-        for c in range(k_clusters):
+        for c in range(int(np.max(labels)) + 1 if len(labels) else 0):
             c_mask = (labels == c)
             c_expr = data.X[c_mask]
 
@@ -139,20 +161,33 @@ class ClusteringCapability(BaseCapability):
             best_type = max(scores, key=scores.get) if max(scores.values()) > 0.05 else f"Cluster_{c}"
             cluster_annotations[c] = best_type
 
-        # If cell_type_ground_truth is already present in obs, preserve or refine
-        if "cell_type_ground_truth" in data.obs.columns:
-            annotated_types = data.obs["cell_type_ground_truth"].tolist()
-        else:
-            annotated_types = [cluster_annotations[c] for c in labels]
+        # Never use a ground-truth annotation as a prediction.  The marker
+        # scores above are the only source of the inferred labels.
+        annotated_types = [cluster_annotations[c] for c in labels]
 
         clustered_data = data.copy()
-        clustered_data.obs["leiden"] = [str(c) for c in labels]
+        clustered_data.obs["cluster"] = [str(c) for c in labels]
         clustered_data.obs["cell_type"] = annotated_types
-        clustered_data.obsm["X_umap"] = umap_coords
+        clustered_data.obsm["X_embedding_2d"] = display_coords
         clustered_data.uns["clustering"] = {
+            "method": self.implementation_id,
+            "cluster_algorithm": "lloyd_kmeans",
+            "embedding_method": "pca_first_two_with_sine_display",
             "silhouette": silhouette,
-            "cluster_annotations": cluster_annotations,
+            # HDF5/AnnData requires string mapping keys.
+            "cluster_annotations": {str(k): v for k, v in cluster_annotations.items()},
         }
+
+        # Legacy columns are opt-in and explicitly marked.  This lets old
+        # consumers migrate without silently presenting K-means as Leiden or
+        # the display projection as UMAP.
+        if bool(contract.parameters.get("emit_legacy_aliases", False)):
+            clustered_data.obs["leiden"] = clustered_data.obs["cluster"]
+            clustered_data.obsm["X_umap"] = clustered_data.obsm["X_embedding_2d"]
+            clustered_data.uns["clustering"]["legacy_aliases"] = {
+                "leiden": "cluster",
+                "X_umap": "X_embedding_2d",
+            }
 
         uri_obj = ArtifactURI.parse(in_uri)
         out_uri = f"adata://{uri_obj.study_id}/annotated/v4"
@@ -163,7 +198,7 @@ class ClusteringCapability(BaseCapability):
             artifact_type=ArtifactType.ANNDATA,
             study_id=uri_obj.study_id,
             created_by_task=contract.task_id,
-            operation="cluster_and_annotate_cells",
+            operation="kmeans_cluster_and_marker_annotate_cells",
             parent_uris=[in_uri],
             parameters={"k_clusters": k_clusters, "random_seed": seed},
             summary_metrics={
@@ -180,7 +215,7 @@ class ClusteringCapability(BaseCapability):
             method_used=self.implementation_id,
             input_artifacts=[in_uri],
             output_artifacts=[out_uri],
-            executed_operations=["build_neighbor_graph", "find_clusters", "annotate_cell_types", "calculate_silhouette"],
+            executed_operations=["pca_first_two_display", "lloyd_kmeans", "marker_score_annotation", "calculate_silhouette"],
             metrics={
                 "silhouette_score": silhouette,
                 "identified_cell_types": list(set(annotated_types)),

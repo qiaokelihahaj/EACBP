@@ -275,6 +275,8 @@ def test_compound_perturbation_therapeutic_reversal(populated_registry):
         ],
         parameters={
             "compound_name": "Bexarotene",
+            "condition_a": "AD",
+            "condition_b": "control",
             "dosage": 1.0,
             "n_permutations": 300,
         },
@@ -319,6 +321,8 @@ def test_compound_perturbation_disease_exacerbator(populated_registry):
         input_artifacts=["adata://AD_TEST/microglia_subset/v1"],
         parameters={
             "compound_name": "Mock_Exacerbator",
+            "condition_a": "AD",
+            "condition_b": "control",
             "dosage": 1.0,
             "n_permutations": 200,
         },

@@ -283,11 +283,15 @@ class GeneAgentAdapter(BaseAgentAdapter):
 
         # 6. Register output artifacts
         # Artifact 1: Pathway Enrichment Table
-        out_table_uri = self._generate_output_uri(
-            study_id=study_id,
-            stage="gene_agent_pathways",
-            scheme="table",
-            version="v1",
+        out_table_uri = (
+            contract.expected_outputs[0]
+            if contract.expected_outputs
+            else self._generate_output_uri(
+                study_id=study_id,
+                stage="gene_agent_pathways",
+                scheme="table",
+                version="v1",
+            )
         )
         self._register_versioned_artifact(
             registry=registry,
@@ -307,11 +311,15 @@ class GeneAgentAdapter(BaseAgentAdapter):
         )
 
         # Artifact 2: JSON summary
-        out_json_uri = self._generate_output_uri(
-            study_id=study_id,
-            stage="gene_agent_summary",
-            scheme="json",
-            version="v1",
+        out_json_uri = (
+            contract.expected_outputs[1]
+            if len(contract.expected_outputs) > 1
+            else self._generate_output_uri(
+                study_id=study_id,
+                stage="gene_agent_summary",
+                scheme="json",
+                version="v1",
+            )
         )
         json_payload = {
             "study_id": study_id,

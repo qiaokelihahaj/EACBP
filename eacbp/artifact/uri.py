@@ -12,21 +12,57 @@ import re
 from typing import Tuple
 
 
-URI_REGEX = re.compile(r"^([a-zA-Z0-9_\-]+)://([a-zA-Z0-9_\-]+)/([a-zA-Z0-9_\-\./]+)/([a-zA-Z0-9_\-]+)$")
+URI_REGEX = re.compile(
+    r"^([a-zA-Z0-9_\-]+)://([a-zA-Z0-9_\-]+)/([a-zA-Z0-9_\-./]+)/([a-zA-Z0-9_\-]+)$"
+)
+_COMPONENT_REGEX = re.compile(r"^[A-Za-z0-9_-]+$")
+_NAME_COMPONENT_REGEX = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class ArtifactURI:
     def __init__(self, scheme: str, study_id: str, name: str, version: str):
         self.scheme = scheme.lower()
         self.study_id = study_id
-        self.name = name.strip("/")
+        self.name = name
         self.version = version
+        self._validate_components()
+
+    def _validate_components(self) -> None:
+        """Validate URI components before they can become filesystem paths.
+
+        Artifact names may contain slash-separated namespaces, but path traversal
+        components, backslashes, empty segments, and platform-specific absolute
+        path forms are rejected.  Keeping the validation here means callers that
+        only parse a URI receive the same safety guarantees as the storage layer.
+        """
+        if not _COMPONENT_REGEX.fullmatch(self.scheme):
+            raise ValueError(f"Invalid artifact URI scheme: {self.scheme!r}")
+        if not _COMPONENT_REGEX.fullmatch(self.study_id):
+            raise ValueError(f"Invalid artifact study_id: {self.study_id!r}")
+        if "\\" in self.name or self.name.startswith("/") or self.name.endswith("/"):
+            raise ValueError(f"Invalid artifact name path: {self.name!r}")
+        name_parts = self.name.split("/")
+        if not name_parts or any(
+            part in {"", ".", ".."} or not _NAME_COMPONENT_REGEX.fullmatch(part)
+            for part in name_parts
+        ):
+            raise ValueError(
+                f"Invalid artifact name path: {self.name!r}; path traversal is not allowed"
+            )
+        if not _COMPONENT_REGEX.fullmatch(self.version):
+            raise ValueError(f"Invalid artifact version: {self.version!r}")
 
     @classmethod
     def parse(cls, uri_str: str) -> "ArtifactURI":
-        match = URI_REGEX.match(uri_str.strip())
+        if not isinstance(uri_str, str):
+            raise TypeError("Artifact URI must be a string")
+        cleaned = uri_str.strip()
+        match = URI_REGEX.fullmatch(cleaned)
         if not match:
-            raise ValueError(f"Invalid artifact URI format: '{uri_str}'. Expected: scheme://study_id/artifact_name/version")
+            raise ValueError(
+                f"Invalid artifact URI format: '{uri_str}'. "
+                "Expected: scheme://study_id/artifact_name/version"
+            )
         scheme, study_id, name, version = match.groups()
         return cls(scheme=scheme, study_id=study_id, name=name, version=version)
 

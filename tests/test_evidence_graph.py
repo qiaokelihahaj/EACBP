@@ -84,13 +84,16 @@ def test_claim_engine_creates_traceable_claims():
         score=0.88,
         summary="M3 state is enriched in AD.",
         source_task_id="task_007",
+        audit_passed=True,
+        source_artifact_uris=["table://AD/abundance/v1"],
+        metrics={"fdr_q_value": 0.01},
     )
     eg.add_evidence(ev1)
 
     claim = engine.create_claim(
         claim_id="C103",
-        statement="APOE-high microglia may represent an AD-associated transitional state.",
-        language_tier=LanguageTier.LEVEL_3_SUPPORTED_INTERPRETATION,
+        statement=ev1.summary,
+        language_tier=LanguageTier.LEVEL_2_STATISTICAL_INFERENCE,
         claim_type=ClaimType.MECHANISTIC_HYPOTHESIS,
         causal_status="observational",
         support_evidence_ids=["E201"],

@@ -29,8 +29,30 @@ bio = [
     "scanpy>=1.9.0",
 ]
 
+standard = [
+    "anndata>=0.10",
+    "scanpy>=1.10",
+    "harmonypy==0.0.10",
+    "igraph>=0.11",
+    "leidenalg>=0.10",
+]
+fate = ["cellrank>=2.3,<3", "anndata>=0.11,<0.13"]
+advanced-statistics = [
+    "pydeseq2>=0.5.4",
+    "decoupler>=2.2.0",
+]
+advanced-qc = ["scanpy>=1.10", "scikit-image>=0.24", "celltypist>=1.7,<2"]
+communication = ["liana>=1.10,<2"]
+
+[project.scripts]
+eacbp = "eacbp.cli:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 pythonpath = ["."]
 addopts = "--basetemp=.pytest_temp"
+
+[tool.setuptools.packages.find]
+include = ["eacbp*"]
+exclude = ["tests*", "outputs*", "temp*", "scripts*"]

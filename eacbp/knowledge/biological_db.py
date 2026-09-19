@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 import scipy.stats as stats
 
+from eacbp.numerics import benjamini_hochberg as _benjamini_hochberg
+
 from eacbp.schemas.evidence import (
     EvidenceNode,
     EvidenceType,
@@ -571,33 +573,9 @@ class BiologicalDBRetriever:
 
     @staticmethod
     def benjamini_hochberg(p_values: List[float]) -> List[float]:
-        """
-        Calculates Benjamini-Hochberg False Discovery Rate (FDR) adjusted p-values (q-values).
-        Enforces monotonic step-up correction capped at 1.0.
-        """
-        m = len(p_values)
-        if m == 0:
-            return []
-        if m == 1:
-            return [min(1.0, float(p_values[0]))]
+        """Return BH q-values as a list for the historical knowledge API."""
 
-        # Pair with original index and sort ascending
-        indexed_p = sorted(enumerate(p_values), key=lambda x: x[1])
-        q_values = [1.0] * m
-
-        # Compute raw adjusted: p_(i) * m / i (1-based i)
-        raw_adj = []
-        for rank, (orig_idx, p_val) in enumerate(indexed_p, start=1):
-            adj = (p_val * m) / rank
-            raw_adj.append((orig_idx, adj))
-
-        # Enforce step-up monotonicity: min_{j >= i} raw_adj[j]
-        current_min = 1.0
-        for orig_idx, adj in reversed(raw_adj):
-            current_min = min(current_min, adj)
-            q_values[orig_idx] = max(0.0, min(1.0, current_min))
-
-        return q_values
+        return _benjamini_hochberg(p_values).tolist()
 
     def query_go(
         self,

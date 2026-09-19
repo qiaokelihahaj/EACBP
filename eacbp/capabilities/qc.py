@@ -34,14 +34,17 @@ class DatasetAuditCapability(BaseCapability):
         obs = data.obs
 
         # Audit biological units and conditions
-        condition_col = "condition" if "condition" in obs.columns else obs.columns[0]
-        mouse_col = "mouse_id" if "mouse_id" in obs.columns else "sample_id" if "sample_id" in obs.columns else None
-        batch_col = "batch" if "batch" in obs.columns else None
+        condition_col = contract.parameters.get("condition_col", "condition")
+        mouse_col = contract.parameters.get("donor_col") or next((c for c in ("donor_id", "donor", "mouse_id", "sample_id", "sample") if c in obs), None)
+        batch_col = contract.parameters.get("batch_col") or ("batch" if "batch" in obs.columns else None)
+        for key in ("condition_col", "donor_col", "batch_col"):
+            if contract.parameters.get(key) and contract.parameters[key] not in obs:
+                raise ValueError(f"Explicit metadata column {key} is absent: {contract.parameters[key]}")
 
         n_cells = data.n_obs
         n_genes = data.n_vars
-        conditions = obs[condition_col].unique().tolist()
-        batches = obs[batch_col].unique().tolist() if batch_col else ["single_batch"]
+        conditions = obs[condition_col].dropna().unique().tolist() if condition_col in obs else []
+        batches = obs[batch_col].dropna().unique().tolist() if batch_col else []
 
         donor_counts = {}
         if mouse_col:
@@ -49,17 +52,19 @@ class DatasetAuditCapability(BaseCapability):
                 donor_counts[cond] = int(obs[obs[condition_col] == cond][mouse_col].nunique())
         else:
             for cond in conditions:
-                donor_counts[cond] = 1
+                donor_counts[cond] = 0
 
-        min_reps = min(donor_counts.values()) if donor_counts else 1
-        sufficient_reps = min_reps >= 2
+        min_reps = min(donor_counts.values()) if donor_counts else 0
+        donor_complete = bool(mouse_col and not obs[mouse_col].isna().any() and obs[mouse_col].astype(str).str.strip().ne("").all())
+        sufficient_reps = min_reps >= 2 and donor_complete
+        paired_donors = bool(mouse_col and condition_col in obs and (obs.groupby(mouse_col)[condition_col].nunique() > 1).any())
         batch_effect_possible = len(batches) > 1
 
         audit_table = pd.DataFrame([{
             "n_cells": n_cells,
             "n_genes": n_genes,
-            "conditions": ", ".join(conditions),
-            "batches": ", ".join(batches),
+            "conditions": ", ".join(map(str, conditions)) or "unknown",
+            "batches": ", ".join(map(str, batches)) or "unknown",
             "donor_replicates": str(donor_counts),
             "min_replicates_per_condition": min_reps,
             "biological_replication_sufficient": sufficient_reps,
@@ -95,6 +100,15 @@ class DatasetAuditCapability(BaseCapability):
             executed_operations=["audit_metadata", "assess_replication", "assess_batches"],
             metrics={
                 "n_cells": n_cells,
+                "donor_replicates": donor_counts,
+                "observed_conditions": list(map(str, conditions)),
+                "condition_metadata_complete": condition_col in obs and not obs[condition_col].isna().any(),
+                "condition_col": condition_col,
+                "donor_col": mouse_col,
+                "donor_metadata_complete": donor_complete,
+                "paired_donors_observed": paired_donors,
+                "total_samples": int(obs[mouse_col].nunique()) if mouse_col else 0,
+                "batches": batches,
                 "min_replicates": min_reps,
                 "biological_replication_sufficient": sufficient_reps,
                 "batch_effect_possible": batch_effect_possible,

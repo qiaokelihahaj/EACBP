@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from scipy import stats
+from scipy import sparse
 
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
 from eacbp.schemas.artifact import ArtifactType
@@ -21,6 +22,11 @@ from eacbp.capabilities.base import BaseCapability, ImplementationType
 from eacbp.capabilities.sc_data import SCData
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
+
+
+MAX_DENSE_GRN_GENES = 512
+MAX_PERTURBATION_ELEMENTS = 20_000_000
+MAX_GRN_CORRELATION_ELEMENTS = 20_000_000
 
 
 def construct_grn_adjacency_from_data(
@@ -45,51 +51,65 @@ def construct_grn_adjacency_from_data(
     A : np.ndarray, shape (N_genes, N_genes)
         Row-normalized adjacency matrix with zero diagonal and spectral radius bounded.
     """
+    if sparse.issparse(X):
+        X = X.toarray()
+    X = np.asarray(X, dtype=np.float32)
     n_cells, n_genes = X.shape
+    if int(n_cells) * int(n_genes) > MAX_GRN_CORRELATION_ELEMENTS:
+        raise ValueError(
+            f"GRN correlation is limited to {MAX_GRN_CORRELATION_ELEMENTS:,} input elements; provide a precomputed sparse adjacency"
+        )
     if n_genes <= 1:
         return np.zeros((n_genes, n_genes), dtype=np.float32)
 
-    # Compute correlation matrix safely
+    # A bounded dense path keeps the simple implementation usable for small
+    # demos.  Larger matrices use blockwise top-k correlations and return CSR
+    # so an accidental GxG allocation cannot occur.
     std = np.std(X, axis=0)
     valid_genes = std > 1e-8
     
-    # Gene-gene Pearson correlation
-    corr = np.zeros((n_genes, n_genes), dtype=np.float32)
-    if np.any(valid_genes):
-        valid_indices = np.where(valid_genes)[0]
-        sub_X = X[:, valid_indices]
-        # Standardize sub_X
-        sub_centered = sub_X - np.mean(sub_X, axis=0)
-        sub_norm = np.sqrt(np.sum(sub_centered ** 2, axis=0)) + 1e-8
-        sub_std = sub_centered / sub_norm
-        sub_corr = np.dot(sub_std.T, sub_std)
-        
-        # Place into full matrix
-        for i_idx, g_i in enumerate(valid_indices):
-            for j_idx, g_j in enumerate(valid_indices):
-                corr[g_i, g_j] = sub_corr[i_idx, j_idx]
+    valid_indices = np.where(valid_genes)[0]
+    if len(valid_indices) == 0:
+        return np.zeros((n_genes, n_genes), dtype=np.float32) if n_genes <= MAX_DENSE_GRN_GENES else sparse.csr_matrix((n_genes, n_genes), dtype=np.float32)
 
-    # Zero diagonal (no self-loops in propagation matrix)
-    np.fill_diagonal(corr, 0.0)
+    centered = X[:, valid_indices] - np.mean(X[:, valid_indices], axis=0, keepdims=True)
+    normalized = centered / (np.sqrt(np.sum(centered ** 2, axis=0, keepdims=True)) + 1e-8)
+    degree = min(max(1, int(max_degree or 32)), max(1, n_genes - 1))
 
-    # Apply soft/hard threshold
-    adj = np.where(np.abs(corr) >= threshold, corr, 0.0)
+    if n_genes <= MAX_DENSE_GRN_GENES:
+        corr = np.zeros((n_genes, n_genes), dtype=np.float32)
+        corr_sub = normalized.T @ normalized
+        corr[np.ix_(valid_indices, valid_indices)] = corr_sub
+        np.fill_diagonal(corr, 0.0)
+        adj = np.where(np.abs(corr) >= threshold, corr, 0.0)
+        if max_degree is not None and degree < n_genes:
+            for i in range(n_genes):
+                keep = np.argpartition(np.abs(adj[i]), -degree)[-degree:]
+                mask = np.zeros(n_genes, dtype=bool)
+                mask[keep] = True
+                adj[i, ~mask] = 0.0
+        row_sums = np.sum(np.abs(adj), axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        return (adj / row_sums).astype(np.float32)
 
-    # Optionally prune to top k degrees per gene
-    if max_degree is not None and max_degree < n_genes:
-        for i in range(n_genes):
-            row = adj[i]
-            top_k_indices = np.argsort(np.abs(row))[-max_degree:]
-            mask = np.zeros(n_genes, dtype=bool)
-            mask[top_k_indices] = True
-            adj[i, ~mask] = 0.0
-
-    # Row-normalize adjacency matrix: sum(|A_ij|) <= 1
-    row_sums = np.sum(np.abs(adj), axis=1, keepdims=True)
+    # Blockwise top-k correlation edges.  The largest temporary is
+    # (block_size x number_of_genes), never a dense GxG matrix.
+    rows, cols, vals = [], [], []
+    block_size = 64
+    for start in range(0, len(valid_indices), block_size):
+        block_gene_idx = valid_indices[start : start + block_size]
+        scores = normalized[:, start : start + len(block_gene_idx)].T @ normalized
+        for local_i, gene_i in enumerate(block_gene_idx):
+            scores[local_i, gene_i] = 0.0
+            candidate = np.flatnonzero(np.abs(scores[local_i]) >= threshold)
+            if len(candidate) > degree:
+                candidate = candidate[np.argpartition(np.abs(scores[local_i, candidate]), -degree)[-degree:]]
+            for gene_j in candidate:
+                rows.append(int(gene_i)); cols.append(int(gene_j)); vals.append(float(scores[local_i, gene_j]))
+    adj = sparse.coo_matrix((vals, (rows, cols)), shape=(n_genes, n_genes), dtype=np.float32).tocsr()
+    row_sums = np.asarray(np.abs(adj).sum(axis=1)).ravel()
     row_sums[row_sums == 0] = 1.0
-    A = adj / row_sums
-
-    return A.astype(np.float32)
+    return sparse.diags(1.0 / row_sums).dot(adj).tocsr().astype(np.float32)
 
 
 def compute_grn_propagator(
@@ -111,23 +131,37 @@ def compute_grn_propagator(
     M : np.ndarray, shape (G, G)
         Inverted propagation matrix.
     """
-    n_genes = A.shape[0]
-    # Bound alpha to ensure stability
+    if sparse.issparse(A):
+        A_work = A.tocsr().astype(np.float32)
+        n_genes = A_work.shape[0]
+        sparse_output = True
+    else:
+        A_work = np.asarray(A, dtype=np.float32)
+        if A_work.ndim != 2 or A_work.shape[0] != A_work.shape[1]:
+            raise ValueError("GRN adjacency must be a square matrix")
+        n_genes = A_work.shape[0]
+        if n_genes > MAX_DENSE_GRN_GENES:
+            raise ValueError(
+                f"Dense GRN propagation is limited to {MAX_DENSE_GRN_GENES} genes; provide a CSR adjacency for larger networks"
+            )
+        sparse_output = False
     alpha_clamped = max(0.0, min(0.9, float(alpha)))
-    I = np.eye(n_genes, dtype=np.float32)
-    
+    if sparse_output:
+        identity = sparse.eye(n_genes, format="csr", dtype=np.float32)
+    else:
+        identity = np.eye(n_genes, dtype=np.float32)
     if alpha_clamped == 0.0:
-        return I
+        return identity
 
-    # Invert (I - alpha * A)
-    system_mat = I - alpha_clamped * A
-    try:
-        M = np.linalg.inv(system_mat)
-    except np.linalg.LinAlgError:
-        # Fallback to Neumann series expansion if singular
-        M = I + alpha_clamped * A + (alpha_clamped ** 2) * np.dot(A, A)
-
-    return M.astype(np.float32)
+    # Neumann truncation avoids an unbounded dense inverse.  Row L1-normalised
+    # A and alpha<1 make the omitted tail geometrically bounded.
+    terms = 12
+    result = identity.copy()
+    power = identity.copy()
+    for order in range(1, terms + 1):
+        power = power.dot(A_work) if sparse_output else power @ A_work
+        result = result + (alpha_clamped ** order) * power
+    return result.astype(np.float32)
 
 
 class GeneticPerturbationCapability(BaseCapability):
@@ -159,8 +193,13 @@ class GeneticPerturbationCapability(BaseCapability):
         meta, payload = registry.get(in_uri)
 
         data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-        X = data.X.toarray() if hasattr(data.X, "toarray") else data.X.copy()
-        n_cells, n_genes = X.shape
+        n_cells, n_genes = data.X.shape
+        if int(n_cells) * int(n_genes) > MAX_PERTURBATION_ELEMENTS:
+            raise ValueError(
+                f"Genetic perturbation dense cell-state simulation is limited to {MAX_PERTURBATION_ELEMENTS:,} matrix elements; "
+                "subset cells/genes or provide a sparse/local model"
+            )
+        X = data.X.toarray() if hasattr(data.X, "toarray") else np.asarray(data.X, dtype=np.float32).copy()
 
         # Resolve gene names
         if "gene_name" in data.var.columns:
@@ -183,8 +222,10 @@ class GeneticPerturbationCapability(BaseCapability):
         custom_adjacency = params.get("grn_adjacency", None)
 
         if not target_genes or target_genes == [None]:
-            # Default to first marker or top expressed gene if not specified
-            target_genes = [gene_names[0]]
+            raise ValueError(
+                "Genetic perturbation requires an explicit target_gene or target_genes; "
+                "a default marker would make the perturbation hypothesis implicit"
+            )
 
         # Validate target genes exist
         target_indices = []
@@ -194,12 +235,31 @@ class GeneticPerturbationCapability(BaseCapability):
             target_indices.append(gene_name_to_idx[g])
 
         # Step 1: Construct or load GRN adjacency matrix
+        network_source = None
+        network_verified = False
         if custom_adjacency is not None:
-            A = np.asarray(custom_adjacency, dtype=np.float32)
+            if sparse.issparse(custom_adjacency):
+                A = custom_adjacency.tocsr().astype(np.float32)
+            else:
+                if n_genes > MAX_DENSE_GRN_GENES:
+                    raise ValueError(
+                        f"Dense custom GRN adjacency is limited to {MAX_DENSE_GRN_GENES} genes; pass scipy.sparse.csr_matrix for a larger local graph"
+                    )
+                A = np.asarray(custom_adjacency, dtype=np.float32)
             if A.shape != (n_genes, n_genes):
                 raise ValueError(f"Custom GRN adjacency matrix shape {A.shape} does not match gene count ({n_genes}, {n_genes}).")
+            if not np.isfinite(A.data if sparse.issparse(A) else A).all():
+                raise ValueError("Custom GRN adjacency contains non-finite values")
+            network_source = str(params.get("grn_source", "user_provided_unverified"))
+            network_verified = bool(params.get("grn_verified", False))
         else:
             A = construct_grn_adjacency_from_data(X, threshold=0.05)
+            # Correlations are useful for a counterfactual demo, but they are
+            # not a validated regulatory network.  Record that distinction in
+            # every output so downstream reports cannot present the result as
+            # an experimentally established GRN effect.
+            network_source = "expression_correlation_inferred"
+            network_verified = False
 
         # Step 2: Build initial perturbation matrix V (N_cells x N_genes)
         V = np.zeros((n_cells, n_genes), dtype=np.float32)
@@ -222,7 +282,10 @@ class GeneticPerturbationCapability(BaseCapability):
         # Step 3: Propagate perturbation through GRN: Delta X = V * (I - alpha * A)^{-1}
         M = compute_grn_propagator(A, alpha=alpha)
         # Delta X = V * M (where M_ij represents downstream effect of gene i on gene j)
-        delta_X = np.dot(V, M)
+        delta_X = V.dot(M)
+        if sparse.issparse(delta_X):
+            delta_X = delta_X.toarray()
+        delta_X = np.asarray(delta_X, dtype=np.float32)
 
         # Step 4: Compute simulated post-perturbation expression matrix
         X_perturbed = np.maximum(0.0, X + delta_X).astype(np.float32)
@@ -262,49 +325,51 @@ class GeneticPerturbationCapability(BaseCapability):
         perturb_df = pd.DataFrame(results).sort_values("expression_shift", key=abs, ascending=False).reset_index(drop=True)
 
         # Step 6: Compute Latent State Shift & Reversion Rate
-        reversion_rate = 0.0
+        reversion_rate = None
+        state_reversion_available = False
         obs = data.obs
         cond_col = "condition" if "condition" in obs.columns else None
 
-        # Approximate PCA projection for latent state shift
-        if "X_pca" in data.obsm:
-            orig_pca = data.obsm["X_pca"]
-        else:
-            # Simple PCA projection
-            centered = X - np.mean(X, axis=0)
-            u, s, vt = np.linalg.svd(centered, full_matrices=False)
-            orig_pca = u[:, :min(10, n_genes)] * s[:min(10, n_genes)]
-
-        # Project delta_X to latent space: delta_Z = delta_X * V_pca
-        if n_genes > 1:
-            centered_base = X - np.mean(X, axis=0)
-            _, _, vt = np.linalg.svd(centered_base, full_matrices=False)
-            pca_components = vt[:min(orig_pca.shape[1], vt.shape[0])].T
-            delta_pca = np.dot(delta_X, pca_components)
-            perturbed_pca = orig_pca[:, :pca_components.shape[1]] + delta_pca
-        else:
-            perturbed_pca = orig_pca.copy()
+        # Both states must use the same fitted basis. Existing Harmony/PCA
+        # coordinates cannot be added to a delta projected onto a new basis.
+        centered_base = X - np.mean(X, axis=0)
+        _, _, vt = np.linalg.svd(centered_base, full_matrices=False)
+        pca_components = vt[:min(10, vt.shape[0])].T
+        orig_pca = centered_base @ pca_components
+        perturbed_pca = orig_pca + delta_X @ pca_components
 
         # If disease and control conditions exist, calculate reversion rate
-        if cond_col and len(obs[cond_col].unique()) >= 2:
-            conditions = obs[cond_col].unique()
-            cond_disease = "AD" if "AD" in conditions else conditions[0]
-            cond_ctrl = "control" if "control" in conditions else conditions[1]
+        reversion_conditions = None
+        if cond_col and len(obs[cond_col].dropna().unique()) >= 2:
+            conditions = list(obs[cond_col].dropna().unique())
+            cond_disease = params.get("condition_disease")
+            cond_ctrl = params.get("condition_control")
+            if cond_disease is None or cond_ctrl is None:
+                # Infer only common, unambiguous labels.  Arbitrary A/B labels
+                # do not establish which group is a disease baseline.
+                normalized = {str(value).strip().lower(): value for value in conditions}
+                disease_keys = ("ad", "disease", "case", "treated", "cko", "mutant")
+                control_keys = ("control", "ctrl", "healthy", "wt", "wildtype", "con")
+                cond_disease = next((normalized[key] for key in disease_keys if key in normalized), None)
+                cond_ctrl = next((normalized[key] for key in control_keys if key in normalized), None)
+            if cond_disease is not None and cond_ctrl is not None and cond_disease != cond_ctrl:
+                reversion_conditions = {"condition_disease": str(cond_disease), "condition_control": str(cond_ctrl)}
 
-            mask_dis = (obs[cond_col] == cond_disease).values
-            mask_ctrl = (obs[cond_col] == cond_ctrl).values
+                mask_dis = (obs[cond_col] == cond_disease).values
+                mask_ctrl = (obs[cond_col] == cond_ctrl).values
 
-            if np.sum(mask_dis) > 0 and np.sum(mask_ctrl) > 0:
-                center_dis_orig = np.mean(orig_pca[mask_dis], axis=0)
-                center_ctrl = np.mean(orig_pca[mask_ctrl], axis=0)
-                center_dis_perturbed = np.mean(perturbed_pca[mask_dis], axis=0)
+                if np.sum(mask_dis) > 0 and np.sum(mask_ctrl) > 0:
+                    center_dis_orig = np.mean(orig_pca[mask_dis], axis=0)
+                    center_ctrl = np.mean(orig_pca[mask_ctrl], axis=0)
+                    center_dis_perturbed = np.mean(perturbed_pca[mask_dis], axis=0)
 
-                dist_baseline = float(np.linalg.norm(center_dis_orig - center_ctrl))
-                dist_perturbed = float(np.linalg.norm(center_dis_perturbed - center_ctrl))
+                    dist_baseline = float(np.linalg.norm(center_dis_orig - center_ctrl))
+                    dist_perturbed = float(np.linalg.norm(center_dis_perturbed - center_ctrl))
 
-                if dist_baseline > 1e-6:
-                    reversion_rate = float((dist_baseline - dist_perturbed) / dist_baseline)
-                    reversion_rate = max(-1.0, min(1.0, reversion_rate))
+                    if dist_baseline > 1e-6:
+                        reversion_rate = float((dist_baseline - dist_perturbed) / dist_baseline)
+                        reversion_rate = max(-1.0, min(1.0, reversion_rate))
+                        state_reversion_available = True
 
         # Build output SCData
         res_data = data.copy()
@@ -316,7 +381,12 @@ class GeneticPerturbationCapability(BaseCapability):
             "efficiency": efficiency,
             "network_attenuation": alpha,
             "reversion_rate": reversion_rate,
+            "reversion_conditions": reversion_conditions,
             "mean_shift": mean_shift,
+            "network_source": network_source,
+            "network_verified": network_verified,
+            "network_semantics": "regulatory_network" if network_verified else "expression_association_counterfactual",
+            "state_reversion_available": state_reversion_available,
         }
 
         # Format URIs
@@ -360,6 +430,9 @@ class GeneticPerturbationCapability(BaseCapability):
                 "reversion_rate": reversion_rate,
                 "perturbed_cells": n_cells,
                 "mean_absolute_shift": float(np.mean(abs_shift)),
+                "network_source": network_source,
+                "network_verified": network_verified,
+                "state_reversion_available": state_reversion_available,
             }
         )
 
@@ -374,6 +447,8 @@ class GeneticPerturbationCapability(BaseCapability):
             summary_metrics={
                 "target_genes": target_genes,
                 "top_downstream_genes": perturb_df[~perturb_df["is_target_gene"]]["gene"].head(5).tolist(),
+                "network_source": network_source,
+                "network_verified": network_verified,
             }
         )
 
@@ -396,9 +471,12 @@ class GeneticPerturbationCapability(BaseCapability):
                 "target_genes": target_genes,
                 "perturbation_type": perturb_type,
                 "reversion_rate": reversion_rate,
+                "state_reversion_available": state_reversion_available,
                 "mean_absolute_shift": float(np.mean(abs_shift)),
                 "top_perturbed_genes": perturb_df["gene"].head(10).tolist(),
                 "top_downstream_genes": top_downstream,
+                "network_source": network_source,
+                "network_verified": network_verified,
             }
         )
 
@@ -407,7 +485,7 @@ def generate_genetic_perturbation_evidence(
     contract: TaskContract,
     result: TaskResult,
     target_gene: str,
-    reversion_rate: float,
+    reversion_rate: Optional[float],
     perturbation_type: str = "knockout",
 ) -> EvidenceNode:
     """
@@ -417,6 +495,45 @@ def generate_genetic_perturbation_evidence(
     out_uris = result.output_artifacts
     task_id = contract.task_id
     
+    state_reversion_available = result.metrics.get(
+        "state_reversion_available", reversion_rate is not None
+    )
+    network_source = result.metrics.get("network_source", "unspecified")
+    network_verified = bool(result.metrics.get("network_verified", False))
+
+    # A missing state annotation is a normal, explicitly represented outcome;
+    # it must not be turned into a zero/positive reversion claim by a default.
+    if reversion_rate is None or not state_reversion_available:
+        return EvidenceNode(
+            evidence_id=f"E_perturb_{target_gene}_{task_id}",
+            type=EvidenceType.PERTURBATION,
+            polarity=EvidencePolarity.NEUTRAL,
+            strength=EvidenceStrength.INSUFFICIENT,
+            score=0.0,
+            summary=(
+                f"In silico {perturbation_type} simulation of {target_gene} produced a "
+                "counterfactual expression matrix, but state reversion was not estimable "
+                "because no validated disease/control state labels were available."
+            ),
+            source_task_id=task_id,
+            source_artifact_uris=out_uris,
+            metrics={
+                "target_gene": target_gene,
+                "perturbation_type": perturbation_type,
+                "state_reversion_available": False,
+                "network_source": network_source,
+                "network_verified": network_verified,
+                "in_silico_confidence_cap": 0.50,
+            },
+            biological_context={
+                "target_gene": target_gene,
+                "causal_status": "in_silico_perturbed",
+                "state_claim": "not_estimable",
+            },
+            is_simulated=True,
+            source_verified=False,
+        )
+
     # Quantitative score calibrated and capped at 0.50
     normalized_score = max(0.10, min(0.50, float(abs(reversion_rate))))
 
@@ -448,9 +565,15 @@ def generate_genetic_perturbation_evidence(
             "reversion_rate": reversion_rate,
             "in_silico_confidence_cap": 0.50,
             "model": "grn_linear_propagation",
+            "network_source": network_source,
+            "network_verified": network_verified,
+            "state_reversion_available": True,
         },
         biological_context={
             "target_gene": target_gene,
             "causal_status": "in_silico_perturbed",
+            "network_semantics": "validated_regulatory_network" if network_verified else "expression_association_counterfactual",
         },
+        is_simulated=True,
+        source_verified=False,
     )

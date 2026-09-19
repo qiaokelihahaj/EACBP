@@ -179,7 +179,8 @@ def create_synthetic_spatial_ad_study(
         "X_pca": base_rate[:, :min(20, n_genes)].astype(np.float32),
     }
 
-    return SCData(X=X, obs=obs, var=var, obsm=obsm)
+    return SCData(X=X, obs=obs, var=var, obsm=obsm,
+                  uns={"is_simulated": True, "data_origin": "synthetic_spatial"})
 
 
 __all__ = [

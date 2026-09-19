@@ -37,6 +37,9 @@ class SentenceProvenanceTracker:
                 if self.artifact_registry.exists(uri):
                     meta = self.artifact_registry.get_metadata(uri)
                     lineage_path = self.artifact_registry.lineage.get_lineage_path_from_root(uri)
+                    ancestors = set(self.artifact_registry.lineage.get_ancestors(uri)) | {uri}
+                    lineage_edges = [(a, b) for a, b in self.artifact_registry.lineage.graph.edges
+                                     if a in ancestors and b in ancestors]
                     artifact_details.append({
                         "uri": uri,
                         "type": meta.type.value,
@@ -46,6 +49,8 @@ class SentenceProvenanceTracker:
                         "software": meta.software_versions,
                         "random_seed": meta.random_seed,
                         "lineage_path": lineage_path,
+                        "ancestor_artifacts": sorted(ancestors),
+                        "lineage_edges": lineage_edges,
                     })
 
             evidence_chain.append({

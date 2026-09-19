@@ -6,6 +6,10 @@ Outputs comprehensive publication-grade markdown scientific study report.
 
 import os
 import sys
+import argparse
+import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -31,10 +35,33 @@ from eacbp.capabilities.sc_data import SCData
 from eacbp.report.markdown_report import ScientificReportGenerator
 
 
-def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_cells: int = 1500):
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _validate_output_component(value: str, label: str) -> str:
+    value = str(value or "")
+    if value in {".", ".."} or not _SAFE_COMPONENT.fullmatch(value):
+        raise ValueError(f"{label} must be a single safe path component, got {value!r}")
+    return value
+
+
+def run_kat8_cKO_autonomous_study(
+    output_dir: Path,
+    data_path: Path = None,
+    n_cells: int = 1500,
+    mode: str = "real",
+    run_id: str = None,
+):
+    mode = str(mode).strip().lower()
+    if mode not in {"real", "demo"}:
+        raise ValueError("mode must be 'real' or 'demo'")
     output_dir.mkdir(parents=True, exist_ok=True)
-    storage_dir = output_dir / "artifacts_kat8_cKO"
-    reports_dir = output_dir / "reports"
+    run_id = str(run_id or (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:10]))
+    run_id = _validate_output_component(run_id, "run_id")
+    run_dir = output_dir / "runs" / "Kat8_P12_cKO_SingleCell_Study_001" / run_id
+    storage_dir = run_dir / "artifacts_kat8_cKO"
+    storage_dir.mkdir(parents=True, exist_ok=False)
+    reports_dir = run_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
@@ -67,7 +94,10 @@ def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_ce
 
     # 3. Data Ingestion (from real h5ad if available or high-res structured profile)
     print(f"\n[Plane 2: Compute] Ingesting Single-Cell Data into Content-Addressed Storage...")
-    if data_path and data_path.exists() and data_path.suffix == ".h5ad":
+    raw_data = None
+    if mode == "real" and not (data_path and data_path.is_file() and data_path.suffix == ".h5ad"):
+        print("[Plane 2: Compute] INCOMPLETE: mode=real requires an existing .h5ad data_path")
+    elif data_path and data_path.exists() and data_path.suffix == ".h5ad":
         print(f"Loading data from file: {data_path}")
         raw_data = SCData.from_h5ad(str(data_path), max_cells=n_cells)
     else:
@@ -83,7 +113,7 @@ def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_ce
     raw_uri = f"adata://{study_id}/raw/v1"
     manifest.data.raw_artifact_uri = raw_uri
 
-    if not registry.exists(raw_uri):
+    if raw_data is not None and not registry.exists(raw_uri):
         reg_meta = registry.register(
             uri_str=raw_uri,
             payload=raw_data.to_dict(),
@@ -92,9 +122,10 @@ def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_ce
             created_by_task="task_000_ingest",
             operation="raw_kat8_data_ingest",
         )
-    else:
+    elif raw_data is not None:
         reg_meta = registry.get_metadata(raw_uri)
-    print(f"Raw Data Registered: {raw_uri} (SHA256: {reg_meta.sha256_hash[:16]}...)")
+    if raw_data is not None:
+        print(f"Raw Data Registered: {raw_uri} (SHA256: {reg_meta.sha256_hash[:16]}...)")
 
     # 4. Execute Full Multi-Plane Autonomous Study Workflow
     print(f"\n[Orchestrator] Executing 6-Plane Scientific Task DAG...")
@@ -106,6 +137,7 @@ def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_ce
             "include_knowledge": True,
             "include_perturbation": True,
             "run_compound_perturbation": False,
+            "mode": mode,
         }
     )
 
@@ -117,7 +149,7 @@ def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_ce
 
     # 5. Review Independent Scientific Audits
     print(f"\n[Plane 3: Auditor] Scientific Audit Verification:")
-    all_passed = True
+    all_passed = study_summary.get("status") == "success"
     for report in orchestrator.audit_reports:
         status_str = "[PASSED]" if report.overall_passed else "[FAILED]"
         print(f"  {status_str} Task: {report.target_task_id:<30} Target: {report.target_artifact_uri}")
@@ -127,7 +159,10 @@ def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_ce
                 if not c.passed:
                     print(f"      -> Warning: {c.message}")
 
-    print(f"Overall Audit Status: {'ALL CHECKS PASSED' if all_passed else 'AUDIT WARNINGS FLAGGED'}")
+    print(f"Overall Audit Status: {'ALL CHECKS PASSED' if all_passed else 'INCOMPLETE / FAILURES PRESENT'}")
+    if study_summary.get("failures"):
+        for failure in study_summary["failures"]:
+            print(f"  Failure: {failure.get('task_id')}: {failure.get('error')}")
 
     # 6. Print Evidence DAG and Calibrated Claims
     print(f"\n[Plane 4: Evidence & Claim] Synthesized Scientific Claims (4-Tier Protocol):")
@@ -156,11 +191,25 @@ def run_kat8_cKO_autonomous_study(output_dir: Path, data_path: Path = None, n_ce
 
     print(f"Report Generated and Saved to: {report_path}")
     print("\n" + "=" * 80)
-    print("EACBP Study Execution Finished Successfully!")
+    if study_summary.get("status") == "success":
+        print("EACBP Study Execution Finished Successfully!")
+    else:
+        print("EACBP Study finished INCOMPLETE; see the report and failure summary.")
     print("=" * 80)
     return report_path, study_summary
 
 
 if __name__ == "__main__":
-    out_dir = PROJECT_ROOT / "outputs"
-    run_kat8_cKO_autonomous_study(output_dir=out_dir)
+    parser = argparse.ArgumentParser(description="Run the Kat8 single-cell study")
+    parser.add_argument("--output-dir", type=str, default=str(PROJECT_ROOT / "outputs"))
+    parser.add_argument("--data-path", type=str, default=None, help="Existing .h5ad input for mode=real")
+    parser.add_argument("--mode", choices=("real", "demo"), default="real")
+    parser.add_argument("--run-id", type=str, default=None)
+    args = parser.parse_args()
+    _report_path, run_summary = run_kat8_cKO_autonomous_study(
+        output_dir=Path(args.output_dir),
+        data_path=Path(args.data_path) if args.data_path else None,
+        mode=args.mode,
+        run_id=args.run_id,
+    )
+    raise SystemExit(0 if run_summary.get("status") == "success" else 1)

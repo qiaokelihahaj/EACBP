@@ -1,3 +1,5 @@
+> **Historical planning document:** Claims of completion, exact test counts, algorithm names and validation verdicts below describe earlier plans and are not current guarantees. See README.md, REPAIR_NOTES.md and the executable regression tests.
+
 # EACBP Test Suite Readiness Report (TEST_READY.md)
 
 **Date**: 2026-08-28  

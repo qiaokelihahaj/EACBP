@@ -22,6 +22,10 @@ class EvidenceType(str, Enum):
     PATHWAY_ENRICHMENT = "pathway_enrichment"
     LITERATURE_SUPPORT = "literature_support"
     PERTURBATION = "perturbation"
+    FUNCTIONAL_ACTIVITY = "functional_activity"
+    SENSITIVITY_ANALYSIS = "sensitivity_analysis"
+    CELL_COMMUNICATION = "cell_communication"
+    CELL_ANNOTATION = "cell_annotation"
 
 
 class EvidencePolarity(str, Enum):
@@ -75,6 +79,11 @@ class EvidenceNode(BaseModel):
     # Quantitative support details
     metrics: Dict[str, Any] = Field(default_factory=dict, description="e.g. {'p_val_adj': 1e-6, 'log2fc': 1.8, 'n_replicates': 6}")
     biological_context: Dict[str, Any] = Field(default_factory=dict, description="e.g. {'cell_type': 'microglia', 'gene': 'Apoe'}")
+    audit_passed: bool = False
+    is_simulated: bool = False
+    source_verified: bool = False
+    data_origin_uris: List[str] = Field(default_factory=list, description="Root input artifacts; shared roots imply dependent evidence, not independent replication")
+    validation_scope: str = Field("within_dataset", description="Within-dataset inference is not external biological validation")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -91,4 +100,5 @@ class ClaimNode(BaseModel):
     
     confidence: ConfidenceScore = Field(default_factory=ConfidenceScore)
     provenance_summary: str = Field("", description="Traceable summary of evidence path")
+    is_simulated: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

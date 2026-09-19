@@ -22,6 +22,10 @@ share/python-wheels/
 # Testing & Coverage
 .pytest_cache/
 .pytest_temp/
+.pytest_temp_*/
+.p3_*_validation*/
+p3_*_validation.xml
+tmp_luna_*/
 temp_pytest*/
 .coverage
 .coverage.*
@@ -50,6 +54,7 @@ venv.bak/
 .DS_Store
 Thumbs.db
 tmp/
+temp_tx_*/
 
 # Multi-agent and Local Experiment Artifacts
 .artifacts/

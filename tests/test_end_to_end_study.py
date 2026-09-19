@@ -69,6 +69,7 @@ def test_full_ad_mouse_study_pipeline(tmp_path):
     study_summary = orchestrator.run_study(manifest)
 
     assert study_summary["study_id"] == study_id
+    assert study_summary["status"] == "success", study_summary["failures"]
     assert study_summary["tasks_executed"] == 9
     assert study_summary["artifacts_created"] >= 9
     assert study_summary["evidence_nodes_count"] >= 3
@@ -89,15 +90,17 @@ def test_full_ad_mouse_study_pipeline(tmp_path):
     for report in orchestrator.audit_reports:
         assert report.overall_passed is True
 
-    # 6. Check Evidence Graph and Synthesized Claims
+    # Claims must restate specific audited evidence, not fixed disease templates.
     claims = orchestrator.evidence_graph.claim_nodes
-    assert "C101_microglia_state_transition" in claims
-    assert "C102_dam_marker_expression" in claims
-
-    c101 = claims["C101_microglia_state_transition"]
-    assert c101.confidence.association > 0.5
-    assert c101.confidence.overall > 0.5
-    assert len(c101.support_evidence_ids) >= 2
+    assert claims
+    for claim in claims.values():
+        assert len(claim.support_evidence_ids) == 1
+        node = orchestrator.evidence_graph.evidence_nodes[claim.support_evidence_ids[0]]
+        assert node.audit_passed
+        assert node.summary in claim.statement
+        assert node.source_artifact_uris
+        if claim.language_tier == LanguageTier.LEVEL_2_STATISTICAL_INFERENCE:
+            assert orchestrator.claim_engine.has_valid_statistics(node)
 
     # 7. Generate Scientific Report with Provenance Chains
     report_gen = ScientificReportGenerator(
@@ -110,7 +113,7 @@ def test_full_ad_mouse_study_pipeline(tmp_path):
     report_md = report_gen.generate_markdown()
 
     assert "Scientific Study Report" in report_md
-    assert "C101_microglia_state_transition" in report_md
+    assert next(iter(claims)) in report_md
     assert "Computational Lineage Graph" in report_md
     assert "Evidence-to-Claim DAG" in report_md
 
@@ -170,6 +173,7 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
         n_plaques=3,
         random_seed=42,
     )
+    assert raw_spatial_data.uns["is_simulated"] is True
 
     raw_uri = f"adata://{study_id}/raw/v1"
     manifest.data.raw_artifact_uri = raw_uri
@@ -200,6 +204,7 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
 
     # 4. Verify Task DAG Execution Across All 18 Steps
     assert study_summary["study_id"] == study_id
+    assert study_summary["status"] == "success", study_summary["failures"]
     assert study_summary["tasks_executed"] == 18, f"Expected 18 tasks, got {study_summary['tasks_executed']}"
     assert study_summary["artifacts_created"] >= 18
     assert study_summary["evidence_nodes_count"] >= 8
@@ -248,33 +253,25 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
     assert EvidenceType.TRAJECTORY_STABILITY in evidence_types
     assert EvidenceType.PERTURBATION in evidence_types
 
-    # 8. Check Synthesized Multimodal Claims
+    # Claims remain tied to measured results; curated knowledge is explicitly unverified.
     claims = orchestrator.evidence_graph.claim_nodes
-    assert "C101_microglia_state_transition" in claims
-    assert "C102_dam_marker_expression" in claims
-    assert "C103_knowledge_pathway_convergence" in claims
-    assert "C104_in_silico_perturbation_reversal" in claims
-
-    # Check C102: Spatial Plaque Niche Localization
-    c102 = claims["C102_dam_marker_expression"]
-    assert "spatial" in c102.statement.lower() or "plaque" in c102.statement.lower()
-    assert c102.language_tier == LanguageTier.LEVEL_2_STATISTICAL_INFERENCE
-    assert c102.causal_status == "observational"
-    assert c102.confidence.association > 0.6
-    assert c102.confidence.mechanistic > 0.6
-    assert c102.confidence.overall > 0.6
-
-    # Check C103: Prior-guided hypothesis testing tag
-    c103 = claims["C103_knowledge_pathway_convergence"]
-    assert "[PRIOR-GUIDED HYPOTHESIS TESTING]" in c103.statement
-    assert c103.language_tier == LanguageTier.LEVEL_4_HYPOTHESIS
-
-    # Check C104: In Silico Perturbation Simulation
-    c104 = claims["C104_in_silico_perturbation_reversal"]
-    assert c104.language_tier == LanguageTier.LEVEL_4_HYPOTHESIS
-    assert c104.causal_status == "in_silico_perturbed"
-    assert c104.confidence.causal <= 0.50, f"In silico causal confidence must not exceed 0.50 ceiling, got {c104.confidence.causal}"
-    assert c104.confidence.causal > 0.0
+    assert claims
+    perturbation_claims = [c for c in claims.values() if c.causal_status == "in_silico_perturbed"]
+    assert perturbation_claims
+    assert all(c.language_tier == LanguageTier.LEVEL_4_HYPOTHESIS for c in perturbation_claims)
+    assert all(c.confidence.causal <= .5 for c in perturbation_claims)
+    knowledge_claims = [c for c in claims.values() if "Unverified local reference" in c.statement]
+    assert knowledge_claims
+    assert all(c.language_tier == LanguageTier.LEVEL_4_HYPOTHESIS for c in knowledge_claims)
+    assert all("[PRIOR-GUIDED HYPOTHESIS TESTING]" in c.statement for c in knowledge_claims)
+    for claim in claims.values():
+        assert claim.support_evidence_ids
+        for eid in claim.support_evidence_ids:
+            ev = evidence_nodes[eid]
+            assert ev.audit_passed
+            assert any(t.task_id == ev.source_task_id for t in orchestrator.task_history)
+            assert all(registry.exists(uri) for uri in ev.source_artifact_uris)
+        assert "adjacent to amyloid plaques" not in claim.statement
 
     # 9. Check Invariant 4: Independent Scientific Audits
     assert len(orchestrator.audit_reports) == 18
@@ -300,5 +297,5 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
     assert "## 5. Registered Artifacts & Lineage DAG" in report_md
     assert "## 6. Computational Lineage Graph" in report_md
     assert "## 7. Evidence-to-Claim DAG" in report_md
-    assert "C101_microglia_state_transition" in report_md
-    assert "C104_in_silico_perturbation_reversal" in report_md
+    assert next(iter(claims)) in report_md
+    assert perturbation_claims[0].claim_id in report_md

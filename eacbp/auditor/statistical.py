@@ -47,7 +47,7 @@ class StatisticalValidator(BaseAuditor):
         # =====================================================================
         if cap_name == "deg" and meta.type == ArtifactType.TABLE:
             deg_df = payload if isinstance(payload, pd.DataFrame) else pd.DataFrame(payload)
-            is_pseudobulk = meta.summary_metrics.get("statistical_unit") == "pseudobulk" or "donor_replicates" in meta.summary_metrics
+            is_pseudobulk = meta.summary_metrics.get("statistical_unit") in ("pseudobulk", "donor_pseudobulk")
             
             # Check if cell-level test was used when pseudobulk was possible
             if not is_pseudobulk:
@@ -77,6 +77,16 @@ class StatisticalValidator(BaseAuditor):
                 message="FDR multiple testing adjustment (Benjamini-Hochberg) present." if has_fdr else "Missing multiple testing adjustment column.",
                 metrics={"has_fdr": has_fdr},
             )
+            if has_fdr:
+                column = next(c for c in ("fdr_q_value", "fdr", "p_val_adj") if c in deg_df)
+                values = pd.to_numeric(deg_df[column], errors="coerce")
+                if result.method_used == "pydeseq2_pseudobulk_v1":
+                    # DESeq2 may deliberately leave adjusted p-values missing
+                    # after independent filtering. The dedicated validator
+                    # checks the corresponding per-gene status and reason.
+                    values = values.dropna()
+                report.add_check(name="fdr_valid_range", passed=bool(values.between(0, 1).all()),
+                    severity=ValidationSeverity.ERROR, message="FDR values must be finite and in [0, 1].")
 
         # =====================================================================
         # 2. Clustering Stability Audit
@@ -96,6 +106,12 @@ class StatisticalValidator(BaseAuditor):
         # 3. Trajectory Stability Audit
         # =====================================================================
         elif cap_name == "trajectory_inference" and meta.type == ArtifactType.TABLE:
+            if meta.summary_metrics.get("stability_evaluated") is False:
+                report.add_check(name="trajectory_subsampling_stability", passed=False,
+                    severity=ValidationSeverity.WARNING,
+                    message="Trajectory stability was not evaluated; no stability or mechanistic claim is permitted.",
+                    metrics={"stability_evaluated": False})
+                return report
             stab_score = meta.summary_metrics.get("stability_score", 0.0)
             passed_stab = stab_score >= 0.60
             report.add_check(
@@ -213,7 +229,35 @@ class StatisticalValidator(BaseAuditor):
         # 6. Epistemic Tagging Audit (Prior-Guided Mode)
         # =====================================================================
         is_prior_guided = contract.parameters.get("prior_guided", False) or meta.summary_metrics.get("prior_guided", False)
-        if is_prior_guided or cap_name == "knowledge_retrieval":
+        if cap_name == "knowledge_retrieval":
+            expected_prior = bool(contract.parameters.get("prior_guided", False)) or "prior" in (contract.method or "")
+            stored_reports = []
+            for uri in result.output_artifacts:
+                out_meta, out_payload = registry.get(uri)
+                if out_meta.type == ArtifactType.JSON and isinstance(out_payload, dict):
+                    stored_reports.append(out_payload)
+            valid = len(stored_reports) == 1
+            if valid:
+                stored = stored_reports[0]
+                tag = "[PRIOR-GUIDED HYPOTHESIS TESTING]"
+                nodes = stored.get("evidence_nodes", [])
+                valid = (stored.get("prior_guided") is expected_prior
+                         and stored.get("mode") == ("prior_guided" if expected_prior else "discovery")
+                         and isinstance(stored.get("epistemic_tags"), list)
+                         and isinstance(nodes, list))
+                if expected_prior:
+                    valid = valid and tag in stored.get("epistemic_tags", []) and str(stored.get("summary", "")).startswith(tag)
+                    valid = valid and all(isinstance(node, dict) and str(node.get("summary", "")).startswith(tag) for node in nodes)
+                else:
+                    valid = valid and "mode:unbiased_discovery" in stored.get("epistemic_tags", [])
+                    valid = valid and tag not in str(stored.get("summary", "")) and all(
+                        isinstance(node, dict) and tag not in str(node.get("summary", "")) for node in nodes)
+            report.add_check(
+                name="epistemic_tagging_check", passed=bool(valid), severity=ValidationSeverity.ERROR,
+                message="Checked persisted knowledge mode and epistemic labels against the task contract.",
+                metrics={"prior_guided": expected_prior, "persisted_report_checked": True},
+            )
+        elif is_prior_guided:
             tag_present = "[PRIOR-GUIDED HYPOTHESIS TESTING]" in str(payload) or "[PRIOR-GUIDED HYPOTHESIS TESTING]" in str(result.metrics) or "[PRIOR-GUIDED HYPOTHESIS TESTING]" in str(meta.summary_metrics)
             if is_prior_guided:
                 report.add_check(

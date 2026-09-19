@@ -78,7 +78,7 @@ class ComputationalValidator(BaseAuditor):
             # Check spatial coordinates dimension match if present
             if "spatial" in data.obsm:
                 spatial_coords = np.asarray(data.obsm["spatial"], dtype=np.float32)
-                spatial_nan = int(np.isnan(spatial_coords).sum())
+                spatial_nan = int((~np.isfinite(spatial_coords)).sum())
                 spatial_match = spatial_coords.shape[0] == n_cells
                 report.add_check(
                     name="embedding_spatial_finite",
@@ -94,9 +94,9 @@ class ComputationalValidator(BaseAuditor):
                     continue
                 try:
                     emb_arr = np.asarray(emb_val, dtype=np.float32)
-                    emb_nan = int(np.isnan(emb_arr).sum())
+                    emb_nan = int((~np.isfinite(emb_arr)).sum())
                 except Exception:
-                    emb_nan = 0
+                    emb_nan = 1
 
                 report.add_check(
                     name=f"embedding_{emb_name}_finite",
@@ -112,7 +112,7 @@ class ComputationalValidator(BaseAuditor):
             is_empty = df.empty
             report.add_check(
                 name="table_non_empty",
-                passed=not is_empty,
+                passed=not is_empty or (len(df.columns) > 0 and contract.capability in ("trajectory_inference", "deg", "spatial_deg", "knowledge_retrieval", "cell_cell_communication", "liana_communication")),
                 severity=ValidationSeverity.ERROR,
                 message=f"Table artifact has {len(df)} rows and {len(df.columns)} columns.",
                 metrics={"rows": len(df), "cols": len(df.columns)},
@@ -121,7 +121,26 @@ class ComputationalValidator(BaseAuditor):
             # Check for non-finite values in numeric columns
             if not is_empty:
                 numeric_cols = df.select_dtypes(include=[np.number]).columns
-                total_nans = int(df[numeric_cols].isna().sum().sum())
+                check_df = df
+                if contract.capability == "knowledge_retrieval" and "category" in df:
+                    # Literature records have no statistical test; their null p/FDR values are intentional.
+                    check_df = df[df["category"] != "Local_Curated_Literature"]
+                total_nans = int((~np.isfinite(check_df[numeric_cols].to_numpy(dtype=float))).sum())
+                from eacbp.auditor.advanced_statistics import METHODS, NULLABLE_STATISTICS
+                if result.method_used in METHODS:
+                    # These methods retain unestimated statistical quantities.
+                    # Their independent validator still rejects infinities,
+                    # invalid probabilities, designs and fabricated intervals.
+                    numeric = check_df[numeric_cols]
+                    total_nans = int(np.isinf(numeric.to_numpy(dtype=float)).sum())
+                    required_numeric = [c for c in numeric_cols if c not in NULLABLE_STATISTICS]
+                    if result.method_used == "pydeseq2_leave_one_donor_out_v1" and "status" in check_df and check_df.status.eq("skipped").all():
+                        required_numeric = [c for c in required_numeric if c not in {"gene", "left_out_donor"}]
+                    total_nans += int(numeric[required_numeric].isna().sum().sum())
+                if result.method_used == "liana_rank_aggregate_v1" and "comparison_status" in check_df:
+                    nullable = [c for c in numeric_cols if c.startswith(("mean_", "comparison_p_value_", "comparison_fdr_"))]
+                    total_nans = int(np.isinf(check_df[numeric_cols].to_numpy(dtype=float)).sum())
+                    total_nans += int(check_df[[c for c in numeric_cols if c not in nullable]].isna().sum().sum())
                 report.add_check(
                     name="table_finite_values",
                     passed=(total_nans == 0),

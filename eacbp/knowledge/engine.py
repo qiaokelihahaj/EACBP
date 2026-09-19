@@ -34,6 +34,7 @@ class KnowledgeReport(BaseModel):
     evidence_nodes: List[EvidenceNode] = Field(default_factory=list)
     epistemic_tags: List[str] = Field(default_factory=list)
     summary: str = Field(..., description="High-level narrative summary of knowledge retrieval findings")
+    source_mode: str = "local_curated_unverified"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -197,10 +198,10 @@ class KnowledgeEngine:
                 clean_t = t.strip().upper()
                 if clean_t and (clean_t in self.biological_db_retriever._genes or self.biological_db_retriever.query_gene(clean_t)):
                     extracted.append(clean_t)
-            target_genes = extracted if extracted else ["TREM2", "APOE", "CLEC7A", "TYROBP"]
+            target_genes = extracted
 
         species = manifest.biological_design.species
-        disease = manifest.biological_design.disease or "Alzheimer's Disease"
+        disease = manifest.biological_design.disease
         cell_types = manifest.biological_design.target_cell_types
 
         # 2. Targeted Literature Retrieval
@@ -308,36 +309,16 @@ class KnowledgeEngine:
         Synthesizes a traceable ClaimNode backed by the KnowledgeReport evidence nodes.
         Maintains strict 4-tier language calibration and epistemic provenance.
         """
-        eids = [node.evidence_id for node in report.evidence_nodes]
-        
-        # Calculate confidence from evidence nodes
-        scores = [n.score for n in report.evidence_nodes]
-        mech_score = float(sum(scores) / len(scores)) if scores else 0.5
-        overall_conf = round(0.45 * mech_score + 0.35 * 0.8, 3)
-
-        if report.prior_guided:
-            tag = "[PRIOR-GUIDED HYPOTHESIS TESTING]"
-            statement = f"{tag}: Prior-guided evaluation supports the biological plausibility of the hypothesized axis '{report.hypothesis_tested}'."
-            lang_tier = LanguageTier.LEVEL_4_HYPOTHESIS
-            prov_summary = f"{tag} Claim {claim_id} evaluates user prior hypothesis '{report.hypothesis_tested}' supported by {len(report.evidence_nodes)} knowledge evidence items."
-        else:
-            statement = f"Data-driven pathway enrichment and literature context support activation of {report.target_genes[:3]} in {report.mode} analysis."
-            lang_tier = LanguageTier.LEVEL_3_SUPPORTED_INTERPRETATION
-            prov_summary = f"Claim {claim_id} supported by {len(report.evidence_nodes)} discovery knowledge evidence items."
-
+        if not report.evidence_nodes:
+            raise ValueError("No retrieved evidence; cannot synthesize a knowledge claim.")
+        tag = "[PRIOR-GUIDED HYPOTHESIS TESTING] " if report.prior_guided else ""
         return ClaimNode(
             claim_id=claim_id,
-            statement=statement,
-            language_tier=lang_tier,
-            claim_type=ClaimType.MECHANISTIC_HYPOTHESIS if report.prior_guided else ClaimType.REGULATORY,
+            statement=tag + f"Unverified local reference context suggests hypotheses for {report.target_genes}; source records require independent verification.",
+            language_tier=LanguageTier.LEVEL_4_HYPOTHESIS,
+            claim_type=ClaimType.MECHANISTIC_HYPOTHESIS,
             causal_status="observational",
-            support_evidence_ids=eids,
-            confidence=ConfidenceScore(
-                association=0.7,
-                mechanistic=round(mech_score, 3),
-                causal=0.0,
-                overall=overall_conf,
-            ),
-            provenance_summary=prov_summary,
-            created_at=datetime.now(timezone.utc),
+            support_evidence_ids=[n.evidence_id for n in report.evidence_nodes],
+            confidence=ConfidenceScore(),
+            provenance_summary="Local curated references; not independently audited computational evidence.",
         )

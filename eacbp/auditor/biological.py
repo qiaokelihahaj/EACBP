@@ -74,14 +74,12 @@ class BiologicalValidator(BaseAuditor):
             deg_df = payload if isinstance(payload, pd.DataFrame) else pd.DataFrame(payload)
             top_up = deg_df[deg_df["log2_fold_change"] > 0]["gene"].head(10).tolist()
             
-            # Check overlap with DAM markers for AD study
-            dam_overlap = [g for g in top_up if g in CANONICAL_MARKERS["DAM"]]
             report.add_check(
-                name="disease_marker_coherence",
+                name="reported_gene_context",
                 passed=True,
                 severity=ValidationSeverity.INFO,
-                message=f"Top upregulated genes in disease condition include known markers: {dam_overlap}",
-                metrics={"dam_overlap": dam_overlap, "top_upregulated": top_up[:5]}
+                message=f"Reported positive-direction genes: {top_up[:5]}; no disease-specific coherence is inferred without a supplied reference.",
+                metrics={"top_upregulated": top_up[:5]}
             )
 
         return report

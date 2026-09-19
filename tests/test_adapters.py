@@ -316,7 +316,7 @@ def test_spacell_adapter_valid_execution(tmp_path):
     assert out_sc.n_obs == n_cells  # cell count preserved!
     assert "spatial_domain" in out_sc.obs.columns
     assert "neighborhood_composition" in out_sc.obsm
-    assert out_sc.obs["leiden"].equals(obs["leiden"])  # clusters untouched!
+    assert out_sc.obs["leiden"].astype(str).tolist() == obs["leiden"].astype(str).tolist()
 
     # Verify table and JSON
     meta_table, payload_table = reg.get(table_uri)

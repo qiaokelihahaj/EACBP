@@ -1,3 +1,5 @@
+> **Historical planning document:** Claims of completion, exact test counts, algorithm names and validation verdicts below describe earlier plans and are not current guarantees. See README.md, REPAIR_NOTES.md and the executable regression tests.
+
 # EACBP E2E Test Infrastructure & Test Architecture Specification (Phases V3–V5)
 
 **Document Version**: 1.0.0  

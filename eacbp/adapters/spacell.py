@@ -7,6 +7,8 @@ from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
+from scipy.spatial import cKDTree
+from scipy import sparse
 
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
 from eacbp.schemas.artifact import ArtifactType
@@ -22,7 +24,15 @@ def _kmeans_clustering(
     max_iter: int = 50,
     random_seed: int = 42,
 ) -> np.ndarray:
-    """Lightweight deterministic K-Means clustering using numpy and scipy."""
+    """Run SpaCell's adapter-specific lightweight K-Means.
+
+    This intentionally remains separate from the general capability helper:
+    the SpaCell contract historically assigns one label per sample when the
+    requested cluster count is at least the sample count and re-seeds an empty
+    cluster with the farthest sample.  Those edge-case semantics affect the
+    adapter's spatial neighborhood interpretation, so silently substituting
+    the general display-clustering helper would change its results.
+    """
     rng = np.random.default_rng(random_seed)
     n_samples = X.shape[0]
     if n_samples <= n_clusters:
@@ -125,21 +135,21 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
         n_cells = data.n_obs
 
         # 2. Compute spatial distance matrix and k-NN graph
-        dist_matrix = cdist(coords, coords, metric="euclidean")
-        np.fill_diagonal(dist_matrix, np.inf)
-
-        # Find k nearest neighbors for each cell
-        knn_indices = np.argsort(dist_matrix, axis=1)[:, :k_neighbors]
+        if n_cells < 2 or not np.isfinite(coords).all():
+            raise ValueError("Spatial neighborhoods require at least two cells with finite coordinates.")
+        k_neighbors = min(max(1, k_neighbors), n_cells - 1)
+        _, candidate_indices = cKDTree(coords).query(coords, k=k_neighbors + 1)
+        knn_indices = np.array([row[row != i][:k_neighbors] for i, row in enumerate(candidate_indices)])
 
         # 3. Determine cell type labels for microenvironment composition
         if "cell_type" in data.obs.columns:
             cell_type_series = data.obs["cell_type"].astype(str)
-        elif "cell_type_ground_truth" in data.obs.columns:
-            cell_type_series = data.obs["cell_type_ground_truth"].astype(str)
+        elif "cluster" in data.obs.columns:
+            cell_type_series = data.obs["cluster"].astype(str)
         elif "leiden" in data.obs.columns:
             cell_type_series = data.obs["leiden"].astype(str)
         else:
-            cell_type_series = pd.Series([f"Cluster_{i%3}" for i in range(n_cells)], index=data.obs.index)
+            raise ValueError("Spatial annotation requires cell_type or cluster labels.")
 
         unique_cell_types = sorted(cell_type_series.unique())
         ct_to_idx = {ct: idx for idx, ct in enumerate(unique_cell_types)}
@@ -185,11 +195,9 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
         # 6. Global Moran's I spatial autocorrelation for top marker genes
         moran_results = {}
         # Construct symmetric spatial weight matrix W
-        W = np.zeros((n_cells, n_cells), dtype=np.float32)
-        for i in range(n_cells):
-            for nbr_idx in knn_indices[i]:
-                W[i, nbr_idx] = 1.0
-                W[nbr_idx, i] = 1.0
+        rows = np.repeat(np.arange(n_cells), k_neighbors)
+        W = sparse.csr_matrix((np.ones(rows.size), (rows, knn_indices.ravel())), shape=(n_cells, n_cells))
+        W = W.maximum(W.T)
         W_sum = W.sum()
 
         if W_sum > 0 and data.X.shape[1] > 0:
@@ -197,11 +205,12 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
             for g_idx in genes_to_test:
                 gene_name = data.var["gene_name"].iloc[g_idx] if "gene_name" in data.var.columns else f"Gene_{g_idx}"
                 x = data.X[:, g_idx]
+                x = x.toarray().ravel() if sparse.issparse(x) else np.asarray(x).ravel()
                 x_mean = np.mean(x)
                 x_diff = x - x_mean
                 denom = np.sum(x_diff ** 2)
                 if denom > 1e-8:
-                    num = np.sum(W * np.outer(x_diff, x_diff))
+                    num = float(x_diff @ (W @ x_diff))
                     moran_i = float((n_cells / W_sum) * (num / denom))
                     moran_results[gene_name] = round(moran_i, 4)
 

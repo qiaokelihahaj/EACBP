@@ -32,7 +32,9 @@ class SubsetCapability(BaseCapability):
 
         data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
         
-        target_cell_type = contract.parameters.get("cell_type", "Microglia")
+        target_cell_type = contract.parameters.get("cell_type")
+        if not target_cell_type:
+            raise ValueError("Subsetting requires an explicit cell_type")
         obs_key = contract.parameters.get("obs_key", "cell_type")
 
         if obs_key not in data.obs.columns:
@@ -43,14 +45,8 @@ class SubsetCapability(BaseCapability):
         # 2. Case-insensitive match
         if mask.sum() == 0:
             mask = (data.obs[obs_key].astype(str).str.lower() == target_cell_type.lower()).values
-        # 3. Substring match
         if mask.sum() == 0:
-            mask = data.obs[obs_key].astype(str).str.lower().str.contains(target_cell_type.lower()).values
-        # 4. Fallback to most frequent cell type if not found
-        if mask.sum() == 0:
-            top_ct = data.obs[obs_key].value_counts().index[0]
-            mask = (data.obs[obs_key] == top_ct).values
-            target_cell_type = str(top_ct)
+            raise ValueError(f"Requested cell type {target_cell_type!r} is absent; refusing to substitute a different population")
 
         subset_data = data.subset_obs(mask)
 
@@ -61,11 +57,12 @@ class SubsetCapability(BaseCapability):
         # Sub-cluster into granular sub-states
         from eacbp.capabilities.clustering import simple_kmeans
         sub_labels = simple_kmeans(local_pca, k=3, random_seed=contract.parameters.get("random_seed", 42))
-        subset_data.obs["microglia_state"] = [f"M{c+1}" for c in sub_labels]
+        if target_cell_type.lower() == "microglia":
+            subset_data.obs["microglia_state"] = [f"M{c+1}" for c in sub_labels]
         subset_data.obs["sub_state"] = [f"S{c+1}" for c in sub_labels]
 
         uri_obj = ArtifactURI.parse(in_uri)
-        out_uri = f"adata://{uri_obj.study_id}/microglia_subset/v5"
+        out_uri = contract.expected_outputs[0] if contract.expected_outputs else f"adata://{uri_obj.study_id}/target_subset/v5"
 
         registry.register(
             uri_str=out_uri,
@@ -79,7 +76,7 @@ class SubsetCapability(BaseCapability):
             summary_metrics={
                 "parent_cells": data.n_obs,
                 "subset_cells": subset_data.n_obs,
-                "sub_states": subset_data.obs["microglia_state"].value_counts().to_dict(),
+                "sub_states": subset_data.obs["sub_state"].value_counts().to_dict(),
             }
         )
 

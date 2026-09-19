@@ -25,6 +25,12 @@ from eacbp.schemas.artifact import (
     ArtifactRef,
     LineageNode,
 )
+from eacbp.schemas.audit import (
+    ArtifactAuditRecord,
+    AuditRecord,
+    AuditRecordStatus,
+    AuditStatus,
+)
 from eacbp.schemas.evidence import (
     EvidenceNode,
     EvidenceType,
@@ -35,6 +41,7 @@ from eacbp.schemas.evidence import (
     LanguageTier,
     ConfidenceScore,
 )
+from eacbp.schemas.runtime import RunConfig, PlanningContext, ExecutionState
 
 __all__ = [
     "StudyManifest",
@@ -54,6 +61,10 @@ __all__ = [
     "ArtifactType",
     "ArtifactRef",
     "LineageNode",
+    "ArtifactAuditRecord",
+    "AuditRecord",
+    "AuditRecordStatus",
+    "AuditStatus",
     "EvidenceNode",
     "EvidenceType",
     "EvidencePolarity",
@@ -62,4 +73,7 @@ __all__ = [
     "ClaimType",
     "LanguageTier",
     "ConfidenceScore",
+    "RunConfig",
+    "PlanningContext",
+    "ExecutionState",
 ]

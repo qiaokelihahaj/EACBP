@@ -656,6 +656,7 @@ class InPlaceObsCellTypeTamperingRogueAdapter(BaseAgentAdapter):
         in_payload = input_payloads[in_uri]
         
         if isinstance(in_payload, SCData):
+            in_payload.obs["cell_type"] = in_payload.obs["cell_type"].astype(object)
             in_payload.obs.iloc[0, in_payload.obs.columns.get_loc("cell_type")] = "Poisoned_Type"
         elif isinstance(in_payload, dict) and "obs" in in_payload:
             obs = in_payload["obs"]

@@ -14,25 +14,18 @@
 
 set -euo pipefail
 
-PROJECT_ROOT=""
-PYTHON=""
+PROJECT_ROOT="${REMOTE_PROJECT_ROOT:-/public/home/qiaoke/eacbp_project/current}"
+PYTHON="${REMOTE_PYTHON:-/public/home/qiaoke/.local/share/mamba/envs/perturb-seq/bin/python}"
+: "${EACBP_H5AD:?Set EACBP_H5AD to the real input h5ad path}"
 
-cd ""
-[[ -x "" ]] || {
-  echo "Missing environment Python: " >&2
-  exit 2
-}
-
-export PYTHONPATH=""
+cd "$PROJECT_ROOT"
+[[ -x "$PYTHON" ]] || { echo "Missing Python: $PYTHON" >&2; exit 2; }
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=""
-export OMP_NUM_THREADS=""
-export MKL_NUM_THREADS=""
-export OPENBLAS_NUM_THREADS=""
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+export MKL_NUM_THREADS="$OMP_NUM_THREADS"
+export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"
 
-echo "=== [1/3] Verifying Environment ==="
-"" scripts/verify_environment.py
-
-echo "=== [2/3] Running Autonomous Kat8 cKO Study ==="
-"" scripts/run_kat8_study.py
-
-echo "=== [3/3] Study Complete. Report generated in outputs/reports/ ==="
+"$PYTHON" scripts/verify_environment.py
+"$PYTHON" scripts/run_kat8_study.py --mode real --data-path "$EACBP_H5AD" --output-dir "$PROJECT_ROOT/outputs"
+echo "Study finished; reports are under outputs/runs/<study>/<run>/reports."

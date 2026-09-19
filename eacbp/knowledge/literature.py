@@ -493,6 +493,7 @@ class LiteratureRetriever:
         }
 
         metrics: Dict[str, Any] = {
+            "source_mode": "local_curated_unverified",
             "relevance_score": evidence.relevance_score,
             "citation_count": evidence.citation_count,
             "prior_guided": prior_guided,

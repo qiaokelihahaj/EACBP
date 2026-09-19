@@ -29,17 +29,17 @@ def test_capability_router_3_tier_resolution():
     
     # 1. Routing for DEG when donor replicates >= 3 -> Pseudobulk
     deg_method = router.resolve_method("deg", manifest, current_state={"min_replicates": 6})
-    assert deg_method == "deg_pseudobulk_v1"
+    assert deg_method == "donor_pseudobulk_welch_v1"
 
     # 2. Routing for Trajectory without velocity -> paga_dpt
     manifest.data.has_rna_velocity = False
     traj_method = router.resolve_method("trajectory_inference", manifest, current_state={})
-    assert traj_method == "paga_dpt"
+    assert traj_method == "root_distance_pseudotime_v1"
 
     # 3. Routing for Trajectory with velocity -> cellrank
     manifest.data.has_rna_velocity = True
     traj_method_vel = router.resolve_method("trajectory_inference", manifest, current_state={})
-    assert traj_method_vel == "cellrank"
+    assert traj_method_vel == "root_distance_pseudotime_v1"
 
     # 4. Spatial capabilities routing
     assert router.resolve_method("spatial_domain", manifest, {}) == "spatial_domain_knn_v1"
@@ -80,7 +80,8 @@ def test_computational_dag_planner_contracts():
     manifest = IntentParser.parse_prompt_to_manifest("AD mouse brain single cell study", study_id="AD_01")
     tasks = ComputationalDAGPlanner.build_study_plan(manifest)
 
-    assert len(tasks) >= 9
+    assert len(tasks) >= 8
+    assert all(t.capability != "subset_cells" for t in tasks)  # no target requested
     task_capabilities = [t.capability for t in tasks]
     assert "dataset_audit" in task_capabilities
     assert "qc" in task_capabilities
@@ -93,7 +94,7 @@ def test_computational_dag_planner_contracts():
     traj_task = next(t for t in tasks if t.capability == "trajectory_inference")
     assert "filter_cells" in traj_task.forbidden_operations
     assert "recluster" in traj_task.forbidden_operations
-    assert "build_neighbor_graph" in traj_task.allowed_operations
+    assert "estimate_root_distance_pseudotime" in traj_task.allowed_operations
 
 
 def test_dynamic_dag_planning_spatial_and_prior_guided():
@@ -128,6 +129,7 @@ def test_dynamic_dag_planning_spatial_and_prior_guided():
             "include_knowledge": True,
             "include_perturbation": True,
             "run_compound_perturbation": True,
+            "target_gene": "Trem2",
         }
     )
 

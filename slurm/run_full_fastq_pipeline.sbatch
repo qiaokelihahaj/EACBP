@@ -16,7 +16,9 @@ set -euo pipefail
 
 PROJECT_ROOT="${REMOTE_PROJECT_ROOT:-/public/home/qiaoke/eacbp_project/current}"
 PYTHON="${REMOTE_PYTHON:-/public/home/qiaoke/.local/share/mamba/envs/perturb-seq/bin/python}"
-FASTQ_DIR="/public/home/qiaoke/data"
+: "${EACBP_SAMPLE_MANIFEST:?Set EACBP_SAMPLE_MANIFEST to the JSON sample manifest}"
+: "${EACBP_INDEX_PATH:?Set EACBP_INDEX_PATH to the kb index}"
+: "${EACBP_T2G_PATH:?Set EACBP_T2G_PATH to the transcript-to-gene map}"
 
 cd "$PROJECT_ROOT"
 [[ -x "$PYTHON" ]] || {
@@ -38,8 +40,12 @@ echo "=== [1/3] Verifying Environment ==="
 
 echo "=== [2/3] Submitting Full FASTQ-to-Biology Autonomous Pipeline ==="
 "$PYTHON" scripts/run_fastq_to_biology_pipeline.py \
-  --fastq-dir "$FASTQ_DIR" \
+  --mode real \
+  --sample-manifest "$EACBP_SAMPLE_MANIFEST" \
+  --index-path "$EACBP_INDEX_PATH" \
+  --t2g-path "$EACBP_T2G_PATH" \
+  --threads "${SLURM_CPUS_PER_TASK:-16}" \
   --target-gene "Kat8" \
   --output-dir "$PROJECT_ROOT/outputs"
 
-echo "=== [3/3] Execution Finished. Scientific report ready in outputs/reports/ ==="
+echo "=== [3/3] Execution Finished. Reports are under outputs/runs/<study>/<run>/reports ==="
