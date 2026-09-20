@@ -56,3 +56,6 @@ addopts = "--basetemp=.pytest_temp"
 [tool.setuptools.packages.find]
 include = ["eacbp*"]
 exclude = ["tests*", "outputs*", "temp*", "scripts*"]
+
+[tool.setuptools.package-data]
+"eacbp.webui" = ["static/*.html", "static/*.css", "static/*.js"]

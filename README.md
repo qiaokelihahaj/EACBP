@@ -33,6 +33,17 @@ python -m pytest -q
 
 AnnData/Scanpy are required for full single-cell processing. CI is configured for tests and wheel builds on Windows/Linux with Python 3.11/3.12/3.13. Local test results do not establish that remote CI or real FASTQ alignment has run.
 
+## Browser workbench
+
+Run `python -m eacbp webui` (or `eacbp webui` after installation) to open the
+local browser interface. It supports h5ad file selection, study configuration,
+plan previews, background execution, logs, run history, strict resume, and
+saved-report viewing/revalidation. No extra frontend build or web-framework
+dependency is required. Use `--workspace PATH`, `--runs-dir PATH`,
+`--port 8765`, and `--no-browser` as needed. See [WEBUI.md](WEBUI.md) for usage,
+SSH access and the single-user/single-job scope. Existing scientific methods
+and audit gates are shared with the CLI.
+
 ## Real data and demo data
 
 FASTQ quantification defaults to `mode="real"`. Real mode requires valid sample metadata, every FASTQ pair, the selected executable (kb-python or STAR), and explicit references. Missing dependencies, invalid inputs and alignment failures return a structured failure. STARsolo preserves all lanes and reads its own run's filtered Matrix Market output; raw output must be explicitly requested with `use_raw_counts=True`. Missing filtered output never silently falls back to raw or a previous run.
@@ -133,6 +144,8 @@ Metadata audit adapts the remaining plan: missing or ambiguous contrasts omit au
 The task journal uses an OS process lock and atomic replacement. Artifact hashes detect payload changes relative to the local metadata index; this is not a tamper-proof external signature of the entire filesystem. An older artifact directory without an index is not silently reconstructed as trusted data.
 
 ## Scope and migration
+
+Container deployment design and implementation gates (Chinese): [CONTAINERIZATION_PLAN.md](CONTAINERIZATION_PLAN.md). The plan uses the installed CLI for Linux batch jobs and evaluates Apptainer for Slurm; container images have not yet been implemented or validated.
 
 ### Advanced biological analysis
 

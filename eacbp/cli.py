@@ -647,6 +647,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version="eacbp 0.1.0")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    webui = commands.add_parser("webui", help="open the local browser interface")
+    webui.add_argument("--workspace", type=Path, help="root directory for input data (default: current directory)")
+    webui.add_argument("--runs-dir", type=Path, help="run history and outputs (default: workspace/outputs/runs)")
+    webui.add_argument("--port", type=int, default=8765)
+    webui.add_argument("--no-browser", action="store_true", help="do not open a browser automatically")
+
     plan = commands.add_parser("plan", help="preview a static study plan")
     plan.add_argument("--manifest", required=True, help="manifest JSON file or JSON object")
     plan.add_argument("--config", help="optional run-config JSON file or JSON object")
@@ -681,6 +687,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "webui":
+            from eacbp.webui.server import serve
+            return serve(workspace=args.workspace, runs_dir=args.runs_dir, port=args.port,
+                         open_browser=not args.no_browser)
         if args.command == "plan":
             manifest = _load_manifest(args.manifest)
             result = _planning_preview(manifest, _load_config(args.config))

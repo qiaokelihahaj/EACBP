@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -54,6 +54,8 @@ venv.bak/
 .DS_Store
 Thumbs.db
 tmp/
+temp_*/
+!temp_debug_fastq/
 temp_tx_*/
 
 # Multi-agent and Local Experiment Artifacts
