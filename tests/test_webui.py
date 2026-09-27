@@ -30,6 +30,25 @@ def input_data(tmp_path):
     return path
 
 
+def design_data(tmp_path, *, shared_donor=False):
+    ad = pytest.importorskip("anndata")
+    rng = np.random.default_rng(25)
+    labels = ["treated"] * 40 + ["control"] * 40
+    donors = [f"D{i // 10 + 1}" for i in range(40)]
+    donors += [f"D{i // 10 + (1 if shared_donor else 5)}" for i in range(40)]
+    obs = pd.DataFrame({
+        "group": labels,
+        "donor_id": donors,
+        "sample_id": donors,
+        "batch": ["run1" if i % 2 else "run2" for i in range(80)],
+    }, index=[f"cell{i}" for i in range(80)])
+    data = ad.AnnData(rng.poisson(4, (80, 40)).astype(np.float32), obs=obs,
+                      var=pd.DataFrame(index=[f"g{i}" for i in range(40)]))
+    path = tmp_path / ("shared_donor.h5ad" if shared_donor else "design_fixture.h5ad")
+    data.write_h5ad(path)
+    return path
+
+
 def form(data):
     return {"data": str(data), "study_id": "ui_test", "species": "human", "tissue": "synthetic_test",
             "title": "Synthetic software validation only", "method_profile": "baseline", "min_genes": 1}
@@ -59,6 +78,121 @@ def test_form_plan_and_metadata_keep_input_read_only(service, tmp_path):
     assert result["config"]["capability_parameters"]["dataset_audit"]["donor_col"] == "patient"
     assert not list(service.manager.runs_dir.glob("*/run_config.json"))
     assert data.read_bytes() == before
+
+
+def test_csv_import_preview_confirms_id_alignment_and_creates_controlled_h5ad(service, tmp_path):
+    ad = pytest.importorskip("anndata")
+    counts = tmp_path / "counts.csv"
+    metadata = tmp_path / "metadata.tsv"
+    counts.write_text("cell_id,g1,g2\n001,0,3\nNA,2,1\ncell_c,4,0\n", encoding="utf-8")
+    metadata.write_text(
+        "cell_id\tcondition\tdonor\nNA\ttreated\td2\ncell_c\t\td3\n001\tcontrol\td1\n",
+        encoding="utf-8")
+    counts_before, metadata_before = counts.read_bytes(), metadata.read_bytes()
+
+    preview = service.preview_import({"counts": str(counts), "metadata": str(metadata),
+                                      "orientation": "cells_by_genes"})
+    assert preview["n_cells"] == 3 and preview["n_genes"] == 2
+    assert preview["metadata_rows_reordered"] is True
+    assert preview["metadata_missing"]["condition"] == 1
+    assert preview["count_range"] == {"minimum": 0, "maximum": 4, "nonzero": 4}
+
+    result = service.confirm_import({"preview_token": preview["preview_token"]})
+    output = Path(result["data"])
+    assert output.is_relative_to(tmp_path / ".eacbp" / "imports")
+    imported = ad.read_h5ad(output)
+    assert list(imported.obs.index) == ["001", "NA", "cell_c"]
+    assert list(imported.var.index) == ["g1", "g2"]
+    assert imported.obs.loc["001", "condition"] == "control"
+    assert pd.isna(imported.obs.loc["cell_c", "condition"])
+    assert imported.X.dtype == np.dtype("int32")
+    assert np.array_equal(imported.X, imported.layers["counts"])
+    assert counts.read_bytes() == counts_before and metadata.read_bytes() == metadata_before
+
+
+def test_csv_import_supports_explicit_genes_by_cells_orientation(service, tmp_path):
+    ad = pytest.importorskip("anndata")
+    counts = tmp_path / "genes.tsv"
+    metadata = tmp_path / "cells.csv"
+    counts.write_text("gene_id\t001\tNA\ng1\t0\t2\ng2\t5\t0\n", encoding="utf-8")
+    metadata.write_text("cell_id,group\nNA,B\n001,A\n", encoding="utf-8")
+    preview = service.preview_import({"counts": str(counts), "metadata": str(metadata),
+                                      "orientation": "genes_by_cells"})
+    result = service.confirm_import({"preview_token": preview["preview_token"]})
+    imported = ad.read_h5ad(result["data"])
+    assert list(imported.obs.index) == ["001", "NA"]
+    assert list(imported.var.index) == ["g1", "g2"]
+    assert imported.X.tolist() == [[0, 5], [2, 0]]
+
+
+@pytest.mark.parametrize("matrix", [
+    "cell_id,g1,g2\na,1,2\na,3,4\n",
+    "cell_id,g1,g1\na,1,2\n",
+    "cell_id,g1,g2\na,1,-2\n",
+    "cell_id,g1,g2\na,1,1.5\n",
+    "cell_id,g1,g2\na,1,\n",
+])
+def test_csv_import_preview_rejects_duplicate_ids_headers_and_invalid_counts(service, tmp_path, matrix):
+    counts = tmp_path / "counts.csv"
+    metadata = tmp_path / "metadata.csv"
+    counts.write_text(matrix, encoding="utf-8")
+    metadata.write_text("cell_id,group\na,A\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        service.preview_import({"counts": str(counts), "metadata": str(metadata),
+                                "orientation": "cells_by_genes"})
+
+
+def test_csv_import_confirmation_rejects_changed_sources(service, tmp_path):
+    counts = tmp_path / "counts.csv"
+    metadata = tmp_path / "metadata.csv"
+    counts.write_text("cell_id,g1\na,1\n", encoding="utf-8")
+    metadata.write_text("cell_id,group\na,A\n", encoding="utf-8")
+    preview = service.preview_import({"counts": str(counts), "metadata": str(metadata),
+                                      "orientation": "cells_by_genes"})
+    counts.write_text("cell_id,g1\na,2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="变化"):
+        service.confirm_import({"preview_token": preview["preview_token"]})
+    assert not (tmp_path / ".eacbp" / "imports").exists()
+
+
+def test_preview_preflight_uses_confirmed_mapping_and_separates_replicates(service, tmp_path):
+    data = design_data(tmp_path)
+    result = service.preview({
+        **form(data), "research_purpose": "deg", "condition_col": "group",
+        "condition_a": "treated", "condition_b": "control", "sample_col": "sample_id",
+        "donor_col": "donor_id", "batch_col": "batch",
+    })
+
+    overview = result["design"]["overview"]
+    assert overview["cells"] == 80
+    assert overview["samples"]["count"] == 8
+    assert overview["donors"]["count"] == 8
+    assert overview["conditions"]["confirmed"] is True
+    assert overview["donors"]["confirmed"] is True
+    assert [(group["condition"], group["cells"], group["samples"], group["donors"])
+            for group in overview["conditions"]["groups"]] == [
+                ("treated", 40, 4, 4), ("control", 40, 4, 4),
+            ]
+    assert result["design"]["checklist"]["blockers"] == []
+
+
+def test_preflight_rejects_welch_overlap_and_final_json_column_conflict(service, tmp_path):
+    data = design_data(tmp_path, shared_donor=True)
+    payload = {
+        **form(data), "research_purpose": "deg", "condition_col": "group",
+        "condition_a": "treated", "condition_b": "control", "donor_col": "donor_id",
+        "batch_col": "batch",
+    }
+    overlap = service.preview(payload)
+    assert any(item["field"] == "paired" and "同时出现在" in item["message"]
+               for item in overlap["design"]["checklist"]["blockers"])
+
+    conflict = service.preview({
+        **payload,
+        "config_overrides": {"capability_parameters": {"deg": {"condition_col": "unknown_condition"}}},
+    })
+    assert any(item["field"] == "condition_col"
+               for item in conflict["design"]["checklist"]["blockers"])
 
 
 @pytest.mark.parametrize("changes", [
@@ -150,14 +284,18 @@ def test_http_auth_origin_and_packaged_assets(http_server):
     assert status == 200 and server.token.encode() in body
     assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
     assert request(server, "/app.js")[0] == 200
+    assert request(server, "/results.js")[0] == 200
     assert request(server, "/style.css")[0] == 200
     assert request(server, "/api/settings")[0] == 403
+    assert request(server, "/api/results?id=fixture")[0] == 403
     auth = {"X-EACBP-Token": server.token}
     assert request(server, "/api/settings", headers=auth)[0] == 200
     assert request(server, "/api/settings", headers={**auth, "Origin": "https://untrusted.invalid"})[0] == 403
     assert request(server, "/", headers={"Host": "untrusted.invalid"})[0] == 403
     assert request(server, "/api/settings", headers={**auth, "Sec-Fetch-Site": "cross-site"})[0] == 403
     assert request(server, "/api/files?path=..", headers=auth)[0] == 400
+    assert request(server, "/api/results?id=../outside", headers=auth)[0] == 400
+    assert request(server, "/api/results?id=missing", headers=auth)[0] == 404
     assert request(server, "/api/download?id=x&name=../../pyproject.toml", headers=auth)[0] == 400
     assert request(server, "/api/preview", "POST", "[]", {**auth, "Content-Type": "application/json"})[0] == 400
 
@@ -170,6 +308,20 @@ def test_worker_real_run_restart_resume_and_report_gate(service, tmp_path):
     first = wait_job(service.manager, result["job"]["id"])
     assert first["status"] == "success", first
     run_dir = Path(first["run_dir"])
+    assert read_json(run_dir / "webui_context.json") == {"research_purpose": "overview"}
+    reuse = service.reuse_configuration(result["run_id"])
+    assert reuse["form"]["data"] == ""
+    assert reuse["unsupported_manifest_sections"]
+    equivalent = service.preview({**reuse["form"], "data": str(source)})
+    assert equivalent["config"] == reuse["original"]["config"]
+    methods = service.methods_report(result["run_id"])
+    assert "软件版本（历史产物元数据）" in methods and "snapshot_capability_parameters" in methods
+    bundle, bundle_name = service.export_bundle(result["run_id"])
+    assert bundle.name == bundle_name and bundle.is_file()
+    from zipfile import ZipFile
+    with ZipFile(bundle) as archive:
+        assert archive.testzip() is None
+        assert "snapshot.json" in archive.namelist()
     report = (run_dir / "report.md").read_bytes()
     restarted = JobManager(tmp_path, service.manager.runs_dir)
     assert restarted.runs()[0]["status"] == "success"

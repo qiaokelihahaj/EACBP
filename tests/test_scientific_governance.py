@@ -171,11 +171,17 @@ def test_resume_rejects_changed_input(tmp_path):
     orch = ScientificOrchestrator(artifact_registry=reg)
     uri = "json://review/input/v1"
     meta = reg.register(uri, {"value": 1}, ArtifactType.JSON, "review", "ingest", "ingest")
-    task = TaskContract(task_id="audit", capability="dataset_audit", input_artifacts=[uri])
+    output_uri = "json://review/audit/v1"
+    task = TaskContract(task_id="audit", capability="dataset_audit", input_artifacts=[uri],
+                        expected_outputs=[output_uri])
     result = TaskResult(task_id="audit", capability="dataset_audit", method_used="sc_audit_v1",
-                        status=TaskStatus.SUCCESS, output_artifacts=[uri])
+                        status=TaskStatus.SUCCESS, input_artifacts=[uri], output_artifacts=[output_uri])
+    def execute(contract, staged):
+        staged.register(output_uri, {"value": 1}, ArtifactType.JSON, "review", "audit", "audit",
+                        parent_uris=[uri])
+        return result
     with patch.object(ComputationalDAGPlanner, "build_study_plan", return_value=[task]), \
-         patch.object(orch.capability_registry, "execute_contract", return_value=result) as call:
+         patch.object(orch.capability_registry, "execute_contract", side_effect=execute) as call:
         assert orch.run_study(manifest())["status"] == "success"
         from pathlib import Path
         Path(meta.storage_path).write_text('{"value": 999}', encoding="utf-8")

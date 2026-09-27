@@ -78,7 +78,7 @@ class ArtifactRegistry:
     """Manage immutable payloads, metadata, and their lineage across restarts."""
 
     INDEX_FILENAME = ".artifact_registry.json"
-    INDEX_VERSION = 1
+    INDEX_VERSION = 2
 
     def __init__(self, storage_dir: str = ".artifacts"):
         self._mutex = threading.RLock()
@@ -141,12 +141,18 @@ class ArtifactRegistry:
                 payload = json.load(handle)
             if not isinstance(payload, dict):
                 raise ValueError("registry index root must be an object")
+            version = payload.get("index_version", 1)
+            if type(version) is not int or version not in (1, self.INDEX_VERSION):
+                raise ValueError(f"unsupported registry index version: {version!r}")
             records = payload.get("metadata", [])
             if not isinstance(records, list):
                 raise ValueError("registry index metadata must be a list")
             rebuilt: Dict[str, ArtifactMetadata] = {}
             for record in records:
                 metadata = ArtifactMetadata.model_validate(record)
+                if version >= 2:
+                    self.storage.validate_object_key(metadata.storage_path)
+                metadata.storage_path = str(self.storage.resolve_path(metadata.storage_path))
                 canonical_uri = ArtifactURI.parse(metadata.uri).to_string()
                 if canonical_uri != metadata.uri:
                     raise ValueError(
@@ -192,10 +198,11 @@ class ArtifactRegistry:
         return {"nodes": nodes, "edges": edges}
 
     def _index_payload(self) -> Dict[str, Any]:
-        metadata_records = [
-            metadata.model_dump(mode="json")
-            for metadata in sorted(self.registry.values(), key=lambda item: item.uri)
-        ]
+        metadata_records = []
+        for metadata in sorted(self.registry.values(), key=lambda item: item.uri):
+            record = metadata.model_dump(mode="json")
+            record["storage_path"] = self.storage.relative_path(metadata.storage_path)
+            metadata_records.append(record)
         return {
             "index_version": self.INDEX_VERSION,
             "metadata": metadata_records,
@@ -453,7 +460,7 @@ class ArtifactRegistry:
                 auditor_fingerprint=auditor_fingerprint,
             )
 
-    def _verify_audit_outputs_locked(self, record: ArtifactAuditRecord) -> Tuple[bool, str]:
+    def _verify_audit_outputs_locked(self, record: ArtifactAuditRecord, *, payloads=None, retain_uris=None) -> Tuple[bool, str]:
         """Verify all sibling outputs, not only the artifact being queried."""
 
         try:
@@ -476,12 +483,15 @@ class ArtifactRegistry:
             try:
                 # ``load`` verifies the digest and also rejects a payload that
                 # can no longer be deserialized after tampering.
-                self.storage.load(
+                value = self.storage.load(
                     metadata.uri,
                     metadata.type,
                     expected_sha256=expected,
                     storage_path=metadata.storage_path,
                 )
+                if payloads is not None and (retain_uris is None or uri in retain_uris):
+                    payloads[uri] = value
+                del value
             except Exception as exc:  # fail closed for every storage error
                 return False, f"audited output integrity check failed for {uri}: {exc}"
         return True, ""
@@ -683,6 +693,8 @@ class ArtifactRegistry:
         *,
         expected_auditor_version: Optional[str] = None,
         expected_auditor_fingerprint: Optional[str] = None,
+        payloads=None,
+        retain_uris=None,
     ) -> ArtifactAuditRecord:
         if contract is None:
             raise ArtifactAuditAccessError(
@@ -729,7 +741,9 @@ class ArtifactRegistry:
             raise ArtifactAuditAccessError("Durable audit report did not pass")
         if bool(self._report_field(report_payload, "stop_rule_triggered", False)):
             raise ArtifactAuditAccessError("Durable audit stop rule prevents evidence access")
-        integrity_ok, reason = self._verify_audit_outputs_locked(record)
+        integrity_ok, reason = self._verify_audit_outputs_locked(
+            record, payloads=payloads, retain_uris=retain_uris
+        )
         if not integrity_ok:
             raise ArtifactAuditAccessError(reason)
         return record
@@ -775,13 +789,16 @@ class ArtifactRegistry:
         )
         with self.storage.lock():
             self._load_persisted()
+            canonical_uri = ArtifactURI.parse(uri_str).to_string()
+            payloads = {}
             record = self._require_audited_locked(
                 signature,
                 contract,
                 expected_auditor_version=expected_auditor_version,
                 expected_auditor_fingerprint=expected_auditor_fingerprint,
+                payloads=payloads,
+                retain_uris={canonical_uri},
             )
-            canonical_uri = ArtifactURI.parse(uri_str).to_string()
             if canonical_uri not in record.output_artifacts:
                 raise ArtifactAuditAccessError(
                     f"Artifact {canonical_uri!r} is not an output of audited task {signature!r}"
@@ -789,18 +806,7 @@ class ArtifactRegistry:
             metadata = self.registry.get(canonical_uri)
             if metadata is None:
                 raise ArtifactAuditAccessError(f"Audited artifact metadata is missing for {canonical_uri}")
-            try:
-                payload = self.storage.load(
-                    metadata.uri,
-                    metadata.type,
-                    expected_sha256=record.artifact_hashes[canonical_uri],
-                    storage_path=metadata.storage_path,
-                )
-            except Exception as exc:
-                raise ArtifactAuditAccessError(
-                    f"Audited artifact integrity check failed for {canonical_uri}: {exc}"
-                ) from exc
-            return metadata.model_copy(deep=True), payload
+            return metadata.model_copy(deep=True), payloads[canonical_uri]
 
     # A query spelling is provided for integrations that use query terminology;
     # both paths enforce the same explicit signature/context requirements.
@@ -845,22 +851,18 @@ class ArtifactRegistry:
         )
         with self.storage.lock():
             self._load_persisted()
+            payloads = {}
             record = self._require_audited_locked(
                 signature,
                 contract,
                 expected_auditor_version=expected_auditor_version,
                 expected_auditor_fingerprint=expected_auditor_fingerprint,
+                payloads=payloads,
             )
             values: List[Tuple[ArtifactMetadata, Any]] = []
             for uri in record.output_artifacts:
                 metadata = self.registry[uri]
-                payload = self.storage.load(
-                    metadata.uri,
-                    metadata.type,
-                    expected_sha256=record.artifact_hashes[uri],
-                    storage_path=metadata.storage_path,
-                )
-                values.append((metadata.model_copy(deep=True), payload))
+                values.append((metadata.model_copy(deep=True), payloads[uri]))
             return values
 
     query_audited_many = get_audited_many
@@ -1076,6 +1078,28 @@ class ArtifactRegistry:
         if canonical_uri not in self.registry:
             raise KeyError(f"Artifact URI '{canonical_uri}' is not registered in the system.")
         return self.registry[canonical_uri].model_copy(deep=True)
+
+    @_synchronized
+    def get_metadata_many(self, uri_strings, *, missing_ok=False) -> Dict[str, ArtifactMetadata]:
+        """Read a batch from one index generation, refreshing only once."""
+        uris = list(dict.fromkeys(ArtifactURI.parse(uri).to_string() for uri in uri_strings))
+        self._refresh()
+        return {uri: self.registry[uri].model_copy(deep=True) for uri in uris
+                if not missing_ok or uri in self.registry}
+
+    def verify_many(self, uri_strings) -> Dict[str, ArtifactMetadata]:
+        """Verify file bytes in bounded memory, without deserializing payloads."""
+        metadata = self.get_metadata_many(uri_strings)
+        for meta in metadata.values():
+            self.storage.verify_payload(
+                meta.uri, meta.type, meta.sha256_hash, meta.storage_path,
+                expected_size=meta.size_bytes,
+            )
+        return metadata
+
+    def verify_payload(self, uri_str: str) -> ArtifactMetadata:
+        uri = ArtifactURI.parse(uri_str).to_string()
+        return self.verify_many([uri])[uri]
 
     def load_payload(self, uri_str: str) -> Any:
         meta = self.get_metadata(uri_str)

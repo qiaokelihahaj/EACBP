@@ -43,7 +43,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-from scipy import stats
+from scipy import sparse, stats
 
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
@@ -57,6 +57,8 @@ from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
 _LN2 = float(np.log(2.0))
 _DEFAULT_MIN_DONORS = 2
 _DEFAULT_LOO_MIN_DONORS = 3
+_MAX_PSEUDOBULK_WORKING_BYTES = 1_000_000_000
+_DENSE_AGGREGATION_CHUNK_BYTES = 32 * 1024 * 1024
 
 
 class AdvancedStatisticsInputError(ValueError):
@@ -84,8 +86,70 @@ class _PseudobulkInput:
     donor_ids: list[str]
     donor_ids_a: list[str]
     donor_ids_b: list[str]
+    pseudobulk_dense_bytes: int = 0
+    estimated_aggregation_working_bytes: int = 0
     design_rank: Optional[int] = None
     design_columns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class InferenceSettings:
+    """The shared significance and interval threshold for one fit."""
+
+    alpha: float = 0.05
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.alpha)) or not 0.0 < float(self.alpha) < 1.0:
+            raise AdvancedStatisticsInputError("alpha must be between zero and one")
+        object.__setattr__(self, "alpha", float(self.alpha))
+
+    @classmethod
+    def from_params(cls, params: Mapping[str, Any]) -> "InferenceSettings":
+        try:
+            return cls(alpha=float(params.get("alpha", 0.05)))
+        except (TypeError, ValueError) as exc:
+            raise AdvancedStatisticsInputError("alpha must be between zero and one") from exc
+
+    @property
+    def confidence_level(self) -> float:
+        return 1.0 - self.alpha
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "alpha": self.alpha,
+            "confidence_level": self.confidence_level,
+            "significance_rule": "fdr_q_value < alpha",
+            "legacy_significance_rule": "fdr_q_value < 0.05",
+        }
+
+
+@dataclass(frozen=True)
+class ContrastSpec:
+    """Resolved PyDESeq2 contrast and the estimand its sign describes."""
+
+    kind: str
+    vector: tuple[Any, ...]
+    factor: Optional[str]
+    tested_level: Optional[str]
+    reference_level: Optional[str]
+    label: str
+    effect_definition: str
+
+    def to_pydeseq2(self) -> list[str] | np.ndarray:
+        if self.kind == "numeric":
+            return np.asarray(self.vector, dtype=float)
+        return [str(value) for value in self.vector]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "vector": list(self.vector),
+            "factor": self.factor,
+            "tested_level": self.tested_level,
+            "reference_level": self.reference_level,
+            "label": self.label,
+            "effect_definition": self.effect_definition,
+        }
 
 
 def _software_version(package: str) -> str:
@@ -116,12 +180,28 @@ def _require_decoupler():
     return dc
 
 
-def _as_dense(value: Any) -> np.ndarray:
-    if hasattr(value, "toarray"):
+def _as_dense(value: Any, *, max_bytes: Optional[int] = None) -> np.ndarray:
+    """Materialize a matrix only after its expected size has been checked."""
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if max_bytes is not None and shape is not None and dtype is not None:
+        expected = math.prod(int(size) for size in shape) * np.dtype(dtype).itemsize
+        if expected > int(max_bytes):
+            raise AdvancedStatisticsInputError(
+                f"dense materialization requires {expected:,} bytes, above the "
+                f"{int(max_bytes):,}-byte resource limit"
+            )
+    if sparse.issparse(value):
         value = value.toarray()
     elif hasattr(value, "A"):
         value = value.A
-    return np.asarray(value)
+    result = np.asarray(value)
+    if max_bytes is not None and result.nbytes > int(max_bytes):
+        raise AdvancedStatisticsInputError(
+            f"dense materialization requires {result.nbytes:,} bytes, above the "
+            f"{int(max_bytes):,}-byte resource limit"
+        )
+    return result
 
 
 def _coerce_data(payload: Any) -> SCData:
@@ -220,25 +300,61 @@ def _validate_counts(data: SCData, params: Mapping[str, Any]) -> tuple[Any, str]
             )
     else:
         value = layers[layer_name]
-    arr = _as_dense(value)
-    if arr.ndim != 2 or arr.shape != data.shape:
+    if not sparse.issparse(value):
+        value = np.asarray(value)
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) != 2 or tuple(shape) != tuple(data.shape):
         raise AdvancedStatisticsInputError(
-            f"counts matrix must have shape {data.shape}; received {getattr(arr, 'shape', None)}"
+            f"counts matrix must have shape {data.shape}; received {shape}"
         )
-    if arr.dtype.kind in "fc" and not np.isfinite(arr).all():
-        raise AdvancedStatisticsInputError("raw counts contain NaN or infinite values")
-    if arr.dtype.kind not in "biufc":
-        raise AdvancedStatisticsInputError(f"raw counts have unsupported dtype {arr.dtype}")
-    if np.any(arr < 0):
+    sparse_coordinates = value.tocoo(copy=False) if sparse.issparse(value) else None
+    values = sparse_coordinates.data if sparse_coordinates is not None else np.asarray(value)
+    _validate_count_values(values)
+    if sparse.issparse(value):
+        # Duplicate coordinates are legal in some sparse formats. Bound their
+        # possible sum before SciPy coalesces them in int64 arithmetic.
+        if not getattr(sparse_coordinates, "has_canonical_format", True):
+            coordinates = sparse_coordinates
+            order = np.lexsort((coordinates.col, coordinates.row))
+            sorted_rows = coordinates.row[order]
+            sorted_cols = coordinates.col[order]
+            if len(order):
+                starts = np.r_[True, (sorted_rows[1:] != sorted_rows[:-1]) | (sorted_cols[1:] != sorted_cols[:-1])]
+                boundaries = np.flatnonzero(starts)
+                max_duplicates = int(np.diff(np.r_[boundaries, len(order)]).max())
+                max_value = int(np.max(values)) if values.size else 0
+                if max_value and max_value > np.iinfo(np.int64).max // max_duplicates:
+                    raise AdvancedStatisticsInputError("raw counts exceed int64 range when duplicate sparse entries are combined")
+        counts = value.astype(np.int64, copy=True).tocsr(copy=False)
+        counts.sum_duplicates()
+        counts.sort_indices()
+        if counts.data.size and np.any(counts.data < 0):
+            raise AdvancedStatisticsInputError("raw counts exceed int64 range when duplicate sparse entries are combined")
+        return counts, counts_source
+    return np.asarray(value), counts_source
+
+
+def _validate_count_values(values: np.ndarray) -> None:
+    values = np.asarray(values)
+    kind = values.dtype.kind
+    if kind not in "biuf":
+        raise AdvancedStatisticsInputError(f"raw counts have unsupported dtype {values.dtype}")
+    if kind == "f":
+        if not np.isfinite(values).all():
+            raise AdvancedStatisticsInputError("raw counts contain NaN or infinite values")
+        # 2**63 is exactly representable in floating types while int64.max
+        # rounds up to that value when compared as float64.
+        if values.size and np.any(values.astype(np.longdouble, copy=False) >= np.longdouble(2) ** 63):
+            raise AdvancedStatisticsInputError("raw counts exceed int64 range")
+        if not np.all(np.equal(values, np.floor(values))):
+            raise AdvancedStatisticsInputError(
+                "raw counts must be integer-valued; normalized/log-transformed values are not accepted"
+            )
+    elif kind == "u":
+        if values.size and int(values.max()) > np.iinfo(np.int64).max:
+            raise AdvancedStatisticsInputError("raw counts exceed int64 range")
+    if values.size and np.any(values < 0):
         raise AdvancedStatisticsInputError("raw counts must be non-negative")
-    if not np.all(np.equal(arr, np.floor(arr))):
-        raise AdvancedStatisticsInputError(
-            "raw counts must be integer-valued; normalized/log-transformed values are not accepted"
-        )
-    max_int = np.iinfo(np.int64).max
-    if np.any(arr > max_int):
-        raise AdvancedStatisticsInputError("raw counts exceed int64 range")
-    return np.asarray(arr, dtype=np.int64), counts_source
 
 
 def _gene_names(data: SCData) -> list[str]:
@@ -257,7 +373,7 @@ def _gene_names(data: SCData) -> list[str]:
 
 
 def _aggregate_pseudobulk(
-    counts: np.ndarray,
+    counts: Any,
     obs: pd.DataFrame,
     genes: Sequence[str],
     condition_col: str,
@@ -265,7 +381,7 @@ def _aggregate_pseudobulk(
     condition_a: str,
     condition_b: str,
     covariates: Sequence[str],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, int, int]:
     condition_values = obs[condition_col].astype(str)
     raw_donors = obs[donor_col]
     if raw_donors.isna().any():
@@ -283,9 +399,8 @@ def _aggregate_pseudobulk(
     selected_obs["__donor"] = donor_values.loc[mask].to_numpy()
     if selected_obs["__donor"].isna().any() or selected_obs["__donor"].str.lower().isin({"nan", "none", "<na>", "nat"}).any():
         raise AdvancedStatisticsInputError(f"donor metadata column {donor_col!r} contains missing values")
-    selected_counts = counts[mask]
-
-    rows: list[np.ndarray] = []
+    selected_input_positions = np.flatnonzero(mask)
+    group_cell_positions: list[np.ndarray] = []
     metadata_rows: list[dict[str, Any]] = []
     # groupby(sort=True) gives deterministic pseudobulk order independent of
     # cell order while retaining the original counts exactly.
@@ -293,7 +408,7 @@ def _aggregate_pseudobulk(
         ["__donor", "__condition"], sort=True, observed=True
     ).groups.items():
         pos = np.asarray(list(positions), dtype=int)
-        rows.append(selected_counts[pos].sum(axis=0, dtype=np.int64))
+        group_cell_positions.append(selected_input_positions[pos])
         record: dict[str, Any] = {"donor": str(donor), "condition": str(condition)}
         # Store the caller's names too, so a user formula written with custom
         # metadata column names remains inspectable in the metadata artifact.
@@ -315,14 +430,83 @@ def _aggregate_pseudobulk(
             record[covariate] = unique[0]
         record["sample_id"] = f"{donor}__{condition}"
         metadata_rows.append(record)
-    if not rows:
+    if not group_cell_positions:
         raise AdvancedStatisticsInputError("the requested contrast produced no donor-condition samples")
     metadata = pd.DataFrame(metadata_rows)
     if metadata["sample_id"].duplicated().any():
         raise AdvancedStatisticsInputError("donor-condition pseudobulk sample identifiers are not unique")
     metadata = metadata.set_index("sample_id", drop=True)
-    counts_df = pd.DataFrame(np.vstack(rows), index=metadata.index, columns=list(genes), dtype=np.int64)
-    return counts_df, metadata
+    dense_bytes, peak_bytes = _pseudobulk_memory_estimate(
+        len(group_cell_positions),
+        len(genes),
+        int(mask.sum()),
+        sparse.issparse(counts),
+        int(counts.dtype.itemsize),
+    )
+    if peak_bytes > _MAX_PSEUDOBULK_WORKING_BYTES:
+        raise AdvancedStatisticsInputError(
+            "donor-condition pseudobulk aggregation is estimated to require "
+            f"{peak_bytes:,} bytes (dense count table {dense_bytes:,} bytes), above the "
+            f"{_MAX_PSEUDOBULK_WORKING_BYTES:,}-byte resource limit; reduce genes or donor-condition samples"
+        )
+
+    max_group_cells = max(len(positions) for positions in group_cell_positions)
+    max_count = int(counts.data.max()) if sparse.issparse(counts) and counts.data.size else (
+        int(np.max(counts)) if getattr(counts, "size", 0) else 0
+    )
+    if max_count and max_group_cells > np.iinfo(np.int64).max // max_count:
+        raise AdvancedStatisticsInputError(
+            "donor-condition count sums may exceed int64 range; refusing unsafe aggregation"
+        )
+
+    if sparse.issparse(counts):
+        member_rows = np.concatenate([
+            np.full(len(positions), group_index, dtype=np.intp)
+            for group_index, positions in enumerate(group_cell_positions)
+        ])
+        member_cols = np.concatenate(group_cell_positions).astype(np.intp, copy=False)
+        membership = sparse.csr_matrix(
+            (np.ones(len(member_rows), dtype=np.int64), (member_rows, member_cols)),
+            shape=(len(group_cell_positions), len(obs)),
+        )
+        aggregated = membership @ counts
+        aggregated = _as_dense(aggregated, max_bytes=dense_bytes)
+        aggregate_array = np.asarray(aggregated, dtype=np.int64)
+    else:
+        # Reduce dense inputs in bounded row blocks. The source is already
+        # dense, but fancy indexing must never create another cell-by-gene copy.
+        aggregate_array = np.zeros((len(group_cell_positions), len(genes)), dtype=np.int64)
+        row_bytes = max(1, int(counts.dtype.itemsize) * max(1, len(genes)))
+        rows_per_chunk = max(1, _DENSE_AGGREGATION_CHUNK_BYTES // row_bytes)
+        for group_index, positions in enumerate(group_cell_positions):
+            for start in range(0, len(positions), rows_per_chunk):
+                block_rows = positions[start : start + rows_per_chunk]
+                block = counts[block_rows]
+                aggregate_array[group_index] += np.sum(block, axis=0, dtype=np.int64)
+
+    counts_df = pd.DataFrame(
+        aggregate_array, index=metadata.index, columns=list(genes), dtype=np.int64, copy=False
+    )
+    return counts_df, metadata, dense_bytes, peak_bytes
+
+
+def _pseudobulk_memory_estimate(
+    n_samples: int,
+    n_genes: int,
+    n_selected_cells: int,
+    sparse_input: bool,
+    input_itemsize: int,
+) -> tuple[int, int]:
+    dense_bytes = int(n_samples) * int(n_genes) * np.dtype(np.int64).itemsize
+    if sparse_input:
+        # Bound the worst case where the sparse aggregate fills in, while also
+        # accounting for its dense representation and the membership matrix.
+        peak_bytes = 3 * dense_bytes + 48 * int(n_selected_cells)
+    else:
+        input_chunk = int(input_itemsize) * int(n_genes) * int(n_selected_cells)
+        scratch = min(_DENSE_AGGREGATION_CHUNK_BYTES, input_chunk) + 8 * max(1, int(n_genes))
+        peak_bytes = dense_bytes + scratch
+    return dense_bytes, peak_bytes
 
 
 def _formula_variables(formula: str) -> set[str]:
@@ -418,7 +602,7 @@ def _prepare_pseudobulk(data: SCData, params: Mapping[str, Any]) -> _PseudobulkI
     paired = bool(params.get("paired", params.get("paired_design", False)))
     counts, counts_source = _validate_counts(data, params)
     genes = _gene_names(data)
-    counts_df, metadata = _aggregate_pseudobulk(
+    counts_df, metadata, dense_bytes, estimated_peak_bytes = _aggregate_pseudobulk(
         counts,
         obs,
         genes,
@@ -456,6 +640,8 @@ def _prepare_pseudobulk(data: SCData, params: Mapping[str, Any]) -> _PseudobulkI
         donor_ids=sorted(set(donors_a + donors_b)),
         donor_ids_a=donors_a,
         donor_ids_b=donors_b,
+        pseudobulk_dense_bytes=dense_bytes,
+        estimated_aggregation_working_bytes=estimated_peak_bytes,
     )
 
 
@@ -515,36 +701,73 @@ def _validate_design_and_make_dds(
     return dds
 
 
-def _resolve_contrast(prepared: _PseudobulkInput, params: Mapping[str, Any]) -> list[str] | np.ndarray:
+def _resolve_contrast(prepared: _PseudobulkInput, params: Mapping[str, Any]) -> ContrastSpec:
     supplied = params.get("contrast")
     if supplied is None:
-        return ["condition", prepared.condition_a, prepared.condition_b]
-    if isinstance(supplied, np.ndarray):
-        if supplied.ndim != 1:
-            raise AdvancedStatisticsInputError("numeric contrast must be one-dimensional")
-        return supplied.astype(float)
-    if isinstance(supplied, (list, tuple)):
-        if len(supplied) == 3 and all(isinstance(v, str) for v in supplied):
-            if str(supplied[0]) not in {"condition", prepared.condition_col}:
-                raise AdvancedStatisticsInputError(
-                    "categorical contrast must target the condition factor"
-                )
-            if str(supplied[1]) not in {prepared.condition_a, prepared.condition_b} or str(supplied[2]) not in {
-                prepared.condition_a,
-                prepared.condition_b,
-            }:
-                raise AdvancedStatisticsInputError("contrast levels must be observed condition levels")
-            if str(supplied[1]) == str(supplied[2]):
-                raise AdvancedStatisticsInputError("contrast tested and reference levels must differ")
-            return [str(v) for v in supplied]
-        try:
-            return np.asarray(supplied, dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise AdvancedStatisticsInputError(
-                "contrast must be ['factor', 'tested', 'reference'] or a numeric contrast vector"
-            ) from exc
-    raise AdvancedStatisticsInputError(
-        "contrast must be ['factor', 'tested', 'reference'] or a numeric contrast vector"
+        tested, reference = prepared.condition_a, prepared.condition_b
+        vector = ("condition", tested, reference)
+        return ContrastSpec(
+            kind="categorical",
+            vector=vector,
+            factor="condition",
+            tested_level=tested,
+            reference_level=reference,
+            label=f"{tested} versus {reference}",
+            effect_definition=f"PyDESeq2 log2 fold change for {tested} versus {reference}",
+        )
+
+    if isinstance(supplied, (list, tuple)) and len(supplied) == 3 and all(
+        isinstance(value, str) for value in supplied
+    ):
+        factor, tested, reference = (str(value) for value in supplied)
+        if factor not in {"condition", prepared.condition_col}:
+            raise AdvancedStatisticsInputError("categorical contrast must target the condition factor")
+        observed = {prepared.condition_a, prepared.condition_b}
+        if tested not in observed or reference not in observed:
+            raise AdvancedStatisticsInputError("contrast levels must be observed condition levels")
+        if tested == reference:
+            raise AdvancedStatisticsInputError("contrast tested and reference levels must differ")
+        return ContrastSpec(
+            kind="categorical",
+            vector=(factor, tested, reference),
+            factor=factor,
+            tested_level=tested,
+            reference_level=reference,
+            label=f"{tested} versus {reference}",
+            effect_definition=f"PyDESeq2 log2 fold change for {tested} versus {reference}",
+        )
+
+    try:
+        numeric = np.asarray(supplied, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise AdvancedStatisticsInputError(
+            "contrast must be ['factor', 'tested', 'reference'] or a numeric contrast vector"
+        ) from exc
+    if numeric.ndim != 1:
+        raise AdvancedStatisticsInputError("numeric contrast must be one-dimensional")
+    if not len(numeric) or not np.isfinite(numeric).all() or not np.any(numeric != 0):
+        raise AdvancedStatisticsInputError("numeric contrast must be finite and contain a non-zero coefficient")
+    if prepared.design_columns and len(numeric) != len(prepared.design_columns):
+        raise AdvancedStatisticsInputError(
+            f"numeric contrast has {len(numeric)} coefficients but the design has "
+            f"{len(prepared.design_columns)} columns"
+        )
+    raw_definition = params.get("contrast_effect_definition")
+    definition = str(raw_definition).strip() if raw_definition is not None else ""
+    if not definition:
+        raise AdvancedStatisticsInputError(
+            "numeric contrast requires an explicit contrast_effect_definition that describes the estimated effect"
+        )
+    raw_label = params.get("contrast_label")
+    label = (str(raw_label).strip() if raw_label is not None else "") or definition
+    return ContrastSpec(
+        kind="numeric",
+        vector=tuple(float(value) for value in numeric),
+        factor=None,
+        tested_level=None,
+        reference_level=None,
+        label=label,
+        effect_definition=definition,
     )
 
 
@@ -557,14 +780,15 @@ def _run_pydeseq2(
 ) -> tuple[pd.DataFrame, Any]:
     _, DeseqStats = _require_pydeseq2()
     dds = _validate_design_and_make_dds(prepared, params, counts=counts, metadata=metadata)
-    dds.deseq2()
     contrast = _resolve_contrast(prepared, params)
+    inference = InferenceSettings.from_params(params)
+    dds.deseq2()
     n_cpus = params.get("n_cpus", params.get("n_processes", 1))
     n_cpus = None if n_cpus is None else max(1, int(n_cpus))
     stats_obj = DeseqStats(
         dds,
-        contrast=contrast,
-        alpha=float(params.get("alpha", 0.05)),
+        contrast=contrast.to_pydeseq2(),
+        alpha=inference.alpha,
         cooks_filter=bool(params.get("cooks_filter", True)),
         independent_filter=bool(params.get("independent_filter", True)),
         quiet=True,
@@ -592,23 +816,32 @@ def _result_table(
     status: str = "estimated",
 ) -> pd.DataFrame:
     out = pd.DataFrame(index=result.index.astype(str))
+    inference = InferenceSettings.from_params(params)
+    contrast = _resolve_contrast(prepared, params)
+    categorical = contrast.kind == "categorical"
+    condition_a = contrast.tested_level if categorical else prepared.condition_a
+    condition_b = contrast.reference_level if categorical else prepared.condition_b
     out["gene"] = out.index
-    out["condition_a"] = prepared.condition_a
-    out["condition_b"] = prepared.condition_b
+    out["condition_a"] = condition_a
+    out["condition_b"] = condition_b
+    out["contrast_kind"] = contrast.kind
+    out["contrast_factor"] = contrast.factor
+    out["contrast_tested_level"] = contrast.tested_level
+    out["contrast_reference_level"] = contrast.reference_level
+    out["contrast_label"] = contrast.label
+    out["effect_definition"] = contrast.effect_definition
+    out["alpha"] = inference.alpha
+    out["confidence_level"] = inference.confidence_level
     out["base_mean"] = pd.to_numeric(result["baseMean"], errors="coerce").to_numpy()
     out["log2_fold_change"] = pd.to_numeric(result["log2FoldChange"], errors="coerce").to_numpy()
     out["lfc_se"] = pd.to_numeric(result["lfcSE"], errors="coerce").to_numpy()
-    alpha = float(params.get("alpha", 0.05))
-    if not 0.0 < alpha < 1.0:
-        raise AdvancedStatisticsInputError("alpha must be between zero and one")
-    z_critical = float(stats.norm.ppf(1.0 - alpha / 2.0))
+    z_critical = float(stats.norm.ppf(1.0 - inference.alpha / 2.0))
     out["ci_low"] = out["log2_fold_change"] - z_critical * out["lfc_se"]
     out["ci_high"] = out["log2_fold_change"] + z_critical * out["lfc_se"]
     out["statistic"] = pd.to_numeric(result["stat"], errors="coerce").to_numpy()
     out["p_value"] = pd.to_numeric(result["pvalue"], errors="coerce").to_numpy()
     out["fdr_q_value"] = pd.to_numeric(result["padj"], errors="coerce").to_numpy()
     out["padj"] = out["fdr_q_value"]
-    out["effect_definition"] = "PyDESeq2 log2 fold change for condition_a versus condition_b"
     # Keep the legacy auditor's accepted pseudobulk label while exposing the
     # more precise donor-condition unit in a separate field.
     out["statistical_unit"] = "donor_pseudobulk"
@@ -619,8 +852,12 @@ def _result_table(
     out["paired"] = prepared.paired
     out["covariates"] = ",".join(prepared.covariates)
     out["n_pseudobulk_samples"] = int(len(prepared.metadata))
-    out["n_donors_condition_a"] = int(len(prepared.donor_ids_a))
-    out["n_donors_condition_b"] = int(len(prepared.donor_ids_b))
+    donor_counts = {
+        prepared.condition_a: len(prepared.donor_ids_a),
+        prepared.condition_b: len(prepared.donor_ids_b),
+    }
+    out["n_donors_condition_a"] = int(donor_counts.get(condition_a, 0))
+    out["n_donors_condition_b"] = int(donor_counts.get(condition_b, 0))
     finite_lfc = out["log2_fold_change"].notna()
     finite_p = out["p_value"].notna()
     finite_q = out["fdr_q_value"].notna()
@@ -635,9 +872,14 @@ def _result_table(
     out["status_reason"] = row_reason
     # NaN p-values are preserved as not-estimated.  They are never converted
     # to one, because doing so would present an invented p-value to users.
-    significance = out["fdr_q_value"].lt(float(params.get("alpha", 0.05)))
+    significant_at_alpha = out["fdr_q_value"].lt(inference.alpha)
+    significant_fdr05 = out["fdr_q_value"].lt(0.05)
+    out["significant_at_alpha"] = pd.Series(
+        pd.array(significant_at_alpha.where(out["fdr_q_value"].notna(), pd.NA), dtype="boolean"),
+        index=out.index,
+    )
     out["significant_fdr05"] = pd.Series(
-        pd.array(significance.where(out["fdr_q_value"].notna(), pd.NA), dtype="boolean"),
+        pd.array(significant_fdr05.where(out["fdr_q_value"].notna(), pd.NA), dtype="boolean"),
         index=out.index,
     )
     out = out.reset_index(drop=True)
@@ -667,6 +909,8 @@ def _fit_metrics(prepared: _PseudobulkInput, result_table: pd.DataFrame) -> dict
         "n_donors_condition_a": int(len(prepared.donor_ids_a)),
         "n_donors_condition_b": int(len(prepared.donor_ids_b)),
         "counts_source": prepared.counts_source,
+        "pseudobulk_dense_bytes": int(prepared.pseudobulk_dense_bytes),
+        "estimated_aggregation_working_bytes": int(prepared.estimated_aggregation_working_bytes),
         "all_genes_retained": True,
         "statistical_unit": "donor_pseudobulk",
         "is_pseudobulk": True,
@@ -748,6 +992,27 @@ class PyDESeq2PseudobulkCapability(BaseCapability):
         result, _ = _run_pydeseq2(prepared, contract.parameters)
         table = _result_table(result, prepared, contract.parameters)
         metrics = _fit_metrics(prepared, table)
+        contrast_spec = _resolve_contrast(prepared, contract.parameters)
+        inference = InferenceSettings.from_params(contract.parameters)
+        metrics.update(
+            {
+                "alpha": inference.alpha,
+                "inference_settings": inference.as_dict(),
+                "contrast_spec": contrast_spec.as_dict(),
+                "effect_definition": contrast_spec.effect_definition,
+                "n_significant_at_alpha": int(table["significant_at_alpha"].eq(True).sum()),
+            }
+        )
+        if contrast_spec.kind == "categorical":
+            metrics["condition_a"] = contrast_spec.tested_level
+            metrics["condition_b"] = contrast_spec.reference_level
+            donor_counts = {
+                prepared.condition_a: len(prepared.donor_ids_a),
+                prepared.condition_b: len(prepared.donor_ids_b),
+            }
+            metrics["n_donors_condition_a"] = int(donor_counts[contrast_spec.tested_level])
+            metrics["n_donors_condition_b"] = int(donor_counts[contrast_spec.reference_level])
+        metrics["contrast_label"] = contrast_spec.label
         out_uri = _output_uri(contract, input_uri, "table://{study_id}/pydeseq2_deg/v1")
         _register_table(
             registry,
@@ -765,6 +1030,8 @@ class PyDESeq2PseudobulkCapability(BaseCapability):
                 "covariates": prepared.covariates,
                 "design": prepared.design,
                 "contrast": _contrast_for_record(prepared, contract.parameters),
+                "contrast_spec": contrast_spec.as_dict(),
+                "inference_settings": inference.as_dict(),
                 "counts_source": prepared.counts_source,
             },
             metrics,
@@ -794,9 +1061,8 @@ class PyDESeq2PseudobulkCapability(BaseCapability):
 
 def _contrast_for_record(prepared: _PseudobulkInput, params: Mapping[str, Any]) -> Any:
     contrast = _resolve_contrast(prepared, params)
-    if isinstance(contrast, np.ndarray):
-        return contrast.tolist()
-    return list(contrast)
+    value = contrast.to_pydeseq2()
+    return value.tolist() if isinstance(value, np.ndarray) else list(value)
 
 
 def _read_local_network(path_value: Any) -> tuple[pd.DataFrame, str, str]:
@@ -1029,10 +1295,16 @@ def _activity_test(
     prepared: _PseudobulkInput,
     alpha: float = 0.05,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    inference = InferenceSettings(alpha=float(alpha))
+    contrast_label = f"{prepared.condition_a} versus {prepared.condition_b}"
+    effect_definition = (
+        "Donor-level covariate-adjusted OLS difference in inferred activity for "
+        f"{prepared.condition_a} versus {prepared.condition_b}"
+    )
     design_matrix, contrast_vector, design_columns, design_rank = _activity_design_matrix(prepared)
     design_values = design_matrix.to_numpy(dtype=float)
     residual_df = int(design_values.shape[0] - design_rank)
-    t_critical = float(stats.t.ppf(1.0 - float(alpha) / 2.0, residual_df))
+    t_critical = float(stats.t.ppf(1.0 - inference.alpha / 2.0, residual_df))
     # The same design is used for every source; fit an OLS activity model
     # rather than silently ignoring paired donor effects or covariates.
     xtx_inv = np.linalg.pinv(design_values.T @ design_values)
@@ -1080,6 +1352,14 @@ def _activity_test(
                 "source": str(source),
                 "condition_a": prepared.condition_a,
                 "condition_b": prepared.condition_b,
+                "contrast_kind": "categorical",
+                "contrast_factor": "condition",
+                "contrast_tested_level": prepared.condition_a,
+                "contrast_reference_level": prepared.condition_b,
+                "contrast_label": contrast_label,
+                "effect_definition": effect_definition,
+                "alpha": inference.alpha,
+                "confidence_level": inference.confidence_level,
                 "mean_activity_condition_a": float(np.nanmean(values_a)) if len(values_a) else np.nan,
                 "mean_activity_condition_b": float(np.nanmean(values_b)) if len(values_b) else np.nan,
                 "activity_effect_condition_a_vs_b": effect,
@@ -1118,6 +1398,13 @@ def _activity_test(
         adjusted[estimated] = benjamini_hochberg(summary.loc[estimated, "p_value"].to_numpy(dtype=float))
         summary["fdr_q_value"] = adjusted
         summary["padj"] = summary["fdr_q_value"]
+        summary["significant_at_alpha"] = pd.Series(
+            pd.array(
+                summary["fdr_q_value"].lt(inference.alpha).where(summary["fdr_q_value"].notna(), pd.NA),
+                dtype="boolean",
+            ),
+            index=summary.index,
+        )
         summary["significant_fdr05"] = pd.Series(
             pd.array(
                 summary["fdr_q_value"].lt(0.05).where(summary["fdr_q_value"].notna(), pd.NA),
@@ -1201,11 +1488,31 @@ class DecouplerFunctionalAnalysisCapability(BaseCapability):
         summary["statistical_unit"] = "donor_pseudobulk_activity"
         summary["is_pseudobulk"] = True
         summary["activity_input"] = "log1p_CPM_from_layers_counts"
+        inference = InferenceSettings.from_params(contract.parameters)
+        contrast_label = f"{prepared.condition_a} versus {prepared.condition_b}"
+        effect_definition = (
+            "Donor-level covariate-adjusted OLS difference in inferred activity for "
+            f"{prepared.condition_a} versus {prepared.condition_b}"
+        )
+        contrast_spec = {
+            "kind": "categorical",
+            "factor": "condition",
+            "tested_level": prepared.condition_a,
+            "reference_level": prepared.condition_b,
+            "label": contrast_label,
+            "effect_definition": effect_definition,
+        }
         out_uri = _output_uri(contract, contract.input_artifacts[0], "table://{study_id}/functional_activity/v1")
         metrics = {
             "n_sources": int(len(summary)),
             "n_sources_not_estimated": int(summary["status"].eq("not_estimated").sum()) if not summary.empty else 0,
             "n_significant_fdr05": int(summary["significant_fdr05"].eq(True).sum()) if not summary.empty else 0,
+            "n_significant_at_alpha": int(summary["significant_at_alpha"].eq(True).sum()) if not summary.empty else 0,
+            "alpha": inference.alpha,
+            "inference_settings": inference.as_dict(),
+            "contrast_spec": contrast_spec,
+            "contrast_label": contrast_label,
+            "effect_definition": effect_definition,
             "n_donors_condition_a": len(prepared.donor_ids_a),
             "n_donors_condition_b": len(prepared.donor_ids_b),
             "paired": prepared.paired,
@@ -1230,7 +1537,13 @@ class DecouplerFunctionalAnalysisCapability(BaseCapability):
             contract.input_artifacts,
             contract,
             "functional_activity_decoupler_ulm_donor_comparison",
-            {**provenance, "tmin": tmin, "analysis_kind": feature_kind},
+            {
+                **provenance,
+                "tmin": tmin,
+                "analysis_kind": feature_kind,
+                "contrast_spec": contrast_spec,
+                "inference_settings": inference.as_dict(),
+            },
             metrics,
         )
         outputs = [out_uri]
@@ -1280,13 +1593,29 @@ class DecouplerFunctionalAnalysisCapability(BaseCapability):
 
 
 def _skip_table(reason: str, prepared: Optional[_PseudobulkInput], params: Mapping[str, Any]) -> pd.DataFrame:
+    inference = InferenceSettings.from_params(params)
+    contrast = _resolve_contrast(prepared, params) if prepared is not None else None
     values = {
         "gene": None,
         "left_out_donor": None,
         "status": "skipped",
         "skip_reason": reason,
-        "condition_a": prepared.condition_a if prepared else params.get("condition_a"),
-        "condition_b": prepared.condition_b if prepared else params.get("condition_b"),
+        "condition_a": (
+            contrast.tested_level if contrast and contrast.kind == "categorical"
+            else prepared.condition_a if prepared else params.get("condition_a")
+        ),
+        "condition_b": (
+            contrast.reference_level if contrast and contrast.kind == "categorical"
+            else prepared.condition_b if prepared else params.get("condition_b")
+        ),
+        "contrast_kind": contrast.kind if contrast else None,
+        "contrast_factor": contrast.factor if contrast else None,
+        "contrast_tested_level": contrast.tested_level if contrast else None,
+        "contrast_reference_level": contrast.reference_level if contrast else None,
+        "contrast_label": contrast.label if contrast else None,
+        "effect_definition": contrast.effect_definition if contrast else "PyDESeq2 log2 fold change for condition_a versus condition_b",
+        "alpha": inference.alpha,
+        "confidence_level": inference.confidence_level,
         "p_value": np.nan,
         "fdr_q_value": np.nan,
     }
@@ -1321,28 +1650,39 @@ def _leave_one_out_summary(
         n_estimated = int(len(effects))
         baseline_lfc = pd.to_numeric(pd.Series([baseline.get("log2_fold_change")]), errors="coerce").iloc[0]
         baseline_q = pd.to_numeric(pd.Series([baseline.get("fdr_q_value")]), errors="coerce").iloc[0]
+        baseline_significant_fdr05 = bool(float(baseline_q) < 0.05) if pd.notna(baseline_q) else pd.NA
+        baseline_significant_at_alpha = bool(float(baseline_q) < alpha) if pd.notna(baseline_q) else pd.NA
         if n_estimated and pd.notna(baseline_lfc) and float(baseline_lfc) != 0.0:
             direction_consistency = float((np.sign(effects.to_numpy()) == np.sign(float(baseline_lfc))).mean())
         else:
             direction_consistency = np.nan
         if len(q_values) and pd.notna(baseline_q):
-            baseline_significant = bool(float(baseline_q) < alpha)
             loo_significant = q_values.to_numpy(dtype=float) < alpha
             # Retention is relative to the full-model decision: among the
             # estimated fits, how often did the same significant/non-significant
             # decision remain?
-            significance_retention = float((loo_significant == baseline_significant).mean())
+            significance_retention = float((loo_significant == baseline_significant_at_alpha).mean())
             n_significant_loo = int(loo_significant.sum())
         else:
-            baseline_significant = pd.NA
             significance_retention = np.nan
             n_significant_loo = 0
         rows.append(
             {
                 "gene": gene,
+                "condition_a": baseline.get("condition_a"),
+                "condition_b": baseline.get("condition_b"),
+                "contrast_kind": baseline.get("contrast_kind"),
+                "contrast_factor": baseline.get("contrast_factor"),
+                "contrast_tested_level": baseline.get("contrast_tested_level"),
+                "contrast_reference_level": baseline.get("contrast_reference_level"),
+                "contrast_label": baseline.get("contrast_label"),
+                "effect_definition": baseline.get("effect_definition"),
+                "alpha": float(alpha),
+                "confidence_level": 1.0 - float(alpha),
                 "baseline_log2_fold_change": float(baseline_lfc) if pd.notna(baseline_lfc) else np.nan,
                 "baseline_fdr_q_value": float(baseline_q) if pd.notna(baseline_q) else np.nan,
-                "baseline_significant_fdr05": baseline_significant,
+                "baseline_significant_fdr05": baseline_significant_fdr05,
+                "baseline_significant_at_alpha": baseline_significant_at_alpha,
                 "n_estimated_loo": n_estimated,
                 "estimated_coverage": float(n_estimated / n_requested_fits) if n_requested_fits else np.nan,
                 "direction_consistency": direction_consistency,
@@ -1350,6 +1690,7 @@ def _leave_one_out_summary(
                 "max_log2_fold_change": float(effects.max()) if n_estimated else np.nan,
                 "median_log2_fold_change": float(effects.median()) if n_estimated else np.nan,
                 "n_significant_loo": n_significant_loo,
+                "n_significant_loo_fdr05": int((q_values.to_numpy(dtype=float) < 0.05).sum()),
                 "significance_retention": significance_retention,
                 "summary_status": "estimated" if n_estimated else "not_estimated",
             }
@@ -1398,6 +1739,8 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
         loo_params = dict(contract.parameters)
         loo_params["min_donors"] = 1
         prepared = _prepare_pseudobulk(data, loo_params)
+        inference = InferenceSettings.from_params(contract.parameters)
+        contrast_spec = _resolve_contrast(prepared, contract.parameters)
         min_donors = max(3, int(contract.parameters.get("min_loo_donors", _DEFAULT_LOO_MIN_DONORS)))
         n_a, n_b = len(prepared.donor_ids_a), len(prepared.donor_ids_b)
         if n_a < min_donors or n_b < min_donors:
@@ -1410,8 +1753,21 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
             metrics = {
                 "skipped": True,
                 "skip_reason": reason,
-                "n_donors_condition_a": n_a,
-                "n_donors_condition_b": n_b,
+                "alpha": inference.alpha,
+                "inference_settings": inference.as_dict(),
+                "contrast_spec": contrast_spec.as_dict(),
+                "contrast_label": contrast_spec.label,
+                "effect_definition": contrast_spec.effect_definition,
+                "condition_a": contrast_spec.tested_level if contrast_spec.kind == "categorical" else prepared.condition_a,
+                "condition_b": contrast_spec.reference_level if contrast_spec.kind == "categorical" else prepared.condition_b,
+                "n_donors_condition_a": (
+                    len(prepared.donor_ids_a) if contrast_spec.kind != "categorical" or contrast_spec.tested_level == prepared.condition_a
+                    else len(prepared.donor_ids_b)
+                ),
+                "n_donors_condition_b": (
+                    len(prepared.donor_ids_b) if contrast_spec.kind != "categorical" or contrast_spec.reference_level == prepared.condition_b
+                    else len(prepared.donor_ids_a)
+                ),
                 "paired": prepared.paired,
                 "n_successful_fits": 0,
                 "n_requested_fits": 0,
@@ -1427,7 +1783,12 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
                 [input_uri],
                 contract,
                 "pydeseq2_leave_one_donor_out_skipped",
-                {"skip_reason": reason, "paired": prepared.paired},
+                {
+                    "skip_reason": reason,
+                    "paired": prepared.paired,
+                    "contrast_spec": contrast_spec.as_dict(),
+                    "inference_settings": inference.as_dict(),
+                },
                 metrics,
             )
             outputs = [out_uri]
@@ -1499,12 +1860,20 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
             full_table,
             fit_tables,
             n_requested_fits=len(donors_to_remove),
-            alpha=float(contract.parameters.get("alpha", 0.05)),
+            alpha=inference.alpha,
         )
         # Keep the detailed donor-by-gene table as the primary artifact, while
         # repeating the per-gene stability summaries on each row for callers
         # that request only one output URI.
-        output_table = output_table.merge(summary_table, on="gene", how="left")
+        summary_for_merge = summary_table.drop(
+            columns=[
+                "condition_a", "condition_b", "contrast_kind", "contrast_tested_level",
+                "contrast_factor", "contrast_reference_level", "contrast_label", "effect_definition", "alpha",
+                "confidence_level",
+            ],
+            errors="ignore",
+        )
+        output_table = output_table.merge(summary_for_merge, on="gene", how="left")
         output_table["n_requested_fits"] = len(donors_to_remove)
         output_table["n_successful_fits"] = successful_fits
         output_table["paired_leaveout_removes_complete_donor"] = bool(prepared.paired)
@@ -1518,12 +1887,23 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
         metrics = {
             "skipped": False,
             "skip_reason": None,
+            "alpha": inference.alpha,
+            "inference_settings": inference.as_dict(),
+            "contrast_spec": contrast_spec.as_dict(),
+            "contrast_label": contrast_spec.label,
+            "effect_definition": contrast_spec.effect_definition,
             "n_requested_fits": int(len(donors_to_remove)),
             "n_successful_fits": int(successful_fits),
             "n_failed_fits": int(len(failed_fits)),
             "failed_fits": failed_fits,
-            "n_donors_condition_a": n_a,
-            "n_donors_condition_b": n_b,
+            "condition_a": contrast_spec.tested_level if contrast_spec.kind == "categorical" else prepared.condition_a,
+            "condition_b": contrast_spec.reference_level if contrast_spec.kind == "categorical" else prepared.condition_b,
+            "n_donors_condition_a": (
+                n_a if contrast_spec.kind != "categorical" or contrast_spec.tested_level == prepared.condition_a else n_b
+            ),
+            "n_donors_condition_b": (
+                n_b if contrast_spec.kind != "categorical" or contrast_spec.reference_level == prepared.condition_b else n_a
+            ),
             "paired": prepared.paired,
             "paired_leaveout_removes_complete_donor": bool(prepared.paired),
             "complete_fit_coverage": float(successful_fits / len(donors_to_remove)) if donors_to_remove else np.nan,
@@ -1548,6 +1928,9 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
                 "condition_a": prepared.condition_a,
                 "condition_b": prepared.condition_b,
                 "design": prepared.design,
+                "contrast": _contrast_for_record(prepared, contract.parameters),
+                "contrast_spec": contrast_spec.as_dict(),
+                "inference_settings": inference.as_dict(),
             },
             metrics,
         )
@@ -1574,6 +1957,9 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
                     "condition_a": prepared.condition_a,
                     "condition_b": prepared.condition_b,
                     "design": prepared.design,
+                    "contrast": _contrast_for_record(prepared, contract.parameters),
+                    "contrast_spec": contrast_spec.as_dict(),
+                    "inference_settings": inference.as_dict(),
                 },
                 {"n_rows": int(len(summary_output)), **metrics},
             )
@@ -1613,6 +1999,8 @@ LeaveOneDonorOutCapability = PyDESeq2LeaveOneDonorOutCapability
 __all__ = [
     "AdvancedStatisticsDependencyError",
     "AdvancedStatisticsInputError",
+    "ContrastSpec",
+    "InferenceSettings",
     "PyDESeq2PseudobulkCapability",
     "PyDESeq2DifferentialExpressionCapability",
     "AdvancedDifferentialExpressionCapability",

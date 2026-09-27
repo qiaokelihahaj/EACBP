@@ -354,6 +354,8 @@ def _parse_transaction_index(path: Path) -> tuple[dict[str, ArtifactMetadata], s
         metadata: dict[str, ArtifactMetadata] = {}
         for raw in records:
             item = ArtifactMetadata.model_validate(raw)
+            stored = Path(item.storage_path)
+            item.storage_path = str(stored if stored.is_absolute() else path / stored)
             canonical = ArtifactURI.parse(item.uri).to_string()
             if canonical != item.uri:
                 return {}, f"transaction metadata URI is not canonical: {item.uri}"

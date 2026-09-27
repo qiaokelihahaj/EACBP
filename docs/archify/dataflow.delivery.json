@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "dataflow",
+  "input": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\dataflow.json",
+  "output": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\dataflow.html",
+  "specification": {
+    "sha256": "2f499dd0922939dd96247ce8fd71e91c20ae0f27b47d31395ef39c1b510ea4b4",
+    "bytes": 3051
+  },
+  "artifact": {
+    "sha256": "8f005827eb012f5e9572f11217d0d0b8929ab21f67aba5a79bfba3cf8c53d548",
+    "bytes": 708253
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

@@ -1,0 +1,194 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "EACBP · 审计准入与恢复",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "compute",
+      "label": "任务计算"
+    },
+    {
+      "id": "audit",
+      "label": "科学准入"
+    },
+    {
+      "id": "failure",
+      "label": "失败与恢复",
+      "variant": "exception"
+    }
+  ],
+  "mainPath": [
+    "contract",
+    "attempt",
+    "commit",
+    "audit",
+    "durable",
+    "admit"
+  ],
+  "nodes": [
+    {
+      "id": "contract",
+      "label": "检查任务契约",
+      "sublabel": "依赖与输入",
+      "lane": "compute",
+      "col": 0,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "attempt",
+      "label": "私有事务执行",
+      "sublabel": "隔离本次产物",
+      "lane": "compute",
+      "col": 1,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "commit",
+      "label": "原子发布产物",
+      "sublabel": "索引与恢复回执",
+      "lane": "compute",
+      "col": 2,
+      "type": "database",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "audit",
+      "label": "独立科学审计",
+      "sublabel": "先标记审计待定",
+      "lane": "audit",
+      "col": 2,
+      "type": "security",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "durable",
+      "label": "保存审计状态",
+      "sublabel": "检查点 + 持久回执",
+      "lane": "audit",
+      "col": 3,
+      "type": "database",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "admit",
+      "label": "证据准入",
+      "sublabel": "再更新证据与计划",
+      "lane": "audit",
+      "col": 4,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "reject",
+      "label": "科学失败",
+      "sublabel": "不准入证据",
+      "lane": "failure",
+      "col": 2,
+      "type": "security",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "blocked",
+      "label": "阻断依赖任务",
+      "sublabel": "独立分支仍可继续",
+      "lane": "failure",
+      "col": 3,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "resume",
+      "label": "严格恢复",
+      "sublabel": "复核契约与文件指纹",
+      "lane": "failure",
+      "col": 0,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    }
+  ],
+  "edges": [
+    {
+      "from": "contract",
+      "to": "attempt",
+      "label": "需要新计算"
+    },
+    {
+      "from": "attempt",
+      "to": "commit",
+      "label": "执行成功"
+    },
+    {
+      "from": "commit",
+      "to": "audit",
+      "label": "重新读取产物"
+    },
+    {
+      "from": "audit",
+      "to": "durable",
+      "label": "记录审计结果"
+    },
+    {
+      "from": "durable",
+      "to": "admit",
+      "label": "审计通过且已持久化"
+    },
+    {
+      "from": "audit",
+      "to": "reject",
+      "label": "审计拒绝"
+    },
+    {
+      "from": "reject",
+      "to": "blocked",
+      "label": "依赖传播"
+    },
+    {
+      "from": "resume",
+      "to": "contract",
+      "label": "验证运行配置"
+    },
+    {
+      "from": "resume",
+      "to": "audit",
+      "label": "复用产物仍须重审"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "崩溃恢复",
+      "items": [
+        "发布前失败不暴露产物；发布后可依据回执复用。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "严格复现",
+      "items": [
+        "复核输入 / 输出哈希、契约、源码和依赖指纹。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "事务边界",
+      "items": [
+        "原子性覆盖编排产物；不覆盖外部程序副作用。"
+      ]
+    }
+  ]
+}

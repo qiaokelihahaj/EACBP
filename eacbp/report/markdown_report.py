@@ -260,6 +260,7 @@ class ScientificReportGenerator:
                  "Full registered tables preserve nonsignificant and unestimated outcomes. Previews below are limited to 20 rows; missing estimates do not imply a zero effect.", ""]
         audited = {r.target_task_id for r in self.audit_reports if r.overall_passed and not r.stop_rule_triggered}
         columns = ["gene", "source", "target", "pathway", "activity", "condition_a", "condition_b",
+                   "effect_definition", "alpha", "significant_at_alpha",
                    "log2_fold_change", "lfc_se", "ci_low", "ci_high", "fdr_q_value", "activity_effect_condition_a_vs_b",
                    "n_donors_condition_a", "n_donors_condition_b", "status", "reason",
                    "direction_consistency", "min_log2_fold_change", "max_log2_fold_change",
@@ -270,7 +271,7 @@ class ScientificReportGenerator:
                    "comparison_p_value_specificity", "comparison_fdr_specificity",
                    "estimated_coverage", "significance_retention", "summary_status",
                    "n_estimated_loo", "baseline_log2_fold_change", "baseline_fdr_q_value",
-                   "baseline_significant_fdr05", "n_significant_loo", "median_log2_fold_change",
+                   "baseline_significant_at_alpha", "baseline_significant_fdr05", "n_significant_loo", "median_log2_fold_change",
                    "fit_status", "status_reason", "skip_reason", "n_requested_fits",
                    "n_successful_fits", "complete_fit_coverage",
                    "scientific_robustness_claim_supported"]
@@ -343,7 +344,7 @@ class ScientificReportGenerator:
             if status_value != "success" or task.task_id not in audited:
                 lines.extend([f"Results not admitted: {cell(task.error_message or 'required audit did not pass')}", ""])
                 continue
-            for key in ("status", "reason", "skip_reason", "statistical_unit", "design_formula", "design", "interpretation_limit", "limitations"):
+            for key in ("status", "reason", "skip_reason", "statistical_unit", "design_formula", "design", "contrast_spec", "inference_settings", "alpha", "effect_definition", "interpretation_limit", "limitations"):
                 if key in task.metrics:
                     lines.append(f"- {key}: {cell(task.metrics[key])}")
             append_metric_table(task)
@@ -367,7 +368,8 @@ class ScientificReportGenerator:
                     append_liana_uncertainty(payload)
                 if "fdr_q_value" in payload:
                     q = pd.to_numeric(payload["fdr_q_value"], errors="coerce")
-                    lines.append(f"FDR < 0.05: {int(q.between(0, .05, inclusive='left').sum())}; unestimated FDR: {int(q.isna().sum())}.")
+                    alpha = float(task.metrics.get("alpha", 0.05))
+                    lines.append(f"FDR < {alpha:g}: {int(q.between(0, alpha, inclusive='left').sum())}; unestimated FDR: {int(q.isna().sum())}.")
                 if payload.empty:
                     lines.append("No eligible results were returned; no positive finding is inferred.")
                     continue

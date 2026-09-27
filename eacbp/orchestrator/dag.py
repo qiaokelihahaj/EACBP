@@ -11,27 +11,7 @@ import networkx as nx
 from eacbp.schemas.study import StudyManifest
 from eacbp.schemas.task import TaskContract, RetryPolicy
 from eacbp.artifact.uri import ArtifactURI
-
-
-# These are the analysis capabilities whose input population is the selected
-# target cell type.  Shared preprocessing (through annotation) and analyses of
-# the complete annotated/spatial matrix remain single tasks.  Keeping the
-# population boundary explicit also gives extension planners a stable marker
-# when they add target-dependent capabilities later.
-_TARGET_BRANCH_CAPABILITIES = frozenset({
-    "subset_cells",
-    "differential_abundance",
-    "deg",
-    "trajectory_inference",
-    "gene_function_reasoning",
-    "chatcell_dialogue_prediction",
-    "knowledge_retrieval",
-    "genetic_perturbation_simulation",
-    "compound_perturbation_simulation",
-    "fate_mapping",
-    "functional_activity",
-    "donor_sensitivity",
-})
+from eacbp.capabilities.base import TARGET_BRANCH_CAPABILITIES as _TARGET_BRANCH_CAPABILITIES
 
 
 def _target_slug_base(target: str) -> str:
@@ -92,9 +72,11 @@ def _branch_uri(uri: str, slug: str) -> str:
     ).to_string()
 
 
-def _is_target_branch_task(task: TaskContract) -> bool:
+def _is_target_branch_task(task: TaskContract, scopes: Optional[Mapping[str, str]] = None) -> bool:
     """Identify base tasks that must be replicated per target population."""
 
+    if scopes is not None and task.task_id in scopes:
+        return scopes[task.task_id] == "per_target"
     if task.capability in _TARGET_BRANCH_CAPABILITIES:
         return True
     if task.parameters.get("target_cell_type") or task.parameters.get("target_dependent"):
@@ -117,7 +99,7 @@ def _target_parameter_override(current_state: Mapping[str, Any], target: str, sl
     return {}
 
 
-def _expand_target_branches(tasks: List[TaskContract], targets: List[str], current_state: Mapping[str, Any]) -> List[TaskContract]:
+def _expand_target_branches(tasks: List[TaskContract], targets: List[str], current_state: Mapping[str, Any], *, scopes: Optional[Mapping[str, str]] = None) -> List[TaskContract]:
     """Expand only population-dependent tasks into independent target branches.
 
     The expansion is deliberately URI driven.  Every branch gets a private
@@ -130,7 +112,9 @@ def _expand_target_branches(tasks: List[TaskContract], targets: List[str], curre
     if len(targets) <= 1:
         return tasks
     slug_by_target = target_branch_slug_map(targets)
-    templates = [task for task in tasks if _is_target_branch_task(task)]
+    templates = [task for task in tasks if _is_target_branch_task(task, scopes)]
+    template_ids = {task.task_id for task in templates}
+    template_outputs = {uri for task in templates for uri in task.expected_outputs}
     branch_outputs: Dict[str, Dict[str, str]] = {}
     for target in targets:
         slug = slug_by_target[target]
@@ -142,13 +126,19 @@ def _expand_target_branches(tasks: List[TaskContract], targets: List[str], curre
 
     expanded: List[TaskContract] = []
     for task in tasks:
-        if not _is_target_branch_task(task):
+        if not _is_target_branch_task(task, scopes):
+            if template_outputs.intersection(task.input_artifacts) or template_ids.intersection(task.depends_on):
+                raise ValueError(
+                    f"Shared task {task.task_id!r} refers to an unexpanded per-target task; "
+                    "declare scope='per_target' or explicitly name each target input/dependency"
+                )
             expanded.append(task)
             continue
         for target in targets:
             slug = slug_by_target[target]
             clone = task.model_copy(deep=True)
             clone.task_id = f"{task.task_id}_{slug}"
+            clone.depends_on = [f"{parent}_{slug}" if parent in template_ids else parent for parent in task.depends_on]
             mapping = branch_outputs[target]
             clone.input_artifacts = [mapping.get(uri, uri) for uri in task.input_artifacts]
             clone.expected_outputs = [mapping.get(uri, _branch_uri(uri, slug)) for uri in task.expected_outputs]
@@ -214,7 +204,7 @@ class ComputationalDAGPlanner:
         return [by_id[task_id] for task_id in nx.topological_sort(graph)]
 
     @staticmethod
-    def build_study_plan(manifest: StudyManifest, current_state: Optional[Dict[str, Any]] = None) -> List[TaskContract]:
+    def build_study_plan(manifest: StudyManifest, current_state: Optional[Dict[str, Any]] = None, *, expand_targets: bool = True) -> List[TaskContract]:
         current_state = current_state or {}
         sid = manifest.study_id
         tasks = []
@@ -709,7 +699,7 @@ class ComputationalDAGPlanner:
         if current_state.get("advanced_analysis") or current_state.get("analysis_extensions"):
             from eacbp.orchestrator.advanced_plan import extend_plan
             tasks = extend_plan(tasks, manifest, current_state)
-        if len(manifest.biological_design.target_cell_types) > 1:
+        if expand_targets and len(manifest.biological_design.target_cell_types) > 1:
             tasks = _expand_target_branches(tasks, list(manifest.biological_design.target_cell_types), current_state)
         producers = {uri: task.task_id for task in tasks for uri in task.expected_outputs}
         for task in tasks:

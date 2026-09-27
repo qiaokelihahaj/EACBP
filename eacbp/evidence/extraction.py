@@ -12,6 +12,21 @@ def finite_number(value, default=None):
         return default
 
 
+def _inference_alpha(row=None, task_metrics=None, artifact_parameters=None, contract_parameters=None):
+    """Read the threshold used by an audited result, with legacy defaults."""
+    for source in (row, task_metrics, artifact_parameters, contract_parameters):
+        if source is None:
+            continue
+        for key in ("alpha", "significance_alpha"):
+            if key not in source:
+                continue
+            value = finite_number(source.get(key))
+            if value is None or not 0.0 < value < 1.0:
+                return None
+            return value
+    return 0.05
+
+
 def extract_evidence(contract, result, report, registry):
     if not report.overall_passed or report.stop_rule_triggered:
         return []
@@ -195,16 +210,21 @@ def extract_evidence(contract, result, report, registry):
         return evidence
 
     if cap == "functional_activity" and table is not None:
+        artifact_parameters = outputs[0][0].parameters if outputs else {}
         for _, row in table.iterrows():
             q = finite_number(row.get("fdr_q_value"))
             effect = finite_number(row.get("activity_effect_condition_a_vs_b"))
-            if q is None or effect is None or not 0 <= q < .05:
+            alpha = _inference_alpha(row, metrics, artifact_parameters, contract.parameters)
+            if alpha is None or q is None or effect is None or not 0 <= q < alpha:
                 continue
             source = str(row.get("source"))
-            contrast = f"{row.get('condition_a')} versus {row.get('condition_b')}"
-            add(EvidenceType.FUNCTIONAL_ACTIVITY,
-                f"Inferred activity of {source} differs for {contrast} (donor-level effect={effect:.3g}, FDR={q:.3g}); activity is inferred from the supplied network, not directly measured.",
-                row.to_dict(), score=1-q, context={"pathway": source, "contrast": contrast})
+            contrast = str(row.get("contrast_label") or f"{row.get('condition_a')} versus {row.get('condition_b')}")
+            definition = str(row.get("effect_definition") or "donor-level inferred activity difference")
+            add(
+                EvidenceType.FUNCTIONAL_ACTIVITY,
+                f"Inferred activity of {source} differs for {contrast} ({definition}; donor-level effect={effect:.3g}, FDR={q:.3g} at alpha={alpha:g}); activity is inferred from the supplied network, not directly measured.",
+                row.to_dict(), score=1-q, context={"pathway": source, "contrast": contrast},
+            )
         return evidence
     if cap == "donor_sensitivity":
         if metrics.get("skipped"):
@@ -221,20 +241,48 @@ def extract_evidence(contract, result, report, registry):
         if not required.issubset(table.columns):
             return []
         is_pb = bool(metrics.get("is_pseudobulk", False))
-        comparisons = outputs[0][0].parameters
-        contrast = f"{comparisons.get('condition_a', comparisons.get('cond_ad', 'test'))} versus {comparisons.get('condition_b', comparisons.get('cond_ctrl', 'reference'))}"
+        artifact_parameters = outputs[0][0].parameters
         selected = table.copy()
         selected["fdr_q_value"] = pd.to_numeric(selected["fdr_q_value"], errors="coerce")
-        selected = selected[selected["fdr_q_value"].between(0, 0.05, inclusive="left")].sort_values("fdr_q_value").head(10)
+        if "alpha" in selected:
+            selected["__inference_alpha"] = pd.to_numeric(selected["alpha"], errors="coerce")
+        else:
+            selected["__inference_alpha"] = _inference_alpha(
+                None, metrics, artifact_parameters, contract.parameters
+            )
+        selected = selected[
+            selected["fdr_q_value"].notna()
+            & selected["fdr_q_value"].ge(0.0)
+            & selected["__inference_alpha"].between(0.0, 1.0, inclusive="neither")
+            & selected["fdr_q_value"].lt(selected["__inference_alpha"])
+        ].sort_values("fdr_q_value").head(10)
         for _, row in selected.iterrows():
             fc, q = finite_number(row["log2_fold_change"]), finite_number(row["fdr_q_value"])
             if fc is None or fc == 0 or q is None:
                 continue
+            alpha = finite_number(row.get("__inference_alpha"), 0.05)
             gene = str(row["gene"])
             direction = "higher" if fc > 0 else "lower"
             unit = "donor-level" if is_pb else "exploratory cell-level"
+            legacy_tested = artifact_parameters.get(
+                "condition_a", artifact_parameters.get("cond_ad", "test")
+            )
+            legacy_reference = artifact_parameters.get(
+                "condition_b", artifact_parameters.get("cond_ctrl", "reference")
+            )
+            contrast = str(
+                row.get("contrast_label")
+                or artifact_parameters.get("contrast_spec", {}).get("label")
+                or f"{row.get('condition_a', legacy_tested)} versus "
+                f"{row.get('condition_b', legacy_reference)}"
+            )
+            definition = str(row.get("effect_definition") or "log2 fold change")
+            if str(row.get("contrast_kind", "categorical")) == "numeric":
+                effect_text = f"has a {direction} {definition} estimate"
+            else:
+                effect_text = f"has {direction} expression for {contrast}"
             add(EvidenceType.PSEUDOBULK_DEG if is_pb else EvidenceType.CELL_LEVEL_DEG,
-                f"{gene} has {direction} expression in {contrast} ({unit}; log2FC={fc:.3g}, FDR={q:.3g}).",
+                f"{gene} {effect_text} ({unit}; {definition}; log2FC={fc:.3g}, FDR={q:.3g} at alpha={alpha:g}).",
                 row.to_dict(), score=1-q, context={"gene": gene, "contrast": contrast, "direction": direction})
         return evidence
 

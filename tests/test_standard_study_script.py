@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from eacbp import cli
+from eacbp.application import study_service
 from eacbp.orchestrator.execution import TaskExecutor
 from eacbp.orchestrator.dag import ComputationalDAGPlanner
 
@@ -31,8 +32,8 @@ def _source(path: Path) -> Path:
 def audit_only(monkeypatch):
     original = ComputationalDAGPlanner.build_study_plan
 
-    def plan(manifest, config):
-        return [task for task in original(manifest, config) if task.capability == "dataset_audit"]
+    def plan(manifest, config, **kwargs):
+        return [task for task in original(manifest, config, **kwargs) if task.capability == "dataset_audit"]
 
     monkeypatch.setattr(ComputationalDAGPlanner, "build_study_plan", plan)
 
@@ -67,7 +68,7 @@ def test_script_resume_reuses_snapshot(tmp_path, capsys, audit_only):
     assert saved["import_completed"] is True
 
     source.write_bytes(b"changed after import; resume must use the registry")
-    with patch.object(cli, "_import_h5ad", side_effect=AssertionError("resume must not re-import")), \
+    with patch.object(study_service, "_import_h5ad", side_effect=AssertionError("resume must not re-import")), \
          patch.object(TaskExecutor, "execute", side_effect=AssertionError("resume must reuse checkpoint")):
         resumed = cli.resume_study(run_dir=run_dir)
     assert resumed["status"] == "success", resumed

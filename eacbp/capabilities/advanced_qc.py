@@ -1451,7 +1451,8 @@ class CellBenderBackgroundRemovalCapability(BaseCapability):
         command.extend(str(item) for item in extra_args)
         timeout = params.get("timeout_sec", 3600)
         try:
-            completed = subprocess.run(
+            from eacbp.execution_context import run_external
+            completed = run_external(
                 command,
                 cwd=str(run_cwd),
                 capture_output=True,

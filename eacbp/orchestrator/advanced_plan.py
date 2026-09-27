@@ -82,6 +82,7 @@ def extend_plan(tasks, manifest, state):
         values.setdefault("random_seed", manifest.reproducibility.random_seed)
         if capability == "background_removal":
             _validate_background_parameters(values)
+            values = ADVANCED_EXTENSION_DESCRIPTORS[capability].validate_parameters(values)
         values = pin_resource_files(values)
         task_id = "task_ext_" + capability
         output = f"table://{sid}/{capability}/v1"

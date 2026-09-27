@@ -33,6 +33,7 @@ from pydantic import BaseModel, ValidationError
 
 from eacbp._atomic_json import atomic_write_json
 from eacbp.artifact.uri import ArtifactURI
+from eacbp.artifact.storage import ArtifactStorageBackend
 from eacbp.auditor.base import ValidationReport
 from eacbp.evidence.graph import EvidenceGraph
 from eacbp.schemas.artifact import ArtifactMetadata
@@ -42,7 +43,7 @@ from eacbp.schemas.task import TaskResult, TaskStatus
 
 
 SNAPSHOT_FORMAT = "eacbp.study_snapshot"
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 _MAX_INLINE_ARRAY_ELEMENTS = 4096
 _EXTERNAL_SOURCE_SCHEMES = {
     "doi",
@@ -423,13 +424,15 @@ def _collect_artifact_metadata(
     evidence_nodes: Sequence[EvidenceNode],
     contexts: Sequence[AuditContextSummary],
 ) -> Dict[str, ArtifactMetadata]:
-    result = _registry_artifacts(registry, manifest.study_id)
+    # One index generation supplies all same-study and cross-study ancestors.
+    available = {item.uri: item for item in registry.list_artifacts()}
+    result = {uri: item for uri, item in available.items() if item.study_id == manifest.study_id}
     pending = list(result.values())
     for raw_uri in _artifact_refs(manifest, tasks, evidence_nodes, contexts):
         uri = _artifact_uri(raw_uri, "artifact reference")
         if _external_source(uri) or uri in result:
             continue
-        metadata = _registry_metadata(registry, uri)
+        metadata = available.get(uri)
         if metadata is not None:
             result[metadata.uri] = metadata
             pending.append(metadata)
@@ -446,7 +449,7 @@ def _collect_artifact_metadata(
                     f"artifact {metadata.uri} has an external parent URI; source lineage cannot be verified"
                 )
             if parent not in result:
-                parent_metadata = _registry_metadata(registry, parent)
+                parent_metadata = available.get(parent)
                 if parent_metadata is None:
                     raise SnapshotValidationError(
                         f"artifact {metadata.uri} has missing parent metadata {parent!r}"
@@ -589,6 +592,8 @@ def _validate_cross_references(
         metadata = artifact_metadata[uri]
         if source.uri != uri or source.sha256 != metadata.sha256_hash:
             raise SnapshotValidationError(f"source hash does not match metadata for {uri}")
+        if source.storage_path != metadata.storage_path or source.size_bytes != metadata.size_bytes:
+            raise SnapshotValidationError(f"source location/size does not match metadata for {uri}")
         if set(source.ancestor_uris) != set(source.ancestor_hashes):
             raise SnapshotValidationError(f"ancestor hash coverage differs for {uri}")
         if not set(source.ancestor_uris).issubset(local_artifacts):
@@ -772,8 +777,39 @@ def _artifact_source_records(
     return records
 
 
+def _canonical_evidence_provenance(nodes, metadata, tasks):
+    """Derive v2 provenance from the artifact graph, never extractor claims."""
+    from eacbp.evidence.provenance import resolve_artifact_provenance
+
+    task_map = {task.task_id: task for task in tasks}
+    normalized = []
+    for node in nodes:
+        if node.source_verified:
+            raise SnapshotValidationError("source_verified has no independent source verification receipt")
+        local_sources = [uri for uri in node.source_artifact_uris if not _external_source(uri)]
+        try:
+            provenance = resolve_artifact_provenance(local_sources, metadata.__getitem__)
+        except (KeyError, ValueError) as exc:
+            raise SnapshotValidationError(f"invalid evidence artifact lineage: {node.evidence_id}") from exc
+        task = task_map.get(node.source_task_id)
+        simulated = bool(node.is_simulated or provenance.is_simulated
+                         or (task is not None and task.metrics.get("is_simulated")))
+        normalized.append(node.model_copy(update={
+            "data_origin_uris": list(provenance.root_uris), "is_simulated": simulated,
+        }))
+    return normalized
+
+
 def _artifact_payload_hash(registry: Any, metadata: ArtifactMetadata) -> Tuple[str, int]:
     storage = getattr(registry, "storage", None)
+    if storage is not None and hasattr(storage, "verify_payload"):
+        try:
+            return storage.verify_payload(
+                metadata.uri, metadata.type, metadata.sha256_hash, metadata.storage_path,
+                expected_size=metadata.size_bytes,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise SnapshotIntegrityError(f"artifact payload changed for {metadata.uri}: {exc}") from exc
     raw_path = Path(metadata.storage_path)
     if not raw_path.is_absolute() and storage is not None:
         raw_path = Path(storage.base_dir) / raw_path
@@ -804,7 +840,8 @@ def _artifact_payload_hash(registry: Any, metadata: ArtifactMetadata) -> Tuple[s
 
 
 def _verify_registry_scope(snapshot: StudySnapshot, registry: Any) -> None:
-    live = _registry_artifacts(registry, snapshot.manifest.study_id)
+    all_metadata = {item.uri: item for item in registry.list_artifacts()}
+    live = {uri: item for uri, item in all_metadata.items() if item.study_id == snapshot.manifest.study_id}
     expected_study = {
         uri for uri, metadata in snapshot.artifact_metadata.items()
         if metadata.study_id == snapshot.manifest.study_id
@@ -817,10 +854,15 @@ def _verify_registry_scope(snapshot: StudySnapshot, registry: Any) -> None:
         )
 
     for uri, expected in sorted(snapshot.artifact_metadata.items()):
-        current = _registry_metadata(registry, uri)
+        current = all_metadata.get(uri)
         if current is None:
             raise SnapshotIntegrityError(f"artifact metadata is missing for {uri}")
-        if _model_dict(current, f"artifact metadata {uri}") != _model_dict(expected, f"snapshot artifact {uri}"):
+        current_record = _model_dict(current, f"artifact metadata {uri}")
+        expected_record = _model_dict(expected, f"snapshot artifact {uri}")
+        if snapshot.schema_version >= 2:
+            current_record["storage_path"] = registry.storage.relative_path(current.storage_path)
+            expected_record["storage_path"] = registry.storage.relative_path(expected.storage_path)
+        if current_record != expected_record:
             raise SnapshotIntegrityError(f"artifact metadata changed for {uri}")
         actual_hash, actual_size = _artifact_payload_hash(registry, current)
         source = snapshot.artifact_sources[uri]
@@ -829,7 +871,7 @@ def _verify_registry_scope(snapshot: StudySnapshot, registry: Any) -> None:
         if current.sha256_hash != expected.sha256_hash:
             raise SnapshotIntegrityError(f"artifact source hash changed for {uri}")
         for ancestor, digest in source.ancestor_hashes.items():
-            ancestor_meta = _registry_metadata(registry, ancestor)
+            ancestor_meta = all_metadata.get(ancestor)
             if ancestor_meta is None or ancestor_meta.sha256_hash != digest:
                 raise SnapshotIntegrityError(f"artifact ancestor source changed for {ancestor}")
 
@@ -1011,6 +1053,11 @@ def write_study_snapshot(
         evidence_nodes,
         list(contexts.values()),
     )
+    metadata = {
+        uri: item.model_copy(update={"storage_path": artifact_registry.storage.relative_path(item.storage_path)})
+        for uri, item in metadata.items()
+    }
+    evidence_nodes = _canonical_evidence_provenance(evidence_nodes, metadata, tasks)
     sources = _artifact_source_records(artifact_registry, metadata)
     snapshot = StudySnapshot(
         schema_version=SNAPSHOT_SCHEMA_VERSION,
@@ -1113,7 +1160,7 @@ def load_study_snapshot(path: str | Path) -> StudySnapshot:
     if raw.get("format") != SNAPSHOT_FORMAT:
         raise SnapshotSchemaError(f"unsupported snapshot format: {raw.get('format')!r}")
     version = raw.get("schema_version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != SNAPSHOT_SCHEMA_VERSION:
+    if type(version) is not int or version not in (1, SNAPSHOT_SCHEMA_VERSION):
         raise SnapshotSchemaError(
             f"unsupported snapshot schema version {version!r}; expected {SNAPSHOT_SCHEMA_VERSION}"
         )
@@ -1168,6 +1215,11 @@ def load_study_snapshot(path: str | Path) -> StudySnapshot:
     metadata: Dict[str, ArtifactMetadata] = {}
     for index, item in enumerate(artifacts_raw["metadata"]):
         value = _coerce_model(item, ArtifactMetadata, f"artifact metadata {index}")
+        if version >= 2:
+            try:
+                ArtifactStorageBackend.validate_object_key(value.storage_path)
+            except ValueError as exc:
+                raise SnapshotValidationError("v2 snapshot requires relative artifact object keys") from exc
         if value.uri in metadata:
             raise SnapshotValidationError(f"duplicate artifact URI {value.uri!r}")
         metadata[value.uri] = value
@@ -1208,6 +1260,11 @@ def load_study_snapshot(path: str | Path) -> StudySnapshot:
         audit_contexts=contexts,
         path=path,
     )
+    if version >= 2:
+        canonical_nodes = _canonical_evidence_provenance(evidence_nodes, metadata, tasks)
+        for original, canonical in zip(evidence_nodes, canonical_nodes):
+            if original.model_dump() != canonical.model_dump():
+                raise SnapshotValidationError(f"evidence provenance does not match artifact lineage: {original.evidence_id}")
     _validate_cross_references(
         snapshot.manifest,
         snapshot.task_results,

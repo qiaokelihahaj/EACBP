@@ -1,0 +1,84 @@
+[
+  {
+    "id": "entry",
+    "sources": [
+      {
+        "path": "eacbp/cli.py"
+      },
+      {
+        "path": "eacbp/webui/worker.py"
+      },
+      {
+        "path": "eacbp/application/study_service.py"
+      }
+    ]
+  },
+  {
+    "id": "plan",
+    "sources": [
+      {
+        "path": "eacbp/orchestrator/dag.py"
+      }
+    ]
+  },
+  {
+    "id": "exec",
+    "sources": [
+      {
+        "path": "eacbp/orchestrator/execution.py"
+      },
+      {
+        "path": "eacbp/execution_context.py"
+      }
+    ]
+  },
+  {
+    "id": "store",
+    "sources": [
+      {
+        "path": "eacbp/artifact/registry.py"
+      }
+    ]
+  },
+  {
+    "id": "audit",
+    "sources": [
+      {
+        "path": "eacbp/auditor/__init__.py"
+      }
+    ]
+  },
+  {
+    "id": "evidence",
+    "sources": [
+      {
+        "path": "eacbp/evidence/graph.py"
+      },
+      {
+        "path": "eacbp/evidence/claim.py"
+      },
+      {
+        "path": "eacbp/evidence/provenance.py"
+      }
+    ]
+  },
+  {
+    "id": "report",
+    "sources": [
+      {
+        "path": "eacbp/report/markdown_report.py"
+      }
+    ]
+  },
+  {
+    "id": "recovery",
+    "sources": [
+      {
+        "path": "eacbp/orchestrator/resume.py"
+      },
+      {
+        "path": "eacbp/artifact/portability.py"
+      }
+    ]
+  }
+]

@@ -1,0 +1,188 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "EACBP · 科研分析工作流",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "shared",
+      "label": "共享预处理"
+    },
+    {
+      "id": "target",
+      "label": "目标群体分析"
+    },
+    {
+      "id": "optional",
+      "label": "条件性扩展"
+    }
+  ],
+  "mainPath": [
+    "design",
+    "qc",
+    "norm",
+    "cluster",
+    "subset",
+    "stats"
+  ],
+  "nodes": [
+    {
+      "id": "design",
+      "label": "研究设计与审计",
+      "sublabel": "donor / 对比",
+      "lane": "shared",
+      "col": 0,
+      "type": "external",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "qc",
+      "label": "质量控制",
+      "sublabel": "过滤与可选高级 QC",
+      "lane": "shared",
+      "col": 1,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "norm",
+      "label": "归一化与整合",
+      "sublabel": "单批次不校正",
+      "lane": "shared",
+      "col": 2,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "cluster",
+      "label": "聚类与注释",
+      "sublabel": "Leiden / UMAP / 标记",
+      "lane": "shared",
+      "col": 3,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "subset",
+      "label": "确定分析群体",
+      "sublabel": "全体或按目标分支",
+      "lane": "target",
+      "col": 3,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "stats",
+      "label": "差异与丰度",
+      "sublabel": "对比和重复数门控",
+      "lane": "target",
+      "col": 4,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "trajectory",
+      "label": "DPT 轨迹",
+      "sublabel": "要求明确根细胞",
+      "lane": "optional",
+      "col": 3,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "fate",
+      "label": "CellRank 命运",
+      "sublabel": "还需终末状态",
+      "lane": "optional",
+      "col": 4,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    },
+    {
+      "id": "spatial",
+      "label": "空间分析",
+      "sublabel": "要求空间坐标",
+      "lane": "optional",
+      "col": 1,
+      "type": "backend",
+      "width": 132,
+      "height": 72
+    }
+  ],
+  "edges": [
+    {
+      "from": "design",
+      "to": "qc",
+      "label": "审计后调整计划"
+    },
+    {
+      "from": "qc",
+      "to": "norm",
+      "label": "合格细胞"
+    },
+    {
+      "from": "norm",
+      "to": "cluster",
+      "label": "低维表示"
+    },
+    {
+      "from": "cluster",
+      "to": "subset",
+      "label": "注释后选择"
+    },
+    {
+      "from": "subset",
+      "to": "stats",
+      "label": "有效实验设计"
+    },
+    {
+      "from": "subset",
+      "to": "trajectory",
+      "label": "提供根细胞"
+    },
+    {
+      "from": "trajectory",
+      "to": "fate",
+      "label": "提供终末状态"
+    },
+    {
+      "from": "cluster",
+      "to": "spatial",
+      "label": "空间矩阵"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "标准方法",
+      "items": [
+        "standard 使用实际第三方库；baseline 为显式轻量算法。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "可选科研分支",
+      "items": [
+        "advanced 可启用 PyDESeq2 与 donor 留一敏感性。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "解释约束",
+      "items": [
+        "无根省略轨迹；重复不足省略丰度推断；模拟不证明因果。"
+      ]
+    }
+  ]
+}

@@ -31,12 +31,24 @@ class ClaimEngine:
         if node.type not in (EvidenceType.PSEUDOBULK_DEG, EvidenceType.DIFFERENTIAL_ABUNDANCE,
                              EvidenceType.SPATIAL_LOCALIZATION, EvidenceType.PATHWAY_ENRICHMENT, EvidenceType.FUNCTIONAL_ACTIVITY):
             return False
+        alpha = 0.05
+        threshold_key = next(
+            (key for key in ("alpha", "significance_alpha") if key in node.metrics),
+            None,
+        )
+        if threshold_key is not None:
+            try:
+                alpha = float(node.metrics[threshold_key])
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
+                return False
         for key in ("fdr_q_value", "fdr", "p_val_adj"):
             try:
                 value = float(node.metrics[key])
             except (KeyError, TypeError, ValueError):
                 continue
-            if math.isfinite(value) and 0 <= value < 0.05:
+            if math.isfinite(value) and 0 <= value < alpha:
                 return True
         return False
 

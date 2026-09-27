@@ -1,0 +1,169 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "EACBP · 科研工作流",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "prepare",
+      "label": "数据准备"
+    },
+    {
+      "id": "research",
+      "label": "核心研究"
+    },
+    {
+      "id": "extend",
+      "label": "条件扩展"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "input",
+      "lane": "prepare",
+      "col": 0,
+      "type": "external",
+      "label": "研究与输入",
+      "sublabel": "FASTQ / 矩阵",
+      "width": 140
+    },
+    {
+      "id": "qc",
+      "lane": "prepare",
+      "col": 1,
+      "type": "backend",
+      "label": "审查与质控",
+      "sublabel": "定量 · audit · QC",
+      "width": 140
+    },
+    {
+      "id": "norm",
+      "lane": "prepare",
+      "col": 2,
+      "type": "backend",
+      "label": "标准化与整合",
+      "sublabel": "log1p · HVG · PCA",
+      "width": 140
+    },
+    {
+      "id": "cluster",
+      "lane": "prepare",
+      "col": 3,
+      "type": "backend",
+      "label": "聚类与注释",
+      "sublabel": "生成 annotated/v4",
+      "width": 140
+    },
+    {
+      "id": "subset",
+      "lane": "research",
+      "col": 3,
+      "type": "backend",
+      "label": "目标细胞提取",
+      "sublabel": "目标细胞子集 v5",
+      "width": 140
+    },
+    {
+      "id": "analysis",
+      "lane": "research",
+      "col": 4,
+      "type": "backend",
+      "label": "丰度 · 差异 · 轨迹",
+      "sublabel": "共享子集，依次执行",
+      "width": 140
+    },
+    {
+      "id": "claims",
+      "lane": "research",
+      "col": 5,
+      "type": "frontend",
+      "label": "审计与研究报告",
+      "sublabel": "证据 · 声明 · 溯源",
+      "width": 140
+    },
+    {
+      "id": "spatial",
+      "lane": "extend",
+      "col": 2,
+      "type": "backend",
+      "label": "空间研究",
+      "sublabel": "空间域 · 自相关 · CCI",
+      "width": 140
+    },
+    {
+      "id": "extras",
+      "lane": "extend",
+      "col": 4,
+      "type": "backend",
+      "label": "知识与模拟",
+      "sublabel": "检索 · 适配器 · 扰动",
+      "width": 140
+    }
+  ],
+  "mainPath": [
+    "input",
+    "qc",
+    "norm",
+    "cluster",
+    "subset",
+    "analysis",
+    "claims"
+  ],
+  "edges": [
+    {
+      "from": "input",
+      "to": "qc",
+      "label": "登记输入"
+    },
+    {
+      "from": "qc",
+      "to": "norm",
+      "label": "保留细胞"
+    },
+    {
+      "from": "norm",
+      "to": "cluster",
+      "label": "整合表征"
+    },
+    {
+      "from": "cluster",
+      "to": "subset",
+      "label": "按细胞类型"
+    },
+    {
+      "from": "subset",
+      "to": "analysis",
+      "label": "统计分析"
+    },
+    {
+      "from": "analysis",
+      "to": "claims",
+      "label": "汇总证据"
+    },
+    {
+      "from": "cluster",
+      "to": "spatial",
+      "label": "具备空间数据",
+      "role": "branch"
+    },
+    {
+      "from": "analysis",
+      "to": "extras",
+      "label": "显式启用",
+      "role": "branch"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "amber",
+      "title": "阅读约定",
+      "items": [
+        "空间输入来自 annotated/v4；图中分支表示研究阶段，非并行调度。",
+        "每项任务执行后审计；结尾统一合成声明。"
+      ]
+    }
+  ]
+}

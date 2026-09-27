@@ -72,6 +72,25 @@ def test_aliases_return_honest_method_ids():
     assert TrajectoryCapability("paga_dpt").implementation_id == "root_distance_pseudotime_v1"
 
 
+def test_integration_uses_the_explicit_batch_column(tmp_path):
+    reg = ArtifactRegistry(storage_dir=str(tmp_path / "artifacts"))
+    data = _small_data()
+    data.obs["study_batch"] = ["site_a"] * 12 + ["site_b"] * 12
+    uri = "adata://batch_mapping/raw/v1"
+    _register(reg, uri, data)
+    contract = TaskContract(
+        task_id="integration_batch_mapping",
+        capability="integration",
+        method="batch_mean_centering_v1",
+        input_artifacts=[uri],
+        expected_outputs=["adata://batch_mapping/integrated/v3"],
+        parameters={"batch_col": "study_batch", "n_components": 2, "random_seed": 7},
+    )
+
+    result = IntegrationCapability().execute(contract, reg)
+    assert "batch_mean_centering_pca" in result.executed_operations
+
+
 def test_unknown_compound_cannot_invent_reversal_signature(tmp_path):
     reg = ArtifactRegistry(str(tmp_path))
     uri = "adata://method_test/raw/v1"

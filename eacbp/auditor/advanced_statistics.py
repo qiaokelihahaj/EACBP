@@ -9,6 +9,7 @@ merely by reporting that all fits completed.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any, Mapping, Optional
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from scipy.stats import norm, t
 
 from eacbp.auditor.base import BaseAuditor, ValidationReport, ValidationSeverity
@@ -43,12 +45,13 @@ NULLABLE_STATISTICS = {
     "baseline_fdr_q_value", "min_log2_fold_change", "max_log2_fold_change",
     "median_log2_fold_change", "estimated_coverage", "direction_consistency",
     "significance_retention",
+    "contrast_factor", "contrast_tested_level", "contrast_reference_level",
 }
 
 
 @dataclass
 class _AuditInput:
-    counts: np.ndarray
+    counts: Any
     genes: list[str]
     obs: pd.DataFrame
     metadata: pd.DataFrame
@@ -66,12 +69,21 @@ class _AuditInput:
     residual_df: int
 
 
-def _dense(value: Any) -> np.ndarray:
-    if hasattr(value, "toarray"):
+def _dense(value: Any, *, max_bytes: Optional[int] = None) -> np.ndarray:
+    """Densify only when a caller supplies a byte budget for that shape."""
+    if sparse.issparse(value):
+        expected = math.prod(int(size) for size in value.shape) * np.dtype(value.dtype).itemsize
+        if max_bytes is None or expected > int(max_bytes):
+            raise ValueError(
+                f"dense materialization requires {expected:,} bytes and exceeds the supplied resource budget"
+            )
         value = value.toarray()
     elif hasattr(value, "A"):
         value = value.A
-    return np.asarray(value)
+    result = np.asarray(value)
+    if max_bytes is not None and result.nbytes > int(max_bytes):
+        raise ValueError(f"dense materialization requires {result.nbytes:,} bytes and exceeds the supplied resource budget")
+    return result
 
 
 def _resolve_column(obs: pd.DataFrame, explicit: Any, candidates: tuple[str, ...], label: str) -> str:
@@ -86,7 +98,7 @@ def _resolve_column(obs: pd.DataFrame, explicit: Any, candidates: tuple[str, ...
     raise ValueError(f"{label} metadata column is absent")
 
 
-def _raw_counts(data: SCData, params: Mapping[str, Any]) -> np.ndarray:
+def _raw_counts(data: SCData, params: Mapping[str, Any]) -> Any:
     layer = str(params.get("counts_layer", params.get("raw_counts_layer", "counts")))
     if layer in (getattr(data, "layers", {}) or {}):
         value = data.layers[layer]
@@ -94,24 +106,46 @@ def _raw_counts(data: SCData, params: Mapping[str, Any]) -> np.ndarray:
         value = data.X
     else:
         raise ValueError(f"raw integer counts are absent from layers[{layer!r}]")
-    arr = _dense(value)
-    if arr.ndim != 2 or tuple(arr.shape) != tuple(data.shape):
-        raise ValueError(f"counts shape {getattr(arr, 'shape', None)} does not match input {data.shape}")
-    try:
-        finite = np.isfinite(arr)
-        negative = np.any(arr < 0)
-        integer = np.all(np.equal(arr, np.floor(arr)))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("counts must be numeric") from exc
-    if not finite.all():
-        raise ValueError("counts contain NaN or infinite values")
-    if negative:
-        raise ValueError("counts contain negative values")
-    if not integer:
-        raise ValueError("counts must be integer-valued")
-    if np.any(arr > np.iinfo(np.int64).max):
+    if not sparse.issparse(value):
+        value = np.asarray(value)
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) != 2 or tuple(shape) != tuple(data.shape):
+        raise ValueError(f"counts shape {shape} does not match input {data.shape}")
+    coordinates = value.tocoo(copy=False) if sparse.issparse(value) else None
+    arr = coordinates.data if coordinates is not None else np.asarray(value)
+    kind = arr.dtype.kind
+    if kind not in "biuf":
+        raise ValueError("counts must be numeric")
+    if kind == "f":
+        if not np.isfinite(arr).all():
+            raise ValueError("counts contain NaN or infinite values")
+        if arr.size and np.any(arr.astype(np.longdouble, copy=False) >= np.longdouble(2) ** 63):
+            raise ValueError("counts exceed int64 range")
+        if not np.all(np.equal(arr, np.floor(arr))):
+            raise ValueError("counts must be integer-valued")
+    elif kind == "u" and arr.size and int(arr.max()) > np.iinfo(np.int64).max:
         raise ValueError("counts exceed int64 range")
-    return np.asarray(arr, dtype=np.int64)
+    if arr.size and np.any(arr < 0):
+        raise ValueError("counts contain negative values")
+    if sparse.issparse(value):
+        if not getattr(coordinates, "has_canonical_format", True):
+            order = np.lexsort((coordinates.col, coordinates.row))
+            sorted_rows = coordinates.row[order]
+            sorted_cols = coordinates.col[order]
+            if len(order):
+                starts = np.r_[True, (sorted_rows[1:] != sorted_rows[:-1]) | (sorted_cols[1:] != sorted_cols[:-1])]
+                boundaries = np.flatnonzero(starts)
+                max_duplicates = int(np.diff(np.r_[boundaries, len(order)]).max())
+                max_value = int(arr.max()) if arr.size else 0
+                if max_value and max_value > np.iinfo(np.int64).max // max_duplicates:
+                    raise ValueError("counts exceed int64 range when duplicate sparse entries are combined")
+        counts = value.astype(np.int64, copy=True).tocsr(copy=False)
+        counts.sum_duplicates()
+        counts.sort_indices()
+        if counts.data.size and np.any(counts.data < 0):
+            raise ValueError("counts exceed int64 range when duplicate sparse entries are combined")
+        return counts
+    return np.asarray(value)
 
 
 def _gene_names(data: SCData) -> list[str]:
@@ -465,7 +499,102 @@ def _table_statistics_errors(table: pd.DataFrame, params: Mapping[str, Any]) -> 
     return errors
 
 
-def _check_summary_against_fits(summary: pd.DataFrame, primary: pd.DataFrame, details: _AuditInput) -> list[str]:
+def _inference_errors(tables, metrics, params, details, method):
+    """Reconstruct result semantics from the request, independently of the executor."""
+    errors = []
+    try:
+        alpha = float(params.get("alpha", 0.05))
+        if not np.isfinite(alpha) or not 0 < alpha < 1:
+            raise ValueError("alpha must be between zero and one")
+        supplied = params.get("contrast")
+        activity = method == "decoupler_ulm_v2"
+        if supplied is None or activity:
+            supplied = ["condition", details.condition_a, details.condition_b]
+        categorical = (isinstance(supplied, (list, tuple)) and len(supplied) == 3
+                       and all(isinstance(value, str) for value in supplied))
+        if categorical:
+            factor, tested, reference = supplied
+            if (factor not in {"condition", details.condition_col} or tested == reference
+                    or {tested, reference} != {details.condition_a, details.condition_b}):
+                raise ValueError("categorical contrast does not match the requested conditions")
+            label = f"{tested} versus {reference}"
+            definition = (f"Donor-level covariate-adjusted OLS difference in inferred activity for {label}"
+                          if activity else f"PyDESeq2 log2 fold change for {label}")
+            vector = list(supplied)
+        else:
+            vector_array = np.asarray(supplied, dtype=float)
+            if (vector_array.ndim != 1 or not len(vector_array) or not np.isfinite(vector_array).all()
+                    or not np.any(vector_array) or len(vector_array) != details.design.shape[1]):
+                raise ValueError("numeric contrast must match the design and contain finite nonzero weights")
+            definition = params.get("contrast_effect_definition")
+            if not isinstance(definition, str) or not definition.strip():
+                raise ValueError("numeric contrast requires contrast_effect_definition")
+            definition = definition.strip()
+            label = str(params.get("contrast_label") or "").strip() or definition
+            factor = tested = reference = None
+            vector = vector_array.tolist()
+        expected_spec = dict(kind="categorical" if categorical else "numeric", vector=vector,
+                             factor=factor, tested_level=tested, reference_level=reference,
+                             label=label, effect_definition=definition)
+        if activity:
+            expected_spec.pop("vector")
+        if metrics.get("contrast_spec") != expected_spec:
+            errors.append("reported contrast_spec differs from contract")
+        for key, expected in (("contrast_label", label), ("effect_definition", definition)):
+            if metrics.get(key) != expected:
+                errors.append(f"reported {key} differs from contract")
+        settings = metrics.get("inference_settings", {})
+        for name, actual, expected in (("alpha", metrics.get("alpha"), alpha),
+                                       ("inference alpha", settings.get("alpha"), alpha),
+                                       ("confidence_level", settings.get("confidence_level"), 1 - alpha)):
+            try:
+                valid = np.isfinite(float(actual)) and np.isclose(float(actual), expected, rtol=0, atol=1e-12)
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                errors.append(f"reported {name} differs from contract")
+        condition_a = tested if categorical else details.condition_a
+        condition_b = reference if categorical else details.condition_b
+        for key, expected in (("condition_a", condition_a), ("condition_b", condition_b)):
+            if key in metrics and metrics[key] != expected:
+                errors.append(f"reported {key} differs from actual contrast")
+        expected_columns = {"condition_a": condition_a, "condition_b": condition_b,
+                            "contrast_kind": expected_spec["kind"], "contrast_factor": factor,
+                            "contrast_tested_level": tested, "contrast_reference_level": reference,
+                            "contrast_label": label, "effect_definition": definition}
+        for table in tables:
+            # Donor-level activity companions are observations, not tested effects.
+            if not {"fdr_q_value", "baseline_fdr_q_value"}.intersection(table.columns):
+                continue
+            for key, expected in expected_columns.items():
+                if key not in table or not (table[key].isna().all() if expected is None
+                                            else table[key].eq(expected).fillna(False).all()):
+                    errors.append(f"result {key} differs from actual contrast")
+            for key, expected in (("alpha", alpha), ("confidence_level", 1 - alpha)):
+                values = pd.to_numeric(table.get(key, pd.Series(dtype=float)), errors="coerce")
+                if key not in table or not np.all(np.isclose(values, expected, rtol=0, atol=1e-12)):
+                    errors.append(f"result {key} differs from contract")
+            if "fdr_q_value" in table and not ("status" in table and table["status"].eq("skipped").all()):
+                uncertainty = ({"activity_effect_condition_a_vs_b", "activity_se", "activity_ci_low", "activity_ci_high"}
+                               if activity else {"log2_fold_change", "lfc_se", "ci_low", "ci_high"})
+                missing = uncertainty - set(table.columns)
+                if missing:
+                    errors.append(f"result lacks uncertainty columns {sorted(missing)}")
+                q = pd.to_numeric(table["fdr_q_value"], errors="coerce")
+                for key, threshold in (("significant_at_alpha", alpha), ("significant_fdr05", 0.05)):
+                    if key not in table:
+                        errors.append(f"result lacks {key}")
+                        continue
+                    actual = table[key]
+                    if (not actual.isna().equals(q.isna())
+                            or not actual[q.notna()].eq(q[q.notna()].lt(threshold)).all()):
+                        errors.append(f"result {key} does not match FDR and threshold")
+    except (TypeError, ValueError, AttributeError) as exc:
+        errors.append(f"inference contract reconstruction failed: {exc}")
+    return errors
+
+
+def _check_summary_against_fits(summary: pd.DataFrame, primary: pd.DataFrame, details: _AuditInput, alpha: float = 0.05) -> list[str]:
     errors: list[str] = []
     required = {
         "gene", "baseline_log2_fold_change", "baseline_fdr_q_value", "n_estimated_loo",
@@ -481,7 +610,6 @@ def _check_summary_against_fits(summary: pd.DataFrame, primary: pd.DataFrame, de
     primary = primary.copy()
     if "left_out_donor" not in primary:
         return errors + ["LOO primary output lacks left_out_donor"]
-    alpha = .05
     for gene in details.genes:
         base = primary.loc[(primary["gene"].astype(str) == gene) & (primary["left_out_donor"].astype(str) == "__full_model__")]
         fits = primary.loc[(primary["gene"].astype(str) == gene) & (primary["left_out_donor"].astype(str) != "__full_model__")]
@@ -516,6 +644,16 @@ def _check_summary_against_fits(summary: pd.DataFrame, primary: pd.DataFrame, de
             actual_retention = pd.to_numeric(pd.Series([row["significance_retention"]]), errors="coerce").iloc[0]
             if not np.isfinite(actual_retention) or not np.isclose(actual_retention, expected_retention):
                 errors.append(f"gene {gene} has incorrect significance retention")
+        for column, threshold in (("n_significant_loo", alpha), ("n_significant_loo_fdr05", 0.05)):
+            if column not in row or row[column] != int(q_values.lt(threshold).sum()):
+                errors.append(f"gene {gene} has incorrect {column}")
+        for column, threshold in (("baseline_significant_at_alpha", alpha), ("baseline_significant_fdr05", 0.05)):
+            actual = row.get(column)
+            if len(baseline_q):
+                if pd.isna(actual) or actual != bool(baseline_q.iloc[0] < threshold):
+                    errors.append(f"gene {gene} has incorrect {column}")
+            elif pd.notna(actual):
+                errors.append(f"gene {gene} has unsupported {column}")
     return errors
 
 
@@ -532,6 +670,14 @@ class AdvancedStatisticsValidator(BaseAuditor):
         errors: list[str] = []
         method = result.method_used
         params = dict(contract.parameters)
+        try:
+            alpha = float(params.get("alpha", 0.05))
+            if not np.isfinite(alpha) or not 0 < alpha < 1:
+                raise ValueError("outside (0, 1)")
+        except (TypeError, ValueError):
+            report.add_check("advanced_statistics_integrity", False, ValidationSeverity.ERROR,
+                             "contract alpha must be finite and between zero and one")
+            return report
         details: Optional[_AuditInput] = None
         tables: list[pd.DataFrame] = []
 
@@ -627,6 +773,8 @@ class AdvancedStatisticsValidator(BaseAuditor):
         errors.extend(resource_errors)
 
         result_errors: list[str] = []
+        if details is not None:
+            result_errors.extend(_inference_errors(tables, result.metrics, params, details, method))
         for table in tables:
             result_errors.extend(_table_statistics_errors(table, params))
         if method == "pydeseq2_pseudobulk_v1" and details is not None:
@@ -720,7 +868,7 @@ class AdvancedStatisticsValidator(BaseAuditor):
                         if len(contract.expected_outputs) >= 2 and summary is None:
                             loo_errors.append("expected LOO summary output is absent")
                         if summary is not None:
-                            loo_errors.extend(_check_summary_against_fits(summary, primary, details))
+                            loo_errors.extend(_check_summary_against_fits(summary, primary, details, float(params.get("alpha", 0.05))))
                     if result.metrics.get("scientific_robustness_claim_supported") is not False:
                         loo_errors.append("LOO must not claim scientific robustness from fit completion")
                     for table in tables:

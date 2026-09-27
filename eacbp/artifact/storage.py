@@ -18,7 +18,7 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
 
 import numpy as np
@@ -569,6 +569,25 @@ class ArtifactStorageBackend:
             ) from exc
         return resolved
 
+    def resolve_path(self, storage_path: str | Path) -> Path:
+        """Resolve a stored object key (or a legacy absolute path) safely."""
+        path = Path(storage_path)
+        return self._validated_path(path if path.is_absolute() else self.base_dir / path)
+
+    @staticmethod
+    def validate_object_key(value: str) -> str:
+        """Reject platform-dependent or traversing portable object keys."""
+        path = PurePosixPath(value)
+        if (not value or value == "." or "\\" in value or ":" in value
+                or path.is_absolute() or path.as_posix() != value
+                or any(part in (".", "..") for part in path.parts)):
+            raise ValueError(f"Invalid artifact object key: {value!r}")
+        return value
+
+    def relative_path(self, storage_path: str | Path) -> str:
+        """Return a portable object key beneath this storage root."""
+        return self.resolve_path(storage_path).relative_to(self.base_dir).as_posix()
+
     def _get_path_for_uri(
         self,
         uri: ArtifactURI,
@@ -718,25 +737,33 @@ class ArtifactStorageBackend:
         expected_sha256: Optional[str] = None,
         storage_path: Optional[str] = None,
     ) -> Any:
+        target_path = self._payload_path(uri_str, artifact_type, storage_path)
+        self.verify_payload(uri_str, artifact_type, expected_sha256, storage_path)
+        return PayloadSerializer.deserialize(target_path, artifact_type)
+
+    def _payload_path(self, uri_str, artifact_type, storage_path=None) -> Path:
         uri = ArtifactURI.parse(uri_str)
-        if storage_path is None:
-            target_path = self._find_existing_path(uri, artifact_type)
-        else:
-            raw_path = Path(storage_path)
-            if not raw_path.is_absolute():
-                raw_path = self.base_dir / raw_path
-            target_path = self._validated_path(raw_path)
+        return (self._find_existing_path(uri, artifact_type) if storage_path is None
+                else self.resolve_path(storage_path))
+
+    def verify_payload(
+        self, uri_str: str, artifact_type: ArtifactType,
+        expected_sha256: Optional[str] = None, storage_path: Optional[str] = None,
+        *, expected_size: Optional[int] = None,
+    ) -> Tuple[str, int]:
+        """Stream a payload's digest without constructing its scientific object."""
+        target_path = self._payload_path(uri_str, artifact_type, storage_path)
         if not target_path.exists():
             raise FileNotFoundError(f"Artifact payload not found at {target_path}")
-
-        if expected_sha256:
-            actual_hash, _ = _sha256_file(target_path)
-            if actual_hash != expected_sha256:
-                raise ArtifactIntegrityError(
-                    f"SHA-256 mismatch for '{uri_str}': expected {expected_sha256}, "
-                    f"observed {actual_hash}"
-                )
-        return PayloadSerializer.deserialize(target_path, artifact_type)
+        actual_hash, actual_size = _sha256_file(target_path)
+        if expected_sha256 and actual_hash != expected_sha256:
+            raise ArtifactIntegrityError(
+                f"SHA-256 mismatch for '{uri_str}': expected {expected_sha256}, "
+                f"observed {actual_hash}"
+            )
+        if expected_size is not None and actual_size != expected_size:
+            raise ArtifactIntegrityError(f"Payload size mismatch for '{uri_str}'")
+        return actual_hash, actual_size
 
     def exists(self, uri_str: str, artifact_type: ArtifactType) -> bool:
         uri = ArtifactURI.parse(uri_str)

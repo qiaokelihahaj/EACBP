@@ -178,6 +178,22 @@ class TaskArtifactTransaction(ArtifactRegistry):
         except KeyError:
             return self.parent.get_metadata(uri_str)
 
+    def get_metadata_many(self, uri_strings, *, missing_ok=False):
+        uris = list(uri_strings)
+        local = super().get_metadata_many(uris, missing_ok=True)
+        missing = [uri for uri in uris if uri not in local]
+        local.update(self.parent.get_metadata_many(missing, missing_ok=missing_ok))
+        return local
+
+    def verify_many(self, uri_strings):
+        uris = list(uri_strings)
+        local = super().get_metadata_many(uris, missing_ok=True)
+        for metadata in local.values():
+            self.storage.verify_payload(metadata.uri, metadata.type, metadata.sha256_hash,
+                                        metadata.storage_path, expected_size=metadata.size_bytes)
+        local.update(self.parent.verify_many([uri for uri in uris if uri not in local]))
+        return local
+
     def get(self, uri_str):
         if super().exists(uri_str):
             return super().get(uri_str)

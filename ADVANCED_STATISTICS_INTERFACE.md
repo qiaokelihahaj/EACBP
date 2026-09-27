@@ -25,6 +25,10 @@ Useful parameters are:
   default formula.
 * `contrast`: `['condition', 'tested_level', 'reference_level']` or a numeric
   contrast vector.  The default reports `condition_a` versus `condition_b`.
+  Reversed categorical contrasts report the actual tested/reference labels,
+  donor counts and effect direction. A custom condition factor must appear in
+  the design formula. Numeric vectors must match the design columns and require
+  a non-empty `contrast_effect_definition`; `contrast_label` is optional.
 * `min_donors` (default 2), `min_replicates` (default 2), `alpha` (default
   0.05), `n_cpus` (default 1), `fit_type`, `size_factors_fit_type`,
   `cooks_filter`, and `independent_filter`.
@@ -35,6 +39,22 @@ including non-significant and PyDESeq2-not-estimated rows.  It contains
 `gene`, `log2_fold_change`, `lfc_se`, `ci_low`, `ci_high`, `statistic`,
 `p_value`, `fdr_q_value`/`padj`, design metadata and sample counts.  A missing
 PyDESeq2 p-value remains `NaN` with no fabricated replacement.
+
+Results record `contrast_spec`, `effect_definition` and `inference_settings`
+in task/artifact metrics, with the corresponding labels, `alpha` and
+`confidence_level` in result tables. `significant_at_alpha` uses `q < alpha`;
+the legacy `significant_fdr05` always means `q < 0.05`. Confidence intervals
+use confidence level `1 - alpha`. Audit, evidence admission and reports use the
+requested threshold; an invalid explicit alpha is rejected. Numeric contrasts
+describe their named coefficient estimand rather than claiming an A/B effect.
+
+Sparse counts remain sparse during validation and donor-condition aggregation,
+including the independent input audit. Only the aggregate count table is
+materialized. Aggregation rejects possible int64 overflow and estimated count
+working space above 1,000,000,000 bytes. `pseudobulk_dense_bytes` and
+`estimated_aggregation_working_bytes` are allocation estimates, not whole-model
+peak memory. A reproducible RSS probe and its limitations are documented in
+[P0 acceptance](docs/P0_ACCEPTANCE.md).
 
 `contract_operations` exposes the normal and underpowered branches, including
 `skip_insufficient_replicates`.  Executed operations are

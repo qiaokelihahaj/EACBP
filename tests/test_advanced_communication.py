@@ -117,7 +117,7 @@ def test_real_liana_local_resource_per_donor(tmp_path, pipeline):
         manifest = StudyManifest(study_id="communication", biological_design=BiologicalDesign(species="human", tissue="test"), data=DataSpec(raw_artifact_uri=pipeline_uri))
         state = {"method_profile": "baseline", "analysis_extensions": {
             "liana_communication": {**task.parameters, "cell_type_col": "reference_type"}},
-            "capability_parameters": {"qc": {"min_genes": 1, "min_cells": 1}}}
+            "capability_parameters": {"qc": {"min_genes": 1}}}
         orch = ScientificOrchestrator(registry)
         outcome = orch.run_study(manifest, state)
         assert outcome["status"] == "success", outcome["failures"]

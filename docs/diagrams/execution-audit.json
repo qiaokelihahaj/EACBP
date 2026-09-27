@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "EACBP · 执行与审计边界",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1300,
+      680
+    ]
+  },
+  "components": [
+    {
+      "id": "contract",
+      "type": "backend",
+      "label": "路由任务契约",
+      "sublabel": "输入 · 方法 · 允许/禁止操作",
+      "pos": [
+        40,
+        60
+      ],
+      "size": [
+        270,
+        80
+      ]
+    },
+    {
+      "id": "run",
+      "type": "backend",
+      "label": "执行并登记产物",
+      "sublabel": "execute_contract → execute",
+      "pos": [
+        465,
+        60
+      ],
+      "size": [
+        270,
+        80
+      ]
+    },
+    {
+      "id": "guard",
+      "type": "security",
+      "label": "副作用验证",
+      "sublabel": "成功结果才检查操作与载荷",
+      "pos": [
+        890,
+        60
+      ],
+      "size": [
+        270,
+        80
+      ]
+    },
+    {
+      "id": "auditor",
+      "type": "security",
+      "label": "独立科学审计",
+      "sublabel": "计算 · 统计 · 生物学检查",
+      "pos": [
+        890,
+        310
+      ],
+      "size": [
+        270,
+        80
+      ]
+    },
+    {
+      "id": "extract",
+      "type": "database",
+      "label": "更新状态并提取证据",
+      "sublabel": "metrics → state · EvidenceGraph",
+      "pos": [
+        465,
+        310
+      ],
+      "size": [
+        270,
+        80
+      ]
+    },
+    {
+      "id": "next",
+      "type": "backend",
+      "label": "继续下一任务",
+      "sublabel": "按计划列表迭代",
+      "pos": [
+        40,
+        310
+      ],
+      "size": [
+        270,
+        80
+      ]
+    },
+    {
+      "id": "stop",
+      "type": "security",
+      "label": "终止任务循环",
+      "sublabel": "非 SUCCESS：break",
+      "pos": [
+        890,
+        550
+      ],
+      "size": [
+        270,
+        80
+      ]
+    },
+    {
+      "id": "synthesis",
+      "type": "frontend",
+      "label": "合成研究声明",
+      "sublabel": "循环结束后统一执行",
+      "pos": [
+        465,
+        550
+      ],
+      "size": [
+        270,
+        80
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "contract",
+      "to": "run",
+      "label": "调用能力"
+    },
+    {
+      "from": "run",
+      "to": "guard",
+      "label": "返回结果"
+    },
+    {
+      "from": "guard",
+      "to": "auditor",
+      "label": "SUCCESS",
+      "labelAt": [
+        1025,
+        220
+      ]
+    },
+    {
+      "from": "auditor",
+      "to": "extract",
+      "label": "审计报告"
+    },
+    {
+      "from": "extract",
+      "to": "next",
+      "label": "记录证据"
+    },
+    {
+      "from": "stop",
+      "to": "synthesis",
+      "label": "已有证据"
+    },
+    {
+      "from": "guard",
+      "to": "stop",
+      "label": "非 SUCCESS",
+      "fromSide": "right",
+      "toSide": "right"
+    },
+    {
+      "from": "next",
+      "to": "contract",
+      "label": "仍有任务",
+      "labelAt": [
+        175,
+        220
+      ]
+    },
+    {
+      "from": "next",
+      "to": "synthesis",
+      "label": "任务耗尽"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "amber",
+      "title": "当前控制流边界",
+      "items": [
+        "能力可在验证前登记产物；终止任务不代表产物已回滚。",
+        "审计失败没有在 run_study 中直接触发 break；未实现自动重试或重规划。"
+      ]
+    }
+  ]
+}

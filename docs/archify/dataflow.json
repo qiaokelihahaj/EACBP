@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "EACBP · 数据与证据血缘",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1080,
+      530
+    ]
+  },
+  "stages": [
+    {
+      "label": "输入"
+    },
+    {
+      "label": "计算"
+    },
+    {
+      "label": "持久化"
+    },
+    {
+      "label": "准入"
+    },
+    {
+      "label": "交付"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "raw",
+      "label": "测序 / 表达输入",
+      "sublabel": "FASTQ 或 h5ad",
+      "stage": 0,
+      "row": 0,
+      "type": "external",
+      "width": 140,
+      "height": 72
+    },
+    {
+      "id": "matrix",
+      "label": "表达矩阵处理",
+      "sublabel": "定量 → QC → 归一化",
+      "stage": 1,
+      "row": 0,
+      "type": "backend",
+      "width": 140,
+      "height": 72
+    },
+    {
+      "id": "adata",
+      "label": "版本化 AnnData",
+      "sublabel": "counts / obs / obsm",
+      "stage": 2,
+      "row": 0,
+      "type": "database",
+      "width": 140,
+      "height": 72
+    },
+    {
+      "id": "results",
+      "label": "科研结果表",
+      "sublabel": "DEG / 轨迹 / 空间等",
+      "stage": 2,
+      "row": 1,
+      "type": "database",
+      "width": 140,
+      "height": 72
+    },
+    {
+      "id": "checks",
+      "label": "独立审计",
+      "sublabel": "完整性与科学规则",
+      "stage": 3,
+      "row": 1,
+      "type": "security",
+      "width": 140,
+      "height": 72
+    },
+    {
+      "id": "graph",
+      "label": "证据与主张",
+      "sublabel": "支持 ID / 表述级别",
+      "stage": 4,
+      "row": 1,
+      "type": "backend",
+      "width": 140,
+      "height": 72
+    },
+    {
+      "id": "snapshot",
+      "label": "证据快照与报告",
+      "sublabel": "校验快照 / 溯源句子",
+      "stage": 4,
+      "row": 2,
+      "type": "database",
+      "width": 140,
+      "height": 72
+    }
+  ],
+  "flows": [
+    {
+      "from": "raw",
+      "to": "matrix",
+      "label": "原始数据"
+    },
+    {
+      "from": "matrix",
+      "to": "adata",
+      "label": "派生矩阵"
+    },
+    {
+      "from": "adata",
+      "to": "results",
+      "label": "分析结果",
+      "labelDy": 30
+    },
+    {
+      "from": "results",
+      "to": "checks",
+      "label": "产物与指标"
+    },
+    {
+      "from": "checks",
+      "to": "graph",
+      "label": "通过的证据"
+    },
+    {
+      "from": "graph",
+      "to": "snapshot",
+      "label": "序列化与渲染",
+      "labelDy": 30
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "存储语义",
+      "items": [
+        "URI 标识版本；元数据保存 SHA-256 和父产物。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "数据来源",
+      "items": [
+        "仅显式 demo 生成模拟数据；模拟标签沿血缘传播。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "可信边界",
+      "items": [
+        "审计未通过的产物可保留，但不能进入证据。"
+      ]
+    }
+  ]
+}

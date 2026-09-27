@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "workflow",
+  "input": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\research-workflow.json",
+  "output": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\research-workflow.html",
+  "specification": {
+    "sha256": "338d3b48c6e0c31408896852c5dc22cd0f100ae479ac50ff4c8e3ae8547b547e",
+    "bytes": 3746
+  },
+  "artifact": {
+    "sha256": "d3294f5e5458c6cd3a53d86abbeaf2dfa81b78abe4d789fdff92330cec8849d2",
+    "bytes": 711106
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

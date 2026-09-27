@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "EACBP · 系统架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1200,
+      620
+    ]
+  },
+  "components": [
+    {
+      "id": "entry",
+      "type": "frontend",
+      "label": "研究应用服务",
+      "sublabel": "CLI / WebUI / 脚本共用",
+      "pos": [
+        40,
+        70
+      ],
+      "size": [
+        220,
+        76
+      ]
+    },
+    {
+      "id": "plan",
+      "type": "backend",
+      "label": "契约与规划",
+      "sublabel": "StudyManifest → TaskContract",
+      "pos": [
+        490,
+        70
+      ],
+      "size": [
+        220,
+        76
+      ]
+    },
+    {
+      "id": "exec",
+      "type": "backend",
+      "label": "路由与执行",
+      "sublabel": "能力路由 / 截止时间 / GPU",
+      "pos": [
+        940,
+        70
+      ],
+      "size": [
+        220,
+        76
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "版本化产物",
+      "sublabel": "相对位置 · 事务 · SHA-256",
+      "pos": [
+        940,
+        270
+      ],
+      "size": [
+        220,
+        76
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "security",
+      "label": "独立科学审计",
+      "sublabel": "计算 / 统计 / 生物学检查",
+      "pos": [
+        490,
+        270
+      ],
+      "size": [
+        220,
+        76
+      ]
+    },
+    {
+      "id": "evidence",
+      "type": "backend",
+      "label": "证据与主张",
+      "sublabel": "统一来源准入 / 证据与主张",
+      "pos": [
+        40,
+        270
+      ],
+      "size": [
+        220,
+        76
+      ]
+    },
+    {
+      "id": "report",
+      "type": "frontend",
+      "label": "科研报告",
+      "sublabel": "证据快照 · Markdown · 溯源",
+      "pos": [
+        40,
+        470
+      ],
+      "size": [
+        220,
+        76
+      ]
+    },
+    {
+      "id": "recovery",
+      "type": "database",
+      "label": "运行恢复",
+      "sublabel": "检查点 / 严格恢复 / 研究包",
+      "pos": [
+        490,
+        470
+      ],
+      "size": [
+        220,
+        76
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "entry",
+      "to": "plan",
+      "label": "提交研究配置"
+    },
+    {
+      "from": "plan",
+      "to": "exec",
+      "label": "依赖排序"
+    },
+    {
+      "from": "exec",
+      "to": "store",
+      "label": "原子发布",
+      "labelDy": 65
+    },
+    {
+      "from": "store",
+      "to": "audit",
+      "label": "读取并核验"
+    },
+    {
+      "from": "audit",
+      "to": "evidence",
+      "label": "持久化通过后准入"
+    },
+    {
+      "from": "evidence",
+      "to": "report",
+      "label": "受限表述",
+      "labelDy": 65
+    },
+    {
+      "from": "audit",
+      "to": "recovery",
+      "label": "记录审计状态",
+      "labelDy": 65
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两个图",
+      "items": [
+        "任务 DAG 决定计算依赖；证据图支撑科研主张。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "实现边界",
+      "items": [
+        "知识源为本地未核验资料；适配器为本地计算。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "准入规则",
+      "items": [
+        "执行成功不等于科学通过；失败分支不贡献证据。"
+      ]
+    }
+  ]
+}

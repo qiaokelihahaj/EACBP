@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\architecture.json",
+  "output": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\architecture.html",
+  "specification": {
+    "sha256": "7652321e17d24e22063c8a1b36aba199041b24eb76b916473b2672c22d174172",
+    "bytes": 3626
+  },
+  "artifact": {
+    "sha256": "73787a337099aad4bdb9ff2b1c374cf8be782b61be400cf3549a82fceaa80f14",
+    "bytes": 709780
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

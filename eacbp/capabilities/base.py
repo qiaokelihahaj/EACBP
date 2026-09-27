@@ -21,6 +21,16 @@ from eacbp.schemas.artifact import ArtifactType
 from eacbp.artifact.registry import ArtifactRegistry
 
 
+# Compatibility scope for built-ins predating explicit descriptors. New
+# extensions declare their scope on CapabilityDescriptor instead of this list.
+TARGET_BRANCH_CAPABILITIES = frozenset({
+    "subset_cells", "differential_abundance", "deg", "trajectory_inference",
+    "gene_function_reasoning", "chatcell_dialogue_prediction", "knowledge_retrieval",
+    "genetic_perturbation_simulation", "compound_perturbation_simulation", "fate_mapping",
+    "functional_activity", "donor_sensitivity",
+})
+
+
 class ImplementationType(str, Enum):
     PYTHON_TOOL = "python_tool"
     R_TOOL = "r_tool"
@@ -76,6 +86,10 @@ class CapabilityDescriptor:
     extractor after that audit has passed.  ``plan_factory`` is used by
     extension planners and is optional for ordinary capabilities.
 
+    ``scope`` declares whether registered extension tasks run once for the
+    study (``shared``) or once for each requested population (``per_target``).
+    It takes precedence over legacy task parameter markers during expansion.
+
     The public constructor intentionally mirrors the existing vocabulary in
     ``BaseCapability`` (``capability_name`` and ``method``) so declarations
     remain explicit and discoverable.
@@ -84,7 +98,7 @@ class CapabilityDescriptor:
     __slots__ = (
         "capability_name", "method", "parameter_model", "input_types", "output_types",
         "required_audit_ids", "validator", "evidence_extractor", "plan_factory",
-        "method_aliases", "description", "validate_types",
+        "method_aliases", "description", "validate_types", "scope",
     )
 
     def __init__(
@@ -101,11 +115,14 @@ class CapabilityDescriptor:
         method_aliases: Optional[Sequence[str]] = None,
         description: str = "",
         validate_types: bool = True,
+        scope: str = "shared",
     ) -> None:
         if not isinstance(capability_name, str) or not capability_name.strip():
             raise ValueError("Capability descriptor requires a non-empty capability_name")
         if not isinstance(method, str) or not method.strip():
             raise ValueError("Capability descriptor requires a non-empty method")
+        if scope not in {"shared", "per_target"}:
+            raise ValueError("Capability descriptor scope must be 'shared' or 'per_target'")
         self.capability_name = capability_name.strip()
         self.method = method.strip()
         self.parameter_model = parameter_model
@@ -118,6 +135,7 @@ class CapabilityDescriptor:
         self.method_aliases = tuple(dict.fromkeys(str(value) for value in (method_aliases or ()) if str(value).strip()))
         self.description = str(description or "")
         self.validate_types = bool(validate_types)
+        self.scope = scope
 
     @property
     def capability(self) -> str:
@@ -144,6 +162,7 @@ class CapabilityDescriptor:
             or getattr(capability, "required_audit_checks", None),
             method_aliases=tuple(getattr(capability, "legacy_aliases", {}).keys()),
             validate_types=False,
+            scope="per_target" if capability.capability_name in TARGET_BRANCH_CAPABILITIES else "shared",
         )
 
     def validate_parameters(self, parameters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -171,7 +190,9 @@ class CapabilityDescriptor:
 
         if isinstance(model, type) and issubclass(model, BaseModel):
             validated = model.model_validate(raw)
-            dumped = validated.model_dump(mode="python")
+            dumped = validated.model_dump(
+                mode="python", exclude_unset=getattr(model, "preserve_omitted_parameters", False)
+            )
         elif hasattr(model, "model_validate"):
             validated = model.model_validate(raw)
             dumped = validated.model_dump(mode="python") if hasattr(validated, "model_dump") else dict(validated)
@@ -233,6 +254,7 @@ class CapabilityDescriptor:
             "has_evidence_extractor": self.evidence_extractor is not None,
             "has_plan_factory": self.plan_factory is not None,
             "validate_types": self.validate_types,
+            "scope": self.scope,
             "description": self.description,
         }
 
@@ -281,6 +303,11 @@ class BaseCapability(ABC):
             descriptor = descriptor_for_capability(self.capability_name, self.implementation_id)
         except ImportError:
             descriptor = None
+        if descriptor is not None:
+            self.descriptor = descriptor
+            return descriptor
+        from eacbp.capabilities.builtin_descriptors import descriptor_for_builtin
+        descriptor = descriptor_for_builtin(self)
         if descriptor is not None:
             self.descriptor = descriptor
             return descriptor

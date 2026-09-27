@@ -77,11 +77,13 @@ class ScientificOrchestrator:
 
     def extract_evidence_from_result(self, contract, result, report):
         from eacbp.evidence.extraction import extract_evidence
+        from eacbp.evidence.provenance import normalize_evidence_candidates
         descriptor = (self.capability_registry.describe(contract.capability, result.method_used or contract.method)
                       if self.capability_registry.has(contract.capability, result.method_used or contract.method) else None)
         nodes = (self.capability_registry.extract_evidence(contract, result, report, self.artifact_registry)
                  if descriptor is not None and descriptor.evidence_extractor is not None
                  else extract_evidence(contract, result, report, self.artifact_registry))
+        nodes = normalize_evidence_candidates(nodes, contract, result, report, self.artifact_registry)
         if any(node.evidence_id in self.evidence_graph.evidence_nodes for node in nodes):
             raise ValueError("Evidence IDs must be unique across study tasks")
         for node in nodes:
@@ -90,10 +92,22 @@ class ScientificOrchestrator:
                     node.biological_context[key] = contract.parameters[key]
         return nodes
 
-    def run_study(self, manifest: StudyManifest, current_state=None):
+    def run_study(self, manifest: StudyManifest, current_state=None, *, execution_context=None):
         """Run a study with a separate diagnostic event log for this invocation."""
         self.event_journal = RunEventJournal(self.artifact_registry.storage.base_dir, manifest.study_id)
         self.task_executor.event_journal = self.event_journal
+        from eacbp.execution_context import ExecutionContext
+        policy_context = ExecutionContext.from_constraints(
+            manifest.constraints, threads=(current_state.get("threads") if current_state is not None else None))
+        if execution_context is not None:
+            # Caller cancellation/deadline can tighten, never weaken manifest policy.
+            policy_context.cancellation = execution_context.cancellation
+            if execution_context.deadline is not None:
+                policy_context.deadline = min(policy_context.deadline, execution_context.deadline)
+            policy_context.gpu_allowed = policy_context.gpu_allowed and execution_context.gpu_allowed
+            limits = [value for value in (policy_context.threads, execution_context.threads) if value is not None]
+            policy_context.threads = min(limits) if limits else None
+        self.task_executor.execution_context = policy_context
         self.event_journal.emit("run_started")
         try:
             summary = self._run_study(manifest, current_state)
@@ -112,6 +126,8 @@ class ScientificOrchestrator:
         """Run dependency-ordered tasks; only audited outputs enter evidence synthesis."""
         from eacbp.orchestrator.checkpoint import StudyJournal, execution_environment
         from eacbp.artifact.transaction import TaskArtifactTransaction
+        from eacbp.execution_context import ExecutionControlError
+        execution_context = self.task_executor.execution_context
         self.execution_state = ExecutionState.from_input(current_state)
         self.current_state = self.execution_state.current_state
         self.task_history = []
@@ -151,6 +167,10 @@ class ScientificOrchestrator:
                     continue
                 self.event_journal.emit("task_started", task_id=task.task_id, capability=task.capability)
                 try:
+                    # Resume still performs scientific work. A cancelled run
+                    # must stop before restoring outputs or starting an audit.
+                    if execution_context is not None:
+                        execution_context.check()
                     pending_nodes = []
                     admission = None
                     branch = task.parameters.get("target_branch")
@@ -196,10 +216,17 @@ class ScientificOrchestrator:
                         audit_started = time.monotonic()
                         self.event_journal.emit("audit_started", task_id=task.task_id, signature=signature)
                         report = self.auditor.audit_task(task, result, self.artifact_registry)
+                        if execution_context is not None:
+                            execution_context.check()
                         admission = self.evidence_admission.stage_report(
                             task, result, manifest, self.execution_state, planned_tasks, report
                         )
                         pending_nodes = admission.pending_nodes
+                        # An extractor may also be expensive. Leave the
+                        # computation reusable and its receipt pending if the
+                        # run was interrupted before evidence admission.
+                        if execution_context is not None:
+                            execution_context.check()
                     journal.entries[task.task_id] = self.resume_manager.journal_entry(
                         signature=signature, result=result, phase="audited", environment=environment
                     )
@@ -255,6 +282,11 @@ class ScientificOrchestrator:
                             self.current_state = self.execution_state.current_state
                     for node in pending_nodes:
                         self.evidence_graph.add_evidence(node)
+                except ExecutionControlError as exc:
+                    result = TaskResult(task_id=task.task_id, capability=task.capability,
+                        method_used=task.method or "unresolved",
+                        status=TaskStatus.POLICY_VIOLATION if exc.failure_type == "resource_policy" else TaskStatus.EXECUTION_FAILURE,
+                        error_type=ExecutionFailureType(exc.failure_type), error_message=str(exc))
                 except Exception as exc:
                     result = TaskResult(task_id=task.task_id, capability=task.capability,
                         method_used=task.method or "unresolved", status=TaskStatus.EXECUTION_FAILURE,

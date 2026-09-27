@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from eacbp import cli
+from eacbp.application import study_service
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.orchestrator.dag import ComputationalDAGPlanner
 from eacbp.orchestrator.events import read_run_events
@@ -34,8 +35,8 @@ def input_file(tmp_path):
 @pytest.fixture
 def audit_only(monkeypatch):
     original = ComputationalDAGPlanner.build_study_plan
-    def plan(manifest, config):
-        return [t for t in original(manifest, config) if t.capability == 'dataset_audit']
+    def plan(manifest, config, **kwargs):
+        return [t for t in original(manifest, config, **kwargs) if t.capability == 'dataset_audit']
     monkeypatch.setattr(ComputationalDAGPlanner, 'build_study_plan', plan)
 
 
@@ -44,8 +45,8 @@ def test_cli_plan_is_read_only_and_reports_errors(tmp_path, monkeypatch, capsys)
     manifest.write_text(study().model_dump_json())
     monkeypatch.chdir(tmp_path)
     before = set(tmp_path.iterdir())
-    with patch.object(cli, '_import_h5ad', side_effect=AssertionError('must not import')), \
-         patch.object(cli, '_make_registry', side_effect=AssertionError('must not create storage')):
+    with patch.object(study_service, '_import_h5ad', side_effect=AssertionError('must not import')), \
+         patch.object(study_service, '_make_registry', side_effect=AssertionError('must not create storage')):
         assert cli.main(['plan', '--manifest', str(manifest)]) == 0
     assert json.loads(capsys.readouterr().out)['phase'] == 'before_dataset_audit'
     assert set(tmp_path.iterdir()) == before
@@ -67,7 +68,7 @@ def test_cli_real_import_strict_resume_and_snapshot_report(tmp_path, monkeypatch
     elsewhere = tmp_path / 'elsewhere'
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
-    with patch.object(cli, '_import_h5ad', side_effect=AssertionError('resume cannot re-import')):
+    with patch.object(study_service, '_import_h5ad', side_effect=AssertionError('resume cannot re-import')):
         rebuilt = cli.report_study(run_dir=run_dir, output=tmp_path / 'rebuilt.md')
         assert Path(rebuilt['report']).read_text(encoding='utf-8') == original_report
         resumed = cli.resume_study(run_dir=run_dir)
@@ -92,7 +93,7 @@ def test_run_refuses_existing_directory_without_modifying_it(tmp_path):
 def test_snapshot_failure_makes_cli_delivery_fail(tmp_path, audit_only, monkeypatch):
     source = input_file(tmp_path)
     run_dir = tmp_path / 'run'
-    with patch.object(cli, '_persist_snapshot', side_effect=OSError('snapshot disk full')):
+    with patch.object(study_service, '_persist_snapshot', side_effect=OSError('snapshot disk full')):
         with pytest.raises(OSError, match='snapshot disk full'):
             cli.run_study(manifest=study(), config={'method_profile': 'baseline'}, data=source, run_dir=run_dir)
     summary = json.loads((run_dir / 'summary.json').read_text())
@@ -143,3 +144,61 @@ def test_config_paths_preserve_cell_ids_and_checkpoint_cwd(tmp_path):
     assert params['background_removal']['run_cwd'] == str((tmp_path / 'worker').resolve())
     assert params['background_removal']['extra_args'][1] == str((tmp_path / 'worker/model.pt').resolve())
     assert params['clustering'] == config['capability_parameters']['clustering']
+
+def test_cli_bundle_move_rebuilds_report_without_original_directory(tmp_path, audit_only, capsys):
+    original = tmp_path / 'original'
+    cli.run_study(manifest=study(), config={'method_profile': 'baseline'},
+                  data=input_file(tmp_path), run_dir=original)
+    bundle = tmp_path / 'study.zip'
+    # Historical snapshots are attachments, not claims of current admission.
+    (original / 'snapshots' / 'historical.json').write_text('{"historical": true}')
+    assert cli.main(['export', '--run-dir', str(original), '--output', str(bundle)]) == 0
+    capsys.readouterr()
+    restored = tmp_path / 'restored'
+    assert cli.main(['import', '--bundle', str(bundle), '--run-dir', str(restored)]) == 0
+    capsys.readouterr()
+    assert Path(cli.inspect_run(run_dir=restored)['event_log']).is_relative_to(restored)
+    assert (restored / 'snapshots' / 'historical.json').read_text() == '{"historical": true}'
+    original.rename(tmp_path / 'original_offline')
+    assert cli.main(['report', '--run-dir', str(restored), '--output', str(restored / 'rebuilt.md')]) == 0
+    rebuilt = (restored / 'rebuilt.md').read_text(encoding='utf-8')
+    assert 'cli_test' in rebuilt
+    assert 'Evidence' in rebuilt
+    # Original metadata remains provenance, not permission to re-import it.
+    saved = json.loads((restored / 'run_config.json').read_text())
+    assert saved['import_completed'] is True
+    with pytest.raises(FileExistsError):
+        study_service.import_study(bundle=bundle, run_dir=restored)
+
+
+def test_application_service_accepts_cancellation_context(tmp_path, audit_only):
+    from eacbp.execution_context import ExecutionContext
+    context = ExecutionContext(threads=2)
+    context.cancel()
+    result = study_service.run_study(manifest=study(), config={'method_profile': 'baseline'},
+                                    data=input_file(tmp_path), run_dir=tmp_path / 'cancelled',
+                                    execution_context=context)
+    assert result['status'] == 'failed'
+    snapshot = json.loads((tmp_path / 'cancelled' / 'snapshot.json').read_text())
+    assert 'cancelled' in json.dumps(snapshot)
+
+
+@pytest.mark.parametrize('invalid', ['incomplete', 'version', 'manifest'])
+def test_application_export_rejects_invalid_envelope_without_publishing(tmp_path, audit_only, invalid):
+    from eacbp.artifact.portability import ArtifactBundleError
+    run_dir = tmp_path / 'run'
+    study_service.run_study(manifest=study(), config={'method_profile': 'baseline'},
+                            data=input_file(tmp_path), run_dir=run_dir)
+    config_path = run_dir / 'run_config.json'
+    envelope = json.loads(config_path.read_text())
+    if invalid == 'incomplete':
+        envelope['import_completed'] = False
+    elif invalid == 'version':
+        envelope['schema_version'] = 999
+    else:
+        envelope['manifest']['biological_design']['tissue'] = 'heart'
+    config_path.write_text(json.dumps(envelope))
+    output = tmp_path / 'invalid-study.zip'
+    with pytest.raises(ArtifactBundleError):
+        study_service.export_study(run_dir=run_dir, output=output)
+    assert not output.exists()

@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="eacbp-token" content="__EACBP_TOKEN__">
   <title>EACBP · 分析工作台</title>
-  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/results.js" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -13,6 +13,7 @@
     <nav aria-label="主导航">
       <button class="nav-item active" id="nav-new"><span>＋</span>新建分析</button>
       <button class="nav-item" id="nav-history"><span>◷</span>运行记录 <span class="nav-count" id="run-count">0</span></button>
+      <button class="nav-item" id="nav-directories" aria-haspopup="dialog"><span>⚙</span>目录设置</button>
     </nav>
     <div class="sidebar-note"><span class="live-dot"></span> 本地工作台<p>数据在当前机器上处理。<br>关闭页面后，分析继续运行。</p></div>
     <div class="sidebar-bottom"><div class="nav-caption">运行环境</div><div id="environment">正在连接…</div><details><summary>目录与依赖</summary><div id="environment-details"></div></details><span class="version">EACBP / 0.1.0</span></div>
@@ -20,39 +21,92 @@
   <main>
     <header class="topbar"><span>研究工作台 <span class="slash">/</span> <span id="breadcrumb">新建分析</span></span><span class="local-badge"><span class="live-dot"></span> LOCAL SESSION</span></header>
     <div id="connection-error" class="notice error hidden" role="alert"></div>
+    <div id="operation-error" class="notice error hidden" role="alert"><button type="button" class="icon-button error-close" id="close-operation-error" aria-label="关闭错误详情">×</button><strong id="operation-error-title"></strong><p id="operation-error-detail"></p><p id="operation-error-next"></p></div>
     <section id="new-view">
       <div class="page-heading"><div><p class="eyebrow">FROM DATA TO EVIDENCE</p><h1>开始一次可追溯的分析</h1><p class="subtitle">选择数据，明确研究设计，再预览即将执行的步骤。</p></div><div class="heading-actions"><button class="button ghost" id="import-config">导入设置</button><button class="button ghost" id="export-config">导出设置 ↗</button><input id="config-file" type="file" accept=".json,application/json" hidden></div></div>
+      <nav class="setup-nav" aria-label="配置步骤">
+        <a href="#data-section"><span class="setup-dot" id="data-step">01</span><span>数据与研究<small id="data-step-hint">选择输入，填写组织</small></span></a>
+        <a href="#design-section"><span class="setup-dot" id="design-step">02</span><span>实验设计<small id="design-step-hint">按需指定条件与供体</small></span></a>
+        <a href="#methods-section"><span class="setup-dot">03</span><span>分析方法<small id="method-step-hint">标准分析</small></span></a>
+      </nav>
+      <section id="reuse-comparison" class="reuse-comparison hidden" aria-live="polite"></section>
       <div class="analysis-layout">
         <form id="study-form" class="form-stack">
-          <section class="card"><div class="section-title"><span class="step-number">01</span><div><h2>数据与研究</h2><p>从本机或服务器工作目录读取 h5ad 文件。</p></div><span class="tag">AnnData</span></div>
+          <section class="card purpose-card" id="purpose-section"><div class="section-title"><span class="step-number">00</span><div><h2>你想回答什么问题？</h2><p>选择一个主要研究目的，查看对应的后端任务和需要确认的输入。</p></div><span class="tag">研究问题</span></div>
+            <fieldset class="purpose-fieldset"><legend class="sr-only">选择主要研究目的</legend><div class="purpose-grid">
+              <label class="purpose-choice"><input type="radio" name="research_purpose" value="overview" checked><span><strong>了解数据与细胞组成</strong><small>数据审计、质量控制、标准聚类与细胞类型概览</small></span></label>
+              <label class="purpose-choice"><input type="radio" name="research_purpose" value="deg"><span><strong>比较两组基因表达</strong><small>差异表达；需明确条件列、A/B 条件与供体单位</small></span></label>
+              <label class="purpose-choice"><input type="radio" name="research_purpose" value="abundance"><span><strong>比较细胞类型丰度</strong><small>供体层面的状态比例；需要独立生物学重复</small></span></label>
+              <label class="purpose-choice"><input type="radio" name="research_purpose" value="trajectory"><span><strong>探索细胞状态轨迹</strong><small>拟时序；需要有生物学依据的根细胞 ID</small></span></label>
+              <label class="purpose-choice"><input type="radio" name="research_purpose" value="batch"><span><strong>检查批次影响</strong><small>整合与批次混合检查；需确认批次元数据列</small></span></label>
+              <label class="purpose-choice"><input type="radio" name="research_purpose" value="annotation"><span><strong>使用本地参考模型注释</strong><small>CellTypist；需本地模型文件与可选依赖</small></span></label>
+            </div></fieldset>
+            <div id="purpose-guide" class="purpose-guide" aria-live="polite"></div>
+            <p class="hint purpose-scope">研究目的用于解释输入要求和预检重点；实际执行步骤仍由下方选项与 EACBP 后端计划器共同确定，不会只运行所选单项。</p>
+          </section>
+          <section class="card" id="data-section"><div class="section-title"><span class="step-number">01</span><div><h2>数据与研究</h2><p>从本机或服务器工作目录读取 h5ad 文件。</p></div><span class="tag">AnnData</span></div>
             <label for="data">输入文件 <span class="required">*</span></label><div class="input-action"><input id="data" name="data" placeholder="选择文件，或输入工作目录内的 .h5ad 路径" required><button type="button" class="button secondary" id="browse">浏览文件</button></div>
-            <div class="field-footer"><span>大文件无需上传到浏览器。</span><button type="button" class="text-button" id="inspect-data">检查数据结构 ↗</button></div>
+            <div class="field-footer"><span>大文件无需上传到浏览器。</span><span><button type="button" class="text-button" id="csv-import-open">导入 CSV/TSV 为 h5ad ↗</button><button type="button" class="text-button" id="inspect-data">检查数据结构 ↗</button></span></div>
             <div id="dataset-info" class="dataset-info hidden"></div>
             <div class="form-grid"><div><label for="study_id">研究编号 <span class="required">*</span></label><input id="study_id" value="study_001" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" maxlength="80" required><small>字母、数字、下划线或连字符</small></div><div><label for="title">研究名称</label><input id="title" placeholder="例如：肾脏单细胞条件比较"></div><div><label for="species">物种 <span class="required">*</span></label><select id="species"><option value="homo_sapiens">人 · Homo sapiens</option><option value="mus_musculus">小鼠 · Mus musculus</option><option value="other">其他（在下方填写）</option></select><input id="other-species" class="hidden" placeholder="物种名称" aria-label="其他物种名称"></div><div><label for="tissue">组织 <span class="required">*</span></label><input id="tissue" placeholder="例如 kidney、brain" required></div></div>
             <label for="target_cell_types">目标细胞类型</label><input id="target_cell_types" placeholder="留空分析所有细胞；多个标签用英文逗号分隔"><small>使用数据中已有的标签，或通过高级设置提供注释参考。</small>
           </section>
-          <section class="card"><div class="section-title"><span class="step-number">02</span><div><h2>实验设计</h2><p>对比与供体信息决定哪些统计分析可以执行。</p></div></div>
-            <div class="form-grid"><div><label for="condition_a">条件 A</label><input id="condition_a" placeholder="例如 treated"></div><div><label for="condition_b">条件 B</label><input id="condition_b" placeholder="例如 control"></div></div><small>填写元数据中的实际取值；同时留空时由数据审计判断可用对比。</small>
-            <details class="advanced"><summary>元数据列名与配对设计</summary><div class="form-grid three"><div><label for="condition_col">条件列</label><input id="condition_col" list="obs-columns" placeholder="默认 condition"></div><div><label for="donor_col">供体列</label><input id="donor_col" list="obs-columns" placeholder="自动识别"></div><div><label for="batch_col">批次列</label><input id="batch_col" list="obs-columns" placeholder="自动识别"></div></div><label class="check-label"><input id="paired" type="checkbox">同一供体的配对比较（需启用 PyDESeq2）</label></details><datalist id="obs-columns"></datalist>
+          <section class="card" id="design-section"><div class="section-title"><span class="step-number">02</span><div><h2>实验设计</h2><p>对比与供体信息决定哪些统计分析可以执行。</p></div></div>
+            <p class="hint" id="metadata-hint">先检查数据结构，再明确选择实验设计列；不会替你指定条件或供体。</p>
+            <div class="form-grid four design-mapping"><div><label for="condition_col">实验条件列</label><select id="condition_col"><option value="">请选择数据列</option></select></div><div><label for="sample_col">样本标识列（概览）</label><select id="sample_col"><option value="">不显示样本数</option></select></div><div><label for="donor_col">供体 / 生物学重复列</label><select id="donor_col"><option value="">请选择数据列</option></select></div><div><label for="batch_col">批次列</label><select id="batch_col"><option value="">不指定批次列</option></select></div></div>
+            <div class="form-grid"><div><label for="condition_a">条件 A</label><select id="condition_a" disabled><option value="">先选择条件列</option></select></div><div><label for="condition_b">条件 B</label><select id="condition_b" disabled><option value="">先选择条件列</option></select></div></div>
+            <small>样本标识只用于计算不同样本 ID 数；供体列对应后端统计单位。细胞数是观测数，不能替代生物学重复数。</small>
+            <div id="design-overview" class="design-overview hidden" aria-live="polite"></div>
+            <details class="advanced"><summary>配对设计与 PyDESeq2 参数</summary><label class="check-label"><input id="paired" type="checkbox">同一供体在两个条件下重复测量（配对差异表达）</label><div class="form-grid three"><div><label for="min_donors">每组最低供体数</label><input id="min_donors" type="number" min="2" step="1" value="2"></div><div><label for="alpha">显著性阈值 α</label><input id="alpha" type="number" min="0.001" max="0.999" step="0.001" value="0.05"></div><div><label for="counts_layer">原始计数 layer</label><select id="counts_layer"><option value="counts">counts（后端默认）</option></select></div></div><label for="design_formula">PyDESeq2 设计公式</label><input id="design_formula" placeholder="可留空自动生成；例如 ~ condition + donor"><label class="check-label"><input id="allow_x_as_counts" type="checkbox">我已确认 X 是原始、非负整数计数</label><small>仅在确认原始计数确实保存在 X 时选择；PyDESeq2 会执行实际矩阵校验。</small></details>
           </section>
-          <section class="card"><div class="section-title"><span class="step-number">03</span><div><h2>分析方法</h2><p>常用方法可直接选择，其余参数保留在高级设置中。</p></div></div>
+          <section class="card" id="methods-section"><div class="section-title"><span class="step-number">03</span><div><h2>分析方法</h2><p>常用方法可直接选择，其余参数保留在高级设置中。</p></div></div>
             <label for="method_profile">分析模式</label><select id="method_profile"><option value="standard">标准分析 · Harmony / Leiden / UMAP</option><option value="baseline">基础分析 · 简化算法，用于探索与流程检查</option></select>
             <label class="check-label feature-check"><input id="advanced_analysis" type="checkbox"><span><strong>启用高级统计</strong><small>PyDESeq2 供体级差异分析与供体留一敏感性分析；需要原始计数及足够供体。</small></span></label>
             <div class="form-grid"><div><label for="min_genes">每个细胞最少基因数</label><input id="min_genes" type="number" min="0" step="1" value="100" required></div><div><label for="max_mito_pct">线粒体比例上限（%）</label><input id="max_mito_pct" type="number" min="0" max="100" step="0.1" value="20" required></div></div>
             <label for="root_cell_id">拟时序根细胞 ID</label><input id="root_cell_id" placeholder="可选；填写有生物学依据的细胞 ID"><small>标准模式中留空将省略 DPT 及其下游分支。</small>
-            <details class="advanced"><summary>高级配置 JSON</summary><p class="hint">递归覆盖上面的基础配置。可设置 marker_reference、CellTypist、LIANA 等；资源路径相对于工作目录。预览会显示最终配置。</p><textarea id="config_overrides" rows="7" spellcheck="false" aria-label="高级配置 JSON">{}</textarea></details>
+            <details class="advanced"><summary>本地参考模型注释</summary><label for="celltypist_model_path">CellTypist 模型文件路径</label><input id="celltypist_model_path" placeholder="本机或服务器上的模型文件绝对路径"><label class="check-label"><input id="annotation_use_as_cell_type" type="checkbox">仅在模型与现有注释无冲突时，用预测标签作为 cell_type</label><small>模型必须已存在于运行机器；WebUI 不下载模型。留空时不会添加此注释任务。</small></details>
+            <details class="advanced"><summary>专家 JSON 配置</summary><p class="hint">此处递归覆盖上方表单设置，冲突时专家 JSON 优先。预检与最终计划按 JSON 生效值执行，并提示已覆盖字段。资源路径相对于工作目录。</p><textarea id="config_overrides" rows="7" spellcheck="false" aria-label="高级配置 JSON">{}</textarea></details>
           </section>
-          <div class="form-actions"><span>先检查执行计划，再启动分析。</span><button class="button primary" type="submit" id="preview">预览分析计划 <span>→</span></button></div>
+          <div class="form-actions"><div><strong id="readiness-title">先准备输入数据</strong><small id="readiness-hint">填写必填项后，即可预览分析计划。</small></div><button class="button primary" type="submit" id="preview">预览分析计划 <span>→</span></button></div>
         </form>
-        <aside class="preview-column"><section class="card preview-card"><div class="preview-heading"><span class="eyebrow">EXECUTION PLAN</span><span id="plan-count" class="tag">待生成</span></div><h2>让每一步都有依据</h2><p class="hint">计划根据你的配置生成。运行时的数据审计可能调整方法，或省略不满足条件的分支。</p>
+        <aside class="preview-column" id="plan-section" tabindex="-1"><section class="card preview-card"><div class="preview-heading"><span class="eyebrow">EXECUTION PLAN</span><span id="plan-count" class="tag">待生成</span></div><h2>让每一步都有依据</h2><p class="hint">计划根据你的配置生成。运行时的数据审计可能调整方法，或省略不满足条件的分支。</p>
             <div id="plan-empty" class="empty-plan"><div class="workflow-step"><span>1</span><div><strong>检查输入与实验设计</strong><small>确认元数据与分析前提</small></div></div><div class="workflow-step"><span>2</span><div><strong>执行分析与独立审计</strong><small>不通过的结果不进入证据</small></div></div><div class="workflow-step"><span>3</span><div><strong>保存结果与报告</strong><small>保留来源，支持后续恢复</small></div></div></div>
             <div id="plan-content" class="hidden"></div><button id="start" class="button primary full" disabled>启动分析 →</button><p class="tiny-note">每次启动创建独立目录，不覆盖历史结果。</p></section><div class="support-note"><strong>关于分析结果</strong><p>软件检查不等于生物学验证。请复核注释、实验设计、质量告警与推断边界。</p></div></aside>
       </div>
     </section>
-    <section id="history-view" class="hidden"><div class="page-heading"><div><p class="eyebrow">RUN HISTORY</p><h1>每一次分析，都有迹可循</h1><p class="subtitle">查看运行状态、执行日志与保存的报告。</p></div><button class="button primary" id="history-new">＋ 新建分析</button></div><div class="stats" id="history-stats"></div><div class="card"><div class="section-title"><h2>研究运行</h2><button class="text-button" id="refresh-runs">刷新 ↻</button></div><div id="runs-list"></div></div></section>
-    <section id="detail-view" class="hidden"><button class="text-button" id="back-history">← 返回运行记录</button><div class="page-heading"><div><p class="eyebrow">STUDY RUN</p><h1 id="detail-title">运行详情</h1><p id="detail-path" class="subtitle path-text"></p></div><div class="heading-actions"><button class="button secondary" id="resume">恢复运行</button><button class="button secondary" id="rebuild-report">校验并重建报告</button></div></div><div id="detail-notice"></div><div class="stats" id="detail-stats"></div><div class="card detail-card"><div class="tabs" role="tablist"><button class="tab active" data-tab="events" role="tab">任务进度</button><button class="tab" data-tab="log" role="tab">运行日志</button><button class="tab" data-tab="report" role="tab">分析报告</button><button class="tab" data-tab="config" role="tab">配置与摘要</button></div><div id="events-panel" class="tab-panel"></div><div id="log-panel" class="tab-panel hidden"><p class="hint">显示最新日志片段。完整日志保存在 runs/.webui/jobs/作业编号/worker.log。</p><pre id="log-output" class="log-output"></pre></div><div id="report-panel" class="tab-panel hidden"><div class="report-toolbar"><p class="hint">这里显示已保存的报告；点击“校验并重建报告”可重新检查当前产物和审计状态。</p><button class="button ghost" id="download-report">下载 Markdown ↗</button></div><article id="report-output" class="markdown"></article></div><div id="config-panel" class="tab-panel hidden"><div class="heading-actions"><button class="button ghost" id="download-config">下载配置</button><button class="button ghost" id="download-summary">下载摘要</button></div><pre id="config-output"></pre></div></div></section>
+    <section id="history-view" class="hidden"><div class="page-heading"><div><p class="eyebrow">RUN HISTORY</p><h1>每一次分析，都有迹可循</h1><p class="subtitle">查看运行状态、执行日志与保存的报告。</p></div><button class="button primary" id="history-new">＋ 新建分析</button></div><div class="stats" id="history-stats"></div><div class="card"><div class="section-title"><h2>研究运行</h2><button class="text-button" id="refresh-runs">刷新 ↻</button></div><div class="history-filters"><div><label for="run-search" class="sr-only">搜索运行记录</label><input id="run-search" type="search" placeholder="搜索研究名称或运行目录…"></div><div><label for="run-filter" class="sr-only">筛选运行状态</label><select id="run-filter"><option value="all">全部状态</option><option value="success">已完成</option><option value="active">正在运行</option><option value="attention">需要检查</option></select></div></div><p id="run-filter-count" class="hint"></p><div id="runs-list"></div></div></section>
+    <section id="detail-view" class="hidden"><button class="text-button" id="back-history">← 返回运行记录</button><div class="page-heading"><div><p class="eyebrow">STUDY RUN</p><h1 id="detail-title">运行详情</h1><p id="detail-path" class="subtitle path-text"></p></div><div class="heading-actions"><button class="button secondary" id="reuse-run">复用成功配置</button><button class="button secondary" id="resume">恢复运行</button><button class="button secondary" id="rebuild-report">校验并重建报告</button></div></div><div id="detail-notice"></div><div class="stats" id="detail-stats"></div><div class="card detail-card"><div class="tabs" role="tablist" aria-label="运行详情"><button class="tab active" data-tab="events" role="tab">任务进度</button><button class="tab" data-tab="results" role="tab">结果图表</button><button class="tab" data-tab="log" role="tab">运行日志</button><button class="tab" data-tab="report" role="tab">分析报告</button><button class="tab" data-tab="config" role="tab">配置与摘要</button></div><div id="events-panel" class="tab-panel"></div><div id="results-panel" class="tab-panel hidden"><div class="report-toolbar"><p class="hint">按研究问题查看已通过快照审计的结果。</p><button id="refresh-results" class="button secondary">读取最新结果</button></div><div class="report-toolbar"><p class="hint">完整证据包通过快照与审计校验；大表也可在下方单独下载。</p><button id="download-evidence" class="button ghost">下载完整证据包 ↗</button></div><div id="results-content"></div></div><div id="log-panel" class="tab-panel hidden"><p class="hint">显示最新日志片段。完整日志保存在 runs/.webui/jobs/作业编号/worker.log。</p><pre id="log-output" class="log-output"></pre></div><div id="report-panel" class="tab-panel hidden"><div class="report-toolbar"><p class="hint">这里显示已保存的报告；点击“校验并重建报告”可重新检查当前产物和审计状态。</p><button class="button ghost" id="download-report">下载 Markdown ↗</button></div><article id="report-output" class="markdown"></article></div><div id="config-panel" class="tab-panel hidden"><div class="heading-actions"><button class="button ghost" id="download-config">下载配置</button><button class="button ghost" id="download-summary">下载摘要</button><button class="button ghost" id="download-snapshot">下载快照</button><button class="button ghost" id="download-methods">下载方法 / 参数 / 软件版本说明</button></div><p class="hint">方法说明取自历史快照与通过审计的产物元数据，不使用当前环境的软件版本。</p><pre id="config-output"></pre></div></div></section>
     <footer>Evidence-aware computational biology<span>输入 · 计算 · 审计 · 证据</span></footer>
   </main>
-  <dialog id="file-dialog"><div class="dialog-heading"><h2>选择输入文件</h2><button class="icon-button" id="close-files" aria-label="关闭文件选择">×</button></div><p class="hint">浏览工作目录内的文件夹与 .h5ad 文件。</p><div class="file-toolbar"><button class="button ghost" id="parent-folder">↑ 上一级</button><span id="folder-path" class="path-text"></span></div><div id="file-list"></div></dialog>
+  <dialog id="directory-dialog" aria-labelledby="directory-title">
+    <div class="dialog-heading"><div><p class="eyebrow">WORKSPACE SETTINGS</p><h2 id="directory-title">目录设置</h2></div><button type="button" class="icon-button" id="close-directories" aria-label="关闭目录设置">×</button></div>
+    <p class="hint directory-intro">程序、输入数据和分析结果可以放在不同位置。请填写运行 EACBP 的机器上的完整目录路径。</p>
+    <form id="directory-form">
+      <label for="directory-workspace">输入数据目录 <span class="required">*</span></label>
+      <input id="directory-workspace" required autocomplete="off" spellcheck="false" aria-describedby="directory-workspace-help" placeholder="输入现有数据文件夹的绝对路径">
+      <small id="directory-workspace-help">文件浏览器以此目录为起点；输入文件需位于此目录内。</small>
+      <label for="directory-runs">结果与历史目录 <span class="required">*</span></label>
+      <input id="directory-runs" required autocomplete="off" spellcheck="false" aria-describedby="directory-runs-help" placeholder="输入存放分析结果的绝对路径">
+      <small id="directory-runs-help">保存新分析、日志和运行历史。目录不存在时会自动创建。</small>
+      <div class="directory-effect"><strong>应用后会发生什么</strong><p>页面将刷新，未提交的分析配置会重置。历史记录切换到新结果目录；已有文件留在原处，可通过切回原目录查看。</p></div>
+      <div id="directory-error" class="notice error hidden" role="alert"></div>
+      <div id="directory-job-notice" class="notice warning hidden" role="status">有运行中或状态待检查的任务，处理完成后才能切换目录。</div>
+      <details class="advanced directory-installation"><summary>程序位置与设置保存</summary>
+        <dl><dt>程序包目录（只读）</dt><dd id="directory-package"></dd><dt>Python 环境（只读）</dt><dd id="directory-python"></dd><dt>目录设置文件</dt><dd id="directory-preferences"></dd></dl>
+        <p class="hint">程序位置随安装位置确定；模型、参考索引和外部工具仍在分析的高级配置中指定。下次启动会读取已保存目录，显式命令行参数优先。</p>
+      </details>
+      <div class="directory-actions"><button type="button" class="button ghost" id="cancel-directories">取消</button><button type="submit" class="button primary" id="save-directories">保存并应用</button></div>
+    </form>
+  </dialog>
+  <dialog id="file-dialog"><div class="dialog-heading"><h2>选择输入文件</h2><button class="icon-button" id="close-files" aria-label="关闭文件选择">×</button></div><p class="hint">浏览工作目录内的 .h5ad、.csv 或 .tsv 文件。</p><div class="file-toolbar"><button class="button ghost" id="parent-folder">↑ 上一级</button><span id="folder-path" class="path-text"></span></div><div id="file-list"></div></dialog>
+  <dialog id="import-dialog" aria-labelledby="import-title"><div class="dialog-heading"><div><p class="eyebrow">CSV / TSV IMPORT</p><h2 id="import-title">从计数矩阵创建 h5ad</h2></div><button type="button" class="icon-button" id="close-import" aria-label="关闭导入向导">×</button></div>
+    <p class="hint">支持 UTF-8 CSV/TSV：一份原始计数矩阵和一份细胞元数据。10x mtx 尚不支持；不会自动猜方向或拼接文件。</p>
+    <label for="import-counts">计数矩阵 CSV/TSV</label><div class="input-action"><input id="import-counts" autocomplete="off" spellcheck="false" placeholder="工作目录内的相对路径或完整路径"><button type="button" class="button secondary" id="browse-import-counts">浏览</button></div>
+    <label for="import-metadata">细胞元数据 CSV/TSV</label><div class="input-action"><input id="import-metadata" autocomplete="off" spellcheck="false" placeholder="工作目录内的相对路径或完整路径"><button type="button" class="button secondary" id="browse-import-metadata">浏览</button></div>
+    <fieldset class="orientation-options"><legend>计数矩阵方向 <span class="required">*</span></legend><label><input type="radio" name="import-orientation" value="cells_by_genes" checked> 行是细胞，列是基因</label><label><input type="radio" name="import-orientation" value="genes_by_cells"> 行是基因，列是细胞</label></fieldset>
+    <p class="hint">ID 使用文本精确对齐；重复/缺失 ID、ID 集合不匹配及非有限、负数或非整数计数会被拒绝。每个文件最多 64 MB，矩阵最多 2,000,000 个计数值。</p>
+    <div id="import-preview" class="hidden"></div><div id="import-error" class="notice error hidden" role="alert"></div>
+    <div class="directory-actions"><button type="button" class="button ghost" id="cancel-import">取消</button><button type="button" class="button secondary" id="preview-import">预检并预览</button><button type="button" class="button primary" id="confirm-import" disabled>确认并新建 h5ad</button></div>
+  </dialog>
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 </body></html>

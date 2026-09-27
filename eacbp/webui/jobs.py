@@ -119,7 +119,8 @@ class JobManager:
                                "created_at": "", "run_dir": ""})
         return sorted(result, key=lambda item: item["created_at"], reverse=True)
 
-    def submit(self, operation: str, *, run_dir: Path, manifest=None, config=None, data=None):
+    def submit(self, operation: str, *, run_dir: Path, manifest=None, config=None, data=None,
+               webui_context=None):
         if operation not in {"run", "resume", "report"}:
             raise ValueError("Unknown operation")
         run_dir = contained(self.runs_dir, run_dir)
@@ -142,6 +143,7 @@ class JobManager:
             write_json(directory / "request.json", {
                 "operation": operation, "run_dir": str(run_dir), "workspace": str(self.workspace),
                 "manifest": manifest, "config": config, "data": str(data) if data else None,
+                "webui_context": webui_context,
             })
             write_json(directory / "job.json", job)
             try:

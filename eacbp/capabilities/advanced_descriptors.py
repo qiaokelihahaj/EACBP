@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel, ConfigDict
 
 from eacbp.capabilities.base import CapabilityDescriptor
+from eacbp.capabilities.parameters import CellBenderParameters
 from eacbp.schemas.artifact import ArtifactType
 
 
@@ -92,13 +93,14 @@ def _descriptor(
     return CapabilityDescriptor(
         capability_name=capability_name,
         method=method,
-        parameter_model=AdvancedExtensionParameters,
+        parameter_model=CellBenderParameters if capability_name == "background_removal" else AdvancedExtensionParameters,
         input_types=input_types,
         output_types=output_types,
         required_audit_ids=required_audit_ids,
         method_aliases=method_aliases,
         plan_factory=lambda **context: _extension_plan(capability_name, **context),
         description=description,
+        scope="per_target" if capability_name in {"functional_activity", "donor_sensitivity"} else "shared",
     )
 
 

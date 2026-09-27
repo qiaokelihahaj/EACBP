@@ -19,6 +19,9 @@ class TaskStatus(str, Enum):
 
 
 class ExecutionFailureType(str, Enum):
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    RESOURCE_POLICY = "resource_policy"
     CODE_ERROR = "code_error"
     MEMORY_ERROR = "memory_error"
     DEPENDENCY_ERROR = "dependency_error"

@@ -2,7 +2,7 @@
 
 This script remains as a compatibility entry point for existing notebooks and
 batch jobs. Importing, artifact registration, orchestration, snapshotting, and
-report generation all belong to :mod:`eacbp.cli`; keeping this adapter small
+report generation all belong to :mod:`eacbp.application.study_service`; keeping this adapter small
 prevents the two entry points from drifting apart.
 """
 
@@ -18,7 +18,7 @@ from uuid import uuid4
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from eacbp.cli import run_study
+from eacbp.application.study_service import run_study
 from eacbp.schemas.study import BiologicalDesign, DataSpec, StudyManifest
 
 

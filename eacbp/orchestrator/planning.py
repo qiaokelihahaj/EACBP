@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from eacbp.capabilities import create_default_capability_registry
 from eacbp.capabilities.advanced_descriptors import ADVANCED_EXTENSION_DESCRIPTORS
-from eacbp.orchestrator.dag import ComputationalDAGPlanner
+from eacbp.orchestrator.dag import ComputationalDAGPlanner, _expand_target_branches
 from eacbp.orchestrator.router import CapabilityRouter
 from eacbp.schemas.runtime import RunConfig
 
@@ -19,8 +19,15 @@ def build_study_tasks(manifest, state, capability_registry):
             name: settings for name, settings in planner_input["analysis_extensions"].items()
             if name in ADVANCED_EXTENSION_DESCRIPTORS
         }
-    tasks = ComputationalDAGPlanner.build_study_plan(manifest, planner_input)
-    tasks.extend(capability_registry.plan_extensions(manifest, state, tasks))
+    tasks = ComputationalDAGPlanner.build_study_plan(manifest, planner_input, expand_targets=False)
+    extensions = capability_registry.plan_extensions(manifest, state, tasks)
+    tasks.extend(extensions)
+    scopes = {task.task_id: capability_registry.describe(task.capability, task.method).scope
+              for task in extensions}
+    if len(manifest.biological_design.target_cell_types) > 1:
+        tasks = _expand_target_branches(
+            tasks, list(manifest.biological_design.target_cell_types), state, scopes=scopes
+        )
     producers = {}
     for task in tasks:
         for uri in task.expected_outputs:
@@ -73,7 +80,7 @@ def preview_study_plan(manifest, config=None, capability_registry=None):
         "notices": [
             "Methods and contrasts are provisional until dataset audit; unsupported branches may be omitted.",
             "Input matrices, observed cell IDs, optional runtime dependencies and available resources are not validated by this preview.",
-            "Runtime-hour, GPU and intermediate-retention constraints are not enforced by the current executor.",
+            "Runtime-hour/GPU policies are checked at Python task boundaries and external commands are supervised; in-process computation is not forcibly preempted.",
         ],
     }
     if "method_profile" not in RunConfig.from_mapping(config).to_mapping():

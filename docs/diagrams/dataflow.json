@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "EACBP · 数据与证据流",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1080,
+      650
+    ]
+  },
+  "stages": [
+    {
+      "label": "输入"
+    },
+    {
+      "label": "变换"
+    },
+    {
+      "label": "研究结果"
+    },
+    {
+      "label": "证据"
+    },
+    {
+      "label": "表达"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "raw",
+      "type": "database",
+      "label": "原始矩阵",
+      "sublabel": "raw/v1 · SCData",
+      "stage": 0,
+      "row": 0
+    },
+    {
+      "id": "processed",
+      "type": "backend",
+      "label": "细胞表征",
+      "sublabel": "QC → norm → integrated",
+      "stage": 1,
+      "row": 0
+    },
+    {
+      "id": "tables",
+      "type": "database",
+      "label": "结果表",
+      "sublabel": "DEG · 丰度 · 轨迹",
+      "stage": 2,
+      "row": 0
+    },
+    {
+      "id": "ev",
+      "type": "database",
+      "label": "证据节点",
+      "sublabel": "来源 URI · 任务 · 审计",
+      "stage": 3,
+      "row": 0
+    },
+    {
+      "id": "claim",
+      "type": "frontend",
+      "label": "声明与报告",
+      "sublabel": "四级语言 · 置信度",
+      "stage": 4,
+      "row": 0
+    },
+    {
+      "id": "reads",
+      "type": "external",
+      "label": "FASTQ 清单",
+      "sublabel": "可选 kb 定量入口",
+      "stage": 0,
+      "row": 2
+    },
+    {
+      "id": "annotated",
+      "type": "database",
+      "label": "注释与子集",
+      "sublabel": "annotated/v4 · subset/v5",
+      "stage": 1,
+      "row": 2
+    },
+    {
+      "id": "extra",
+      "type": "database",
+      "label": "扩展产物",
+      "sublabel": "空间 · 知识 · 扰动",
+      "stage": 2,
+      "row": 2
+    },
+    {
+      "id": "lineage",
+      "type": "database",
+      "label": "产物血缘",
+      "sublabel": "parent_uris · SHA-256",
+      "stage": 3,
+      "row": 2
+    },
+    {
+      "id": "trace",
+      "type": "backend",
+      "label": "溯源卡片",
+      "sublabel": "声明 → 证据 → 原始数据",
+      "stage": 4,
+      "row": 2
+    }
+  ],
+  "flows": [
+    {
+      "from": "reads",
+      "to": "raw",
+      "label": "表达矩阵"
+    },
+    {
+      "from": "raw",
+      "to": "processed",
+      "label": "计数"
+    },
+    {
+      "from": "processed",
+      "to": "annotated",
+      "label": "聚类注释",
+      "labelAt": [
+        315,
+        260
+      ]
+    },
+    {
+      "from": "annotated",
+      "to": "tables",
+      "label": "统计结果"
+    },
+    {
+      "from": "annotated",
+      "to": "extra",
+      "label": "条件分支",
+      "route": "straight",
+      "labelAt": [
+        422,
+        415
+      ]
+    },
+    {
+      "from": "tables",
+      "to": "ev",
+      "label": "结果与审计",
+      "route": "straight"
+    },
+    {
+      "from": "extra",
+      "to": "ev",
+      "label": "扩展证据"
+    },
+    {
+      "from": "ev",
+      "to": "claim",
+      "label": "证据支持"
+    },
+    {
+      "from": "claim",
+      "to": "trace",
+      "label": "支持证据 ID",
+      "labelAt": [
+        960,
+        260
+      ]
+    },
+    {
+      "from": "lineage",
+      "to": "trace",
+      "label": "来源链"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "版本化存储",
+      "items": [
+        "每次 register 保存 payload、元数据与父产物关系。",
+        "图中的产物血缘代表所有已登记产物的横切信息。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "科研边界",
+      "items": [
+        "FASTQ 定量可回退合成数据；需核对真实运行模式。",
+        "计算扰动用于提出假设，不能替代实验验证。"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,153 @@
+{
+  "meta": {
+    "title": "EACBP · 项目架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1200,
+      700
+    ]
+  },
+  "components": [
+    {
+      "id": "study",
+      "type": "frontend",
+      "label": "研究定义",
+      "sublabel": "StudyManifest",
+      "pos": [
+        60,
+        80
+      ],
+      "size": [
+        250,
+        90
+      ]
+    },
+    {
+      "id": "control",
+      "type": "backend",
+      "label": "科研编排",
+      "sublabel": "Planner · Router · Policy",
+      "pos": [
+        460,
+        80
+      ],
+      "size": [
+        270,
+        90
+      ]
+    },
+    {
+      "id": "execute",
+      "type": "backend",
+      "label": "能力执行",
+      "sublabel": "计算 · 知识 · 扰动 · 适配器",
+      "pos": [
+        870,
+        80
+      ],
+      "size": [
+        270,
+        90
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "security",
+      "label": "独立审计",
+      "sublabel": "计算 · 统计 · 生物学",
+      "pos": [
+        870,
+        320
+      ],
+      "size": [
+        270,
+        90
+      ]
+    },
+    {
+      "id": "evidence",
+      "type": "database",
+      "label": "证据与声明",
+      "sublabel": "EvidenceGraph · ClaimEngine",
+      "pos": [
+        460,
+        320
+      ],
+      "size": [
+        270,
+        90
+      ]
+    },
+    {
+      "id": "report",
+      "type": "frontend",
+      "label": "溯源报告",
+      "sublabel": "Markdown · Provenance",
+      "pos": [
+        60,
+        320
+      ],
+      "size": [
+        250,
+        90
+      ]
+    },
+    {
+      "id": "artifacts",
+      "type": "database",
+      "label": "版本化数据产物",
+      "sublabel": "ArtifactRegistry · Storage · Lineage",
+      "pos": [
+        425,
+        550
+      ],
+      "size": [
+        340,
+        90
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "study",
+      "to": "control",
+      "label": "规划任务"
+    },
+    {
+      "from": "control",
+      "to": "execute",
+      "label": "路由与调用"
+    },
+    {
+      "from": "execute",
+      "to": "audit",
+      "label": "提交结果",
+      "labelAt": [
+        1005,
+        240
+      ]
+    },
+    {
+      "from": "audit",
+      "to": "evidence",
+      "label": "验证与证据"
+    },
+    {
+      "from": "evidence",
+      "to": "report",
+      "label": "生成论断"
+    },
+    {
+      "from": "evidence",
+      "to": "artifacts",
+      "label": "关联来源",
+      "labelAt": [
+        595,
+        480
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "diagram_type": "architecture"
+}

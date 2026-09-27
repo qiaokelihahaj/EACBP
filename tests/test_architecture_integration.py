@@ -257,7 +257,7 @@ def test_orchestrator_does_not_admit_state_or_graph_when_audit_persistence_fails
         capability_registry=capabilities,
         auditor=auditor,
     )
-    monkeypatch.setattr(ComputationalDAGPlanner, "build_study_plan", lambda *_args: [task])
+    monkeypatch.setattr(ComputationalDAGPlanner, "build_study_plan", lambda *_args, **_kwargs: [task])
     monkeypatch.setattr(ComputationalDAGPlanner, "order_tasks", lambda tasks: tasks)
 
     def failing_audit(*_args, **_kwargs):

@@ -10,6 +10,7 @@ from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.transaction import TaskArtifactTransaction
 from eacbp.capabilities import CapabilityRegistry
 from eacbp.schemas.task import ExecutionFailureType, TaskContract, TaskResult, TaskStatus
+from eacbp.execution_context import ExecutionContext, ExecutionControlError, activate_execution
 
 
 @dataclass
@@ -34,6 +35,7 @@ class TaskExecutor:
         self.artifact_registry = artifact_registry
         self.capability_registry = capability_registry
         self.event_journal = None
+        self.execution_context: Optional[ExecutionContext] = None
 
     def _emit(self, kind, task, **details):
         if self.event_journal is not None:
@@ -44,7 +46,22 @@ class TaskExecutor:
         started = time.monotonic()
         self._emit("attempt_started", task, attempt=attempt, method=task.method)
         try:
-            result = self.capability_registry.execute_contract(task, staged)
+            with activate_execution(self.execution_context):
+                if self.execution_context is not None:
+                    self.execution_context.interruption = None
+                    self.execution_context.check()
+                    self.execution_context.validate_parameters(task.parameters)
+                result = self.capability_registry.execute_contract(task, staged)
+                if self.execution_context is not None:
+                    if self.execution_context.interruption is not None:
+                        raise self.execution_context.interruption
+                    self.execution_context.check()
+        except ExecutionControlError as exc:
+            staged.close()
+            result = TaskResult(task_id=task.task_id, capability=task.capability,
+                method_used=task.method or "unresolved",
+                status=TaskStatus.POLICY_VIOLATION if exc.failure_type == "resource_policy" else TaskStatus.EXECUTION_FAILURE,
+                error_type=ExecutionFailureType(exc.failure_type), error_message=str(exc))
         except BaseException as exc:
             staged.close()
             self._emit("attempt_finished", task, attempt=attempt, status="exception",

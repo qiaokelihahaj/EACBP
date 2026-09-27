@@ -80,7 +80,7 @@ def test_subset_override_cannot_mislabel_a_branch():
 @pytest.mark.parametrize('missing_target', [False, True])
 def test_real_branch_execution_resume_and_failure_isolation(tmp_path, missing_target):
     study = manifest(['Microglia', 'Absent' if missing_target else 'Neurons'])
-    tasks = [t for t in ComputationalDAGPlanner.build_study_plan(study, {})
+    tasks = [t for t in ComputationalDAGPlanner.build_study_plan(study, {}, expand_targets=False)
              if t.capability in {'subset_cells', 'deg'}]
     task_ids = {t.task_id for t in tasks}
     for task in tasks:
@@ -97,7 +97,7 @@ def test_real_branch_execution_resume_and_failure_isolation(tmp_path, missing_ta
     registry = ArtifactRegistry(str(tmp_path))
     registry.register('adata://s/annotated/v4', data, ArtifactType.ANNDATA, 's', 'input', 'fixture')
     orchestrator = ScientificOrchestrator(registry)
-    with patch.object(ComputationalDAGPlanner, 'build_study_plan', side_effect=lambda *_: [t.model_copy(deep=True) for t in tasks]):
+    with patch.object(ComputationalDAGPlanner, 'build_study_plan', side_effect=lambda *_, **__: [t.model_copy(deep=True) for t in tasks]):
         first = orchestrator.run_study(study)
         assert first['status'] == ('failed' if missing_target else 'success'), first
         nodes = list(orchestrator.evidence_graph.evidence_nodes.values())

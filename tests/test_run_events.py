@@ -60,7 +60,7 @@ def test_retry_resume_and_audit_rejection_are_observable(tmp_path):
         return TaskResult(task_id="a", capability="dataset_audit", method_used="sc_audit_v1",
                           status=TaskStatus.SUCCESS, output_artifacts=["json://s/a/v1"])
 
-    with patch.object(ComputationalDAGPlanner, "build_study_plan", side_effect=lambda *_: [task.model_copy(deep=True)]), \
+    with patch.object(ComputationalDAGPlanner, "build_study_plan", side_effect=lambda *_, **__: [task.model_copy(deep=True)]), \
          patch.object(orch.capability_registry, "execute_contract", side_effect=execute), \
          patch.object(orch.auditor, "audit_task", return_value=ValidationReport(auditor_name="test", target_task_id="a")):
         first = orch.run_study(manifest)
@@ -77,7 +77,7 @@ def test_retry_resume_and_audit_rejection_are_observable(tmp_path):
     assert "audit_started" in [e.kind for e in resumed_events]
     assert first["run_id"] != resumed["run_id"]
 
-    with patch.object(ComputationalDAGPlanner, "build_study_plan", side_effect=lambda *_: [task.model_copy(deep=True)]), \
+    with patch.object(ComputationalDAGPlanner, "build_study_plan", side_effect=lambda *_, **__: [task.model_copy(deep=True)]), \
          patch.object(orch.auditor, "audit_task", return_value=ValidationReport(
              auditor_name="test", target_task_id="a", overall_passed=False, stop_rule_triggered=True)):
         rejected = orch.run_study(manifest, {"resume": True})

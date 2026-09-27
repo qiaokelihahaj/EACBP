@@ -6,6 +6,10 @@ EACBP combines explicit task contracts, versioned local artifacts, independent a
 
 ## Architecture
 
+Unified evidence admission, execution resource policy, shared application services,
+capability contracts, and portable research bundles are described in
+[ARCHITECTURE_P4.md](ARCHITECTURE_P4.md).
+
 Current code-based architecture map, review findings, and improvement priorities (Chinese): [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md).
 
 Runtime configuration separation, task execution helpers, and durable artifact audit access are described in [ARCHITECTURE_OPTIMIZATION.md](ARCHITECTURE_OPTIMIZATION.md). The earlier architecture review is historical; its resolved findings are marked at the top.
@@ -26,12 +30,14 @@ The installed `eacbp` CLI (`plan`, `run`, `resume`, `inspect`, `cleanup`, `repor
 
 ## Installation and tests
 
+Use Python 3.12 for the full optional test install below; the `fate`/CellRank extra requires Python 3.12 or newer.
+
 ```sh
-python -m pip install ".[dev,standard,fate]"
+python -m pip install ".[dev,standard,advanced-statistics,advanced-qc,communication,fate]"
 python -m pytest -q
 ```
 
-AnnData/Scanpy are required for full single-cell processing. CI is configured for tests and wheel builds on Windows/Linux with Python 3.11/3.12/3.13. Local test results do not establish that remote CI or real FASTQ alignment has run.
+The core CI matrix runs on Windows and Linux with Python 3.11/3.12/3.13. `environment.yml` is the legacy Conda core/bio setup for Python 3.10/3.11; it does not install the advanced capability extras. Separate Linux/Python 3.12 jobs install and run the `standard`, `advanced-statistics`, `advanced-qc`, `communication`, and `fate` capability suites; those jobs fail if a selected capability test is skipped. These checks exercise package installation and tests, not real FASTQ alignment.
 
 ## Browser workbench
 
@@ -61,7 +67,7 @@ python scripts/run_standard_study.py --help
 Script output is isolated by study/run directory. Starting another run never deletes an earlier artifact tree. Real sequencing inputs must preserve every lane and carry explicit condition/donor metadata; a filename alone is not an experimental design.
 
 `scripts/run_standard_study.py` is a compatibility adapter around
-`eacbp.cli.run_study`. It keeps the historical flags and
+`eacbp.application.study_service.run_study`. It keeps the historical flags and
 `outputs/runs/<study-id>/<uuid>/` layout, while `run_config.json`, the artifact
 registry, evidence snapshots, reports, and resume behavior come from the same
 package lifecycle as `eacbp run`. Tests that need isolated scratch output
@@ -214,6 +220,6 @@ To enable LIANA, include an explicit local resource in the analysis configuratio
 
 The resource must contain `ligand` and `receptor` columns appropriate for the manifest species; no resource is downloaded automatically. Each donor-condition group needs at least two cell types meeting `min_cells`. Set `paired: true` for repeated donors. Condition comparisons use donor ranks with BH adjustment separately for each score; LIANA ranks themselves are not FDR. Interactions that cannot be evaluated because genes are absent are recorded with the missing genes in artifact metadata and task metrics, and checked independently. They are not evidence that communication is absent. These outputs describe inferred communication and cannot establish signaling or causality.
 
-There is no bundled web UI, multi-user execution service or live PubMed/NCBI connector. Current simulations, marker references and statistical models require domain-specific validation on real data. Very large unsupported workloads fail explicitly instead of allocating unbounded dense matrices.
+A local browser interface is bundled through `eacbp webui`; multi-user execution and live PubMed/NCBI connectors are not implemented. Current simulations, marker references and statistical models require domain-specific validation on real data. Very large unsupported workloads fail explicitly instead of allocating unbounded dense matrices.
 
 `PROJECT.md`, `TEST_INFRA.md`, and `TEST_READY.md` contain historical planning material; this README and executable tests describe current behavior. See `REPAIR_NOTES.md` for the corrective changes and remaining validation limits.

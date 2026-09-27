@@ -9,6 +9,7 @@ from eacbp.capabilities.side_effect import SideEffectValidator
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.schemas.artifact import ArtifactType
 from eacbp.artifact.uri import ArtifactURI
+from eacbp.execution_context import ExecutionControlError
 
 
 class CapabilityRegistry:
@@ -286,6 +287,7 @@ class CapabilityRegistry:
                         "input_types": [value.value for value in cap.get_descriptor().input_types],
                         "output_types": [value.value for value in cap.get_descriptor().output_types],
                         "required_audit_ids": list(cap.get_descriptor().required_audit_ids),
+                        "scope": cap.get_descriptor().scope,
                     },
                 }
                 for cap in impls.values()
@@ -296,6 +298,8 @@ class CapabilityRegistry:
         """Executes a TaskContract through the registered capability with side-effect validation."""
         try:
             return self._execute_contract(contract, registry)
+        except ExecutionControlError:
+            raise
         except Exception as exc:
             return TaskResult(task_id=contract.task_id, capability=contract.capability,
                 method_used=contract.method or "unresolved", status=TaskStatus.EXECUTION_FAILURE,

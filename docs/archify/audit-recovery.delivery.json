@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "workflow",
+  "input": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\audit-recovery.json",
+  "output": "C:\\Users\\hahaj\\Desktop\\EACBP\\docs\\archify\\audit-recovery.html",
+  "specification": {
+    "sha256": "d231c304e7394be22d388fb7a01e4018570ba875ce1d5e8b978bfb54f2e81c59",
+    "bytes": 3891
+  },
+  "artifact": {
+    "sha256": "eda3329f5a30123d67913942f524e651f899d4bf37d9f0425d73cc497344fcdb",
+    "bytes": 712645
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

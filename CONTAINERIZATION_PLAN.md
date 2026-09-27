@@ -6,7 +6,7 @@
 
 采用 **Linux amd64、CPU 批处理镜像**。本地及 CI 使用 Docker；现有 Slurm 集群优先评估 Apptainer，以同一 OCI 镜像转换为 SIF 执行。一次容器执行对应一个研究作业，结果落到持久化目录。
 
-先交付 h5ad 分析镜像及同镜像恢复验收，再增加高级分析、FASTQ 工具和集群支持，最后完成发布与跨节点恢复评估。现有代码没有 Web 服务、数据库或消息队列，首期无需端口、Compose 服务编排或 Kubernetes。标准分析采用 CPU；可选 CellBender 的 CPU/GPU 运行时单独评估。Slurm 使用名为 gpu 的分区不等于已经申请 GPU。
+先交付 h5ad 分析镜像及同镜像恢复验收，再增加高级分析、FASTQ 工具和集群支持，最后完成发布与跨节点恢复评估。现有代码已提供 `eacbp webui` 本地单用户 HTTP 工作台及独立 worker；首期容器仍按 CLI 批处理交付，无需端口、Compose 服务编排或 Kubernetes。标准分析采用 CPU；可选 CellBender 的 CPU/GPU 运行时单独评估。Slurm 使用名为 gpu 的分区不等于已经申请 GPU。
 
 本次修订纠正旧规划的两个前提：项目已有可安装的 `eacbp` CLI，也已有 `resume` 命令。容器化应复用这些入口，而不是重新开发一套运行与恢复接口。
 
@@ -26,7 +26,7 @@
 | `eacbp/artifact/` | 使用文件锁、硬链接、原子替换与事务目录 | 持久化卷必须验证这些文件系统语义，不能直接替换成对象存储挂载 |
 | `eacbp/orchestrator/checkpoint.py` | 恢复指纹含源代码、依赖和 `platform.platform()` | 镜像相同也不保证跨宿主内核恢复；需要专项验收 |
 | `slurm/*.sbatch` | 宿主 Python、项目和日志路径存在绝对路径默认值 | 新增容器模板，保留现有运行方式作为迁移回退 |
-| `.github/workflows/tests.yml` | 已配置 Windows/Linux、Python 3.11/3.12/3.13 测试和 wheel 构建 | 可扩展容器测试；配置存在不代表远端测试已成功 |
+| `.github/workflows/tests.yml` | core 保留 Windows/Linux、Python 3.11/3.12/3.13 测试及 wheel 构建；科学能力按扩展拆为 Linux/Python 3.12 作业 | 指定能力测试不允许静默跳过；配置存在不代表远端测试已成功 |
 
 本次只读探测发现 `docker.exe` 与 `wsl.exe`，但 `docker version` 无法连接 `dockerDesktopLinuxEngine` 命名管道，当前会话尚不具备可用的本地 Docker Linux 构建服务；未启动或修改 Docker/WSL。未连接集群核查 Apptainer、节点权限、存储与配额。核查开始时已跟踪文件无修改，但存在大量未跟踪的 `temp_*` 验证目录，必须从构建上下文排除。实施时仍需选定可追溯源码快照。
 
@@ -47,7 +47,7 @@
 
 ### 3.2 构建约定
 
-1. 候选基线为 Python 3.11 + Debian bookworm slim，目标 `linux/amd64`；这是兼顾现有环境约束的待验证选择。若当前依赖无法解析，应评估调整版本或 Python 3.12，并同步迁移文档，不能静默降级科学方法。
+1. 完整科学环境候选基线为 Python 3.12 + Debian bookworm slim，目标 `linux/amd64`；需在干净 Linux 环境验证依赖解析及各能力测试，再生成发布锁文件。包含当前 `cellrank>=2.3,<3` 的 fate 环境不使用 Python 3.11，也不能静默降级科学方法。本地 Windows 验证不代表容器镜像已通过验收。
 2. 在目标 Linux/Python 环境解析完整传递依赖并保存精确版本和哈希；保留 `harmonypy==0.0.10`、CellRank/AnnData 范围等现有约束。运行与测试使用相同科学计算依赖锁；高级扩展联合解析，不在基础镜像上无约束追加 pip 安装。构建工具也固定版本，离线安装关闭隐式构建依赖下载。
 3. 基础镜像固定实际可获取的 digest；Python 包构建 wheelhouse，应用安装非 editable wheel。基础系统包与外部工具记录版本、来源、校验和；不使用浮动最新版工具下载。
 4. 多阶段构建：builder 负责 wheel/必要编译；runtime 仅保留运行依赖。所需动态库通过安装与导入测试确定，不预设一长串未验证系统包。
@@ -163,7 +163,7 @@ P0 不依赖跨节点恢复；P1 不把 demo 或 mock 当作真实工具验收�
 ## 9. 实施前待核实事项
 
 1. **构建环境**：提供可工作的 Linux Docker daemon 或 Linux CI runner；本机当前探测不通过，不影响规划交付。
-2. **依赖基线**：在 Linux 验证候选 Python 3.11/科学包组合；本次未生成假定可用的锁文件或镜像 digest。
+2. **依赖基线**：在 Linux 验证候选 Python 3.12/科学包组合；本次未生成假定可用的锁文件或镜像 digest。
 3. **集群能力**：核查 Apptainer 版本、允许的绑定、SIF 存放位置、计算节点架构和输出文件系统语义。
 4. **容量与数据**：以计划运行的最大规模评估 RAM、scratch 和持久化配额；确定具有可用权限的小样本、索引和模型。
 5. **发布位置**：本地验证可先行；远端镜像仓库、访问权限和保留周期在发布前确定。发布版本保留旧 digest、SIF 和对应锁文件；回退恢复原镜像和对应 run，不强制新旧环境混用。

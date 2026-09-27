@@ -107,7 +107,9 @@ class IntegrationCapability(BaseCapability):
         n_comps = contract.parameters.get("n_components", 20)
         pca_emb = compute_pca(X_use, n_components=n_comps)
 
-        batch_col = "batch" if "batch" in data.obs.columns else None
+        batch_col = contract.parameters.get("batch_col") or ("batch" if "batch" in data.obs.columns else None)
+        if batch_col is not None and batch_col not in data.obs.columns:
+            raise ValueError(f"Batch metadata column '{batch_col}' is not present")
         batches = data.obs[batch_col].values if batch_col else np.array(["b1"] * data.n_obs)
 
         seed = int(contract.parameters.get("random_seed", 42))

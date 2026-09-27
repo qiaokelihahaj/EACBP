@@ -43,8 +43,8 @@ class ResumeManager:
 
     def input_hashes(self, task: TaskContract) -> Dict[str, str]:
         return {
-            uri: self.artifact_registry.get(uri)[0].sha256_hash
-            for uri in task.input_artifacts
+            uri: meta.sha256_hash
+            for uri, meta in self.artifact_registry.verify_many(task.input_artifacts).items()
         }
 
     def lookup(self, journal: Any, task: TaskContract, signature: str) -> ResumeLookup:
@@ -71,8 +71,10 @@ class ResumeManager:
         if not saved or saved.get("result", {}).get("status") != TaskStatus.SUCCESS.value:
             return ResumeLookup(result=None, saved=saved, reused=False)
 
-        for uri, digest in saved.get("output_hashes", {}).items():
-            meta, _ = self.artifact_registry.get(uri)
+        output_hashes = saved.get("output_hashes", {})
+        verified = self.artifact_registry.verify_many(output_hashes)
+        for uri, digest in output_hashes.items():
+            meta = verified[uri]
             if meta.sha256_hash != digest:
                 raise ValueError(f"Resume output metadata changed: {uri}")
         return ResumeLookup(
@@ -83,9 +85,8 @@ class ResumeManager:
 
     def output_hashes(self, result: TaskResult) -> Dict[str, str]:
         return {
-            uri: self.artifact_registry.get_metadata(uri).sha256_hash
-            for uri in result.output_artifacts
-            if self.artifact_registry.exists(uri)
+            uri: meta.sha256_hash
+            for uri, meta in self.artifact_registry.get_metadata_many(result.output_artifacts, missing_ok=True).items()
         }
 
     def journal_entry(

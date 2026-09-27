@@ -3,7 +3,7 @@ Study Manifest schema defining biological, experimental, data, policy, and repro
 """
 
 from typing import List, Dict, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 
 class BiologicalDesign(BaseModel):
@@ -41,8 +41,8 @@ class Hypotheses(BaseModel):
 
 
 class Constraints(BaseModel):
-    max_runtime_hours: float = Field(12.0, description="Max runtime constraint in hours")
-    gpu_allowed: bool = Field(True, description="Whether GPU hardware acceleration is permitted")
+    max_runtime_hours: float = Field(12.0, gt=0, allow_inf_nan=False, description="Max runtime constraint in hours")
+    gpu_allowed: StrictBool = Field(True, description="Whether GPU hardware acceleration is permitted")
     min_biological_replicates: int = Field(2, description="Minimum donor replicates required for confirmatory DEG")
 
 

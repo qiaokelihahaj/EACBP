@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from eacbp.execution_context import run_external
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -641,7 +642,7 @@ class FASTQQuantificationCapability(BaseCapability):
                 command.extend(["--sjdbGTFfile", str(gtf_path)])
             metrics["commands"].append(command)
             try:
-                subprocess.run(
+                run_external(
                     command,
                     capture_output=True,
                     text=True,
@@ -1002,7 +1003,7 @@ class FASTQQuantificationCapability(BaseCapability):
             command.extend([path for pair in lane_pairs for path in pair])
             metrics["commands"].append(command)
             try:
-                subprocess.run(
+                run_external(
                     command,
                     capture_output=True,
                     text=True,
