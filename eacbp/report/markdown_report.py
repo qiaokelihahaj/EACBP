@@ -118,6 +118,7 @@ class ScientificReportGenerator:
         # independent target branch for population-dependent statistics and
         # consumers.  Keep this grouping explicit in the report so a reader
         # can follow a target's provenance without inferring it from URI text.
+        lines.extend(self._scientific_result_details())
         targets = list(manifest.biological_design.target_cell_types)
         if len(targets) > 1:
             slug_by_target = target_branch_slug_map(targets)
@@ -167,6 +168,8 @@ class ScientificReportGenerator:
             )
             lines.append("")
             lines.append("#### Supporting Evidence & Sentence-Level Provenance Trace:")
+            if card.get("inference_contract_ids"):
+                lines.append("Inference contracts: " + ", ".join(f"`{value}`" for value in card["inference_contract_ids"]))
             for ev in card["evidence_chain"]:
                 task_info = ev["source_task"]
                 lines.append(f"- **Evidence `{ev['evidence_id']}`** (`{ev['evidence_type']}`, `{ev['strength']}`, score: `{ev['score']:.2f}`): {ev['summary']}")
@@ -246,6 +249,45 @@ class ScientificReportGenerator:
         lines.append("")
 
         return "\n".join(lines)
+
+    def _scientific_result_details(self):
+        """Keep valid inconclusive estimates and failed preconditions visible."""
+        selected = [task for task in self.task_history if getattr(task, "scientific_result", None) is not None]
+        if not selected:
+            return []
+        audited = {report.target_task_id for report in self.audit_reports
+                   if report.overall_passed and not report.stop_rule_triggered}
+        lines = ["### Scientific result status and inference contracts", "",
+                 "Non-significance does not establish absence of an effect or practical equivalence. "
+                 "An unknown assumption is not a verified assumption. Failed or unaudited results below "
+                 "describe execution limits and are not admitted scientific evidence.", ""]
+
+        def cell(value):
+            return str(getattr(value, "value", value)).replace("|", "\\|").replace("\n", " ")
+
+        for task in selected:
+            outcome = task.scientific_result
+            contract = getattr(task, "inference_contract", None)
+            admitted = task.task_id in audited and getattr(task.status, "value", task.status) == "success"
+            lines.extend([f"#### `{task.task_id}` — {cell(outcome.status)}", "",
+                          f"- Audit admission: {'passed' if admitted else 'not admitted'}",
+                          f"- Inference contract: `{getattr(task, 'inference_contract_id', None) or 'not recorded'}`",
+                          f"- Estimand: {cell(getattr(contract, 'estimand', 'not resolved'))}",
+                          f"- Features tested: {outcome.n_features_tested}; supported: {outcome.n_features_supported}",
+                          f"- Result: {cell(outcome.summary)}", ""])
+            if contract is not None:
+                lines.extend([f"- Contract version: {contract.contract_version}",
+                              f"- Units: independent `{cell(contract.independent_unit)}`; observed `{cell(contract.observation_unit)}`",
+                              f"- Design: `{cell(contract.design_formula)}`; counts: `{cell(contract.counts_source)}`",
+                              f"- Alpha: {contract.alpha:g}; confidence level: {contract.confidence_level:g}; "
+                              f"FDR: {cell(contract.fdr_method)} / {cell(contract.fdr_family)}", ""])
+            if outcome.assumptions:
+                lines.extend(["| Assumption | Status | Scope | Evidence / limitation |", "| :--- | :--- | :--- | :--- |"])
+                for assessment in outcome.assumptions:
+                    lines.append(f"| {cell(assessment.name)} | {cell(assessment.status)} | {cell(assessment.scope)} | "
+                                 f"{cell(assessment.evidence)}; {cell(assessment.reason)} |")
+                lines.append("")
+        return lines
 
     def _advanced_analysis_details(self):
         """Include audited full-result context, not just significant claims."""

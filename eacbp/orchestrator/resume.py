@@ -34,12 +34,19 @@ class ResumeManager:
         manifest: StudyManifest,
         environment: Mapping[str, Any],
     ) -> str:
-        return fingerprint({
-            "task": task.model_dump(),
+        task_payload = task.model_dump()
+        signature_payload = {
+            "task": task_payload,
             "inputs": dict(input_hashes),
             "manifest": manifest.model_dump(),
             "environment": dict(environment),
-        })
+        }
+        if task.inference_contract is not None:
+            signature_payload["inference_contract_id"] = task.inference_contract.contract_id
+        else:
+            # Keep pre-contract task signatures reusable when loading older journals.
+            task_payload.pop("inference_contract", None)
+        return fingerprint(signature_payload)
 
     def input_hashes(self, task: TaskContract) -> Dict[str, str]:
         return {

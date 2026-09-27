@@ -51,7 +51,17 @@ from eacbp.capabilities.base import BaseCapability, ImplementationType
 from eacbp.numerics import benjamini_hochberg
 from eacbp.capabilities.sc_data import SCData
 from eacbp.schemas.artifact import ArtifactType
-from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
+from eacbp.schemas.task import (
+    AssumptionAssessment,
+    AssumptionStatus,
+    ContrastSpec,
+    InferenceContract,
+    ScientificResult,
+    ScientificResultStatus,
+    TaskContract,
+    TaskResult,
+    TaskStatus,
+)
 
 
 _LN2 = float(np.log(2.0))
@@ -120,35 +130,6 @@ class InferenceSettings:
             "confidence_level": self.confidence_level,
             "significance_rule": "fdr_q_value < alpha",
             "legacy_significance_rule": "fdr_q_value < 0.05",
-        }
-
-
-@dataclass(frozen=True)
-class ContrastSpec:
-    """Resolved PyDESeq2 contrast and the estimand its sign describes."""
-
-    kind: str
-    vector: tuple[Any, ...]
-    factor: Optional[str]
-    tested_level: Optional[str]
-    reference_level: Optional[str]
-    label: str
-    effect_definition: str
-
-    def to_pydeseq2(self) -> list[str] | np.ndarray:
-        if self.kind == "numeric":
-            return np.asarray(self.vector, dtype=float)
-        return [str(value) for value in self.vector]
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind,
-            "vector": list(self.vector),
-            "factor": self.factor,
-            "tested_level": self.tested_level,
-            "reference_level": self.reference_level,
-            "label": self.label,
-            "effect_definition": self.effect_definition,
         }
 
 
@@ -771,6 +752,145 @@ def _resolve_contrast(prepared: _PseudobulkInput, params: Mapping[str, Any]) -> 
     )
 
 
+def _build_inference_contract(
+    contract: TaskContract,
+    registry: ArtifactRegistry,
+    data: Optional[SCData] = None,
+) -> InferenceContract:
+    """Resolve the scientific request from metadata without aggregating the count matrix."""
+
+    if not contract.input_artifacts:
+        raise AdvancedStatisticsInputError("inference contract requires an input artifact")
+    if data is None:
+        _, payload = registry.get(contract.input_artifacts[0])
+        data = _coerce_data(payload)
+    params = contract.parameters
+    obs = data.obs
+    condition_col = _resolve_column(obs, params.get("condition_col"), ("condition",), "Condition")
+    donor_col = _resolve_column(
+        obs,
+        params.get("donor_col"),
+        ("donor", "donor_id", "mouse_id", "sample_id", "sample"),
+        "Donor",
+    )
+    condition_a, condition_b = _resolve_conditions(obs, params, condition_col)
+    covariates = _resolve_covariates(obs, params)
+    paired = bool(params.get("paired", params.get("paired_design", False)))
+    design = _make_design(pd.DataFrame(), params, paired, covariates)
+    donors_a = sorted(set(obs.loc[obs[condition_col].astype(str) == condition_a, donor_col].astype(str)))
+    donors_b = sorted(set(obs.loc[obs[condition_col].astype(str) == condition_b, donor_col].astype(str)))
+
+    if contract.method == "decoupler_ulm_v2":
+        contrast = ContrastSpec(
+            kind="categorical",
+            vector=("condition", condition_a, condition_b),
+            factor="condition",
+            tested_level=condition_a,
+            reference_level=condition_b,
+            label=f"{condition_a} versus {condition_b}",
+            effect_definition=(
+                "Donor-level covariate-adjusted OLS difference in inferred activity for "
+                f"{condition_a} versus {condition_b}"
+            ),
+        )
+    else:
+        contrast_input = _PseudobulkInput(
+            counts=pd.DataFrame(),
+            metadata=pd.DataFrame(),
+            condition_a=condition_a,
+            condition_b=condition_b,
+            condition_col=condition_col,
+            donor_col=donor_col,
+            counts_source="",
+            design=design,
+            paired=paired,
+            covariates=covariates,
+            donor_ids=sorted(set(donors_a + donors_b)),
+            donor_ids_a=donors_a,
+            donor_ids_b=donors_b,
+        )
+        contrast = _resolve_contrast(contrast_input, params)
+
+    counts_layer = params.get("counts_layer", params.get("raw_counts_layer", "counts"))
+    layers = getattr(data, "layers", {}) or {}
+    if counts_layer in layers:
+        counts_source = f"layers.{counts_layer}"
+    elif bool(params.get("allow_x_as_counts", False)):
+        counts_source = "X_explicitly_declared_raw_counts"
+    else:
+        counts_source = f"missing:layers.{counts_layer}"
+
+    target_cell_type = params.get("target_cell_type")
+    target_population = str(
+        params.get("target_population")
+        or target_cell_type
+        or f"all observations in {contract.input_artifacts[0]}"
+    )
+    n_features = len(data.var)
+    if contract.method == "decoupler_ulm_v2":
+        feature_scope = f"eligible prior-network sources overlapping {n_features} input genes"
+    elif contract.method == "pydeseq2_leave_one_donor_out_v1":
+        feature_scope = f"all {n_features} input genes under complete-donor refits"
+    else:
+        feature_scope = f"all {n_features} input genes"
+    question = str(
+        params.get("scientific_question")
+        or params.get("question")
+        or f"{contrast.effect_definition} in {target_population}"
+    )
+    inference = InferenceSettings.from_params(params)
+    raw_sensitivity = params.get("sensitivity_plan", [])
+    if isinstance(raw_sensitivity, str):
+        sensitivity_plan = [raw_sensitivity]
+    else:
+        sensitivity_plan = [str(value) for value in (raw_sensitivity or [])]
+    if contract.method == "pydeseq2_leave_one_donor_out_v1" and "leave_one_donor_out" not in sensitivity_plan:
+        sensitivity_plan.append("leave_one_donor_out")
+    fdr_family = str(
+        params.get("fdr_family")
+        or f"{contract.capability}:{target_cell_type or 'all_observations'}:{contrast.label}"
+    )
+    return InferenceContract(
+        scientific_question=question,
+        estimand=contrast.effect_definition,
+        target_population=target_population,
+        target_cell_type=str(target_cell_type) if target_cell_type is not None else None,
+        feature_scope=feature_scope,
+        input_artifact_uris=list(contract.input_artifacts),
+        independent_unit="donor",
+        observation_unit="cell",
+        paired=paired,
+        design_formula=design,
+        counts_source=counts_source,
+        contrast_spec=contrast,
+        alpha=inference.alpha,
+        confidence_level=inference.confidence_level,
+        fdr_method="benjamini_hochberg",
+        fdr_family=fdr_family,
+        sensitivity_plan=sensitivity_plan,
+    )
+
+
+class _InferenceContractCapability:
+    """Small mixin used by planning to place the resolved contract in the resume signature."""
+
+    @staticmethod
+    def build_inference_contract(contract: TaskContract, registry: ArtifactRegistry) -> InferenceContract:
+        return _build_inference_contract(contract, registry)
+
+    @staticmethod
+    def ensure_inference_contract(
+        contract: TaskContract, registry: ArtifactRegistry, data: SCData
+    ) -> InferenceContract:
+        resolved = _build_inference_contract(contract, registry, data=data)
+        if contract.inference_contract is not None and contract.inference_contract.contract_id != resolved.contract_id:
+            raise AdvancedStatisticsInputError(
+                "resolved inference contract changed after task planning; refusing to run under a stale signature"
+            )
+        contract.inference_contract = resolved
+        return resolved
+
+
 def _run_pydeseq2(
     prepared: _PseudobulkInput,
     params: Mapping[str, Any],
@@ -934,6 +1054,13 @@ def _register_table(
     summary_metrics: Mapping[str, Any],
 ) -> None:
     study_id = ArtifactURI.parse(uri).study_id
+    parameter_record = dict(parameters)
+    summary_record = dict(summary_metrics)
+    if contract.inference_contract is not None:
+        inference_payload = contract.inference_contract.model_dump(mode="json")
+        parameter_record["inference_contract"] = inference_payload
+        parameter_record["inference_contract_id"] = contract.inference_contract.contract_id
+        summary_record["inference_contract_id"] = contract.inference_contract.contract_id
     registry.register(
         uri_str=uri,
         payload=table,
@@ -942,16 +1069,123 @@ def _register_table(
         created_by_task=contract.task_id,
         operation=operation,
         parent_uris=list(input_uris),
-        parameters=dict(parameters),
+        parameters=parameter_record,
         software_versions={
             "pydeseq2": _software_version("pydeseq2"),
             "decoupler": _software_version("decoupler"),
         },
-        summary_metrics=dict(summary_metrics),
+        summary_metrics=summary_record,
     )
 
 
-class PyDESeq2PseudobulkCapability(BaseCapability):
+def _scientific_result(
+    contract: TaskContract,
+    table: pd.DataFrame,
+    metrics: Mapping[str, Any],
+) -> ScientificResult:
+    inference_contract = contract.inference_contract
+    if inference_contract is None:
+        raise AdvancedStatisticsInputError("scientific result requires a resolved inference contract")
+    analysis = table
+    if contract.method == "pydeseq2_leave_one_donor_out_v1" and "left_out_donor" in table:
+        analysis = table.loc[table["left_out_donor"].astype(str) == "__full_model__"]
+    if "p_value" in analysis:
+        p_values = pd.to_numeric(analysis["p_value"], errors="coerce").to_numpy(dtype=float)
+        tested_mask = np.isfinite(p_values)
+        tested = int(tested_mask.sum())
+    elif "fdr_q_value" in analysis:
+        q_values = pd.to_numeric(analysis["fdr_q_value"], errors="coerce").to_numpy(dtype=float)
+        tested_mask = np.isfinite(q_values)
+        tested = int(tested_mask.sum())
+    else:
+        tested_mask = np.zeros(len(analysis), dtype=bool)
+        tested = 0
+    q_values = (
+        pd.to_numeric(analysis["fdr_q_value"], errors="coerce").to_numpy(dtype=float)
+        if "fdr_q_value" in analysis else np.full(len(analysis), np.nan)
+    )
+    if "significant_at_alpha" in analysis:
+        supported = int((analysis["significant_at_alpha"].fillna(False).astype(bool).to_numpy() & tested_mask).sum())
+    elif "fdr_q_value" in analysis:
+        supported = int((np.isfinite(q_values) & (q_values < inference_contract.alpha)).sum())
+    else:
+        supported = 0
+
+    design_rank = metrics.get("design_rank")
+    if design_rank is None and "design_rank" in analysis:
+        ranks = pd.to_numeric(analysis["design_rank"], errors="coerce").dropna()
+        design_rank = int(ranks.iloc[0]) if len(ranks) else None
+    assumptions = [
+        AssumptionAssessment(
+            name="donor_independence",
+            status=AssumptionStatus.UNKNOWN,
+            scope="biological sampling design",
+            evidence={"independent_unit": inference_contract.independent_unit, "design_rank": design_rank},
+            reason="Independence between biological donors is not established by metadata or a full-rank design matrix.",
+        ),
+        AssumptionAssessment(
+            name="raw_integer_counts",
+            status=AssumptionStatus.PASSED,
+            scope="input counts",
+            evidence={"counts_source": inference_contract.counts_source},
+            reason="The method's input validation accepted non-negative integer raw counts.",
+        ),
+        AssumptionAssessment(
+            name="design_full_rank",
+            status=AssumptionStatus.PASSED if design_rank is not None else AssumptionStatus.NOT_ASSESSABLE,
+            scope="fitted design matrix",
+            evidence={"design_rank": design_rank} if design_rank is not None else {},
+            reason=(
+                "The fitted design was full rank. This is an estimability check and does not establish donor independence."
+                if design_rank is not None
+                else "No fitted design-rank diagnostic is available for this result."
+            ),
+        ),
+    ]
+    failed = [item for item in assumptions if item.status == AssumptionStatus.FAILED]
+    skipped = bool(metrics.get("skipped")) or (
+        "status" in table and table["status"].astype(str).eq("skipped").all()
+    )
+    if failed:
+        status = ScientificResultStatus.ASSUMPTIONS_FAILED
+        summary = "The requested estimate was produced, but one or more assessed assumptions failed."
+    elif skipped or tested == 0:
+        status = ScientificResultStatus.NOT_ESTIMABLE
+        reason = str(metrics.get("skip_reason") or "No finite feature-level test statistics were produced.")
+        summary = f"The requested estimand was not estimable. {reason}"
+    elif supported:
+        status = ScientificResultStatus.ESTIMATED_SUPPORTED
+        summary = (
+            f"{supported} of {tested} tested features met the prespecified Benjamini-Hochberg "
+            f"q < {inference_contract.alpha:g} rule for {inference_contract.estimand}."
+        )
+    else:
+        status = ScientificResultStatus.ESTIMATED_INCONCLUSIVE
+        summary = (
+            f"Estimates were produced for {tested} tested features for {inference_contract.estimand}, "
+            f"but none met the prespecified Benjamini-Hochberg q < {inference_contract.alpha:g} rule. "
+            "This does not establish equivalence or absence of an effect."
+        )
+    return ScientificResult(
+        status=status,
+        summary=summary,
+        n_features_tested=tested,
+        n_features_supported=supported,
+        assumptions=assumptions,
+    )
+
+
+def _record_scientific_result(metrics: dict[str, Any], contract: TaskContract, result: ScientificResult) -> None:
+    inference_contract = contract.inference_contract
+    if inference_contract is None:
+        return
+    metrics["inference_contract_id"] = inference_contract.contract_id
+    metrics["scientific_result_status"] = result.status.value
+    metrics["n_features_tested"] = result.n_features_tested
+    metrics["n_features_supported"] = result.n_features_supported
+
+
+class PyDESeq2PseudobulkCapability(_InferenceContractCapability, BaseCapability):
     """Fit a PyDESeq2 donor-condition pseudobulk differential model."""
 
     CONTRACT_OPERATIONS = (
@@ -988,6 +1222,7 @@ class PyDESeq2PseudobulkCapability(BaseCapability):
         input_uri = contract.input_artifacts[0]
         _, payload = registry.get(input_uri)
         data = _coerce_data(payload)
+        self.ensure_inference_contract(contract, registry, data)
         prepared = _prepare_pseudobulk(data, contract.parameters)
         result, _ = _run_pydeseq2(prepared, contract.parameters)
         table = _result_table(result, prepared, contract.parameters)
@@ -1013,6 +1248,8 @@ class PyDESeq2PseudobulkCapability(BaseCapability):
             metrics["n_donors_condition_a"] = int(donor_counts[contrast_spec.tested_level])
             metrics["n_donors_condition_b"] = int(donor_counts[contrast_spec.reference_level])
         metrics["contrast_label"] = contrast_spec.label
+        scientific_result = _scientific_result(contract, table, metrics)
+        _record_scientific_result(metrics, contract, scientific_result)
         out_uri = _output_uri(contract, input_uri, "table://{study_id}/pydeseq2_deg/v1")
         _register_table(
             registry,
@@ -1056,6 +1293,8 @@ class PyDESeq2PseudobulkCapability(BaseCapability):
             output_artifacts=[out_uri],
             executed_operations=operations,
             metrics=metrics,
+            inference_contract=contract.inference_contract,
+            scientific_result=scientific_result,
         )
 
 
@@ -1415,7 +1654,7 @@ def _activity_test(
     return summary, pd.DataFrame(donor_rows)
 
 
-class DecouplerFunctionalAnalysisCapability(BaseCapability):
+class DecouplerFunctionalAnalysisCapability(_InferenceContractCapability, BaseCapability):
     """Run decoupler ULM and compare donor-level pathway/TF activities."""
 
     CONTRACT_OPERATIONS = (
@@ -1452,6 +1691,7 @@ class DecouplerFunctionalAnalysisCapability(BaseCapability):
         for uri in contract.input_artifacts:
             loaded.append(registry.get(uri)[1])
         data = _coerce_data(loaded[0])
+        self.ensure_inference_contract(contract, registry, data)
         prepared = _prepare_pseudobulk(data, contract.parameters)
         network, provenance = _network_from_inputs(contract, registry, loaded)
         tmin = max(1, int(contract.parameters.get("tmin", contract.parameters.get("min_network_size", 1))))
@@ -1530,6 +1770,8 @@ class DecouplerFunctionalAnalysisCapability(BaseCapability):
             "p_values_source": "formulaic OLS donor activity comparison; decoupler ULM p-values retained per donor",
             "all_sources_retained": True,
         }
+        scientific_result = _scientific_result(contract, summary, metrics)
+        _record_scientific_result(metrics, contract, scientific_result)
         _register_table(
             registry,
             out_uri,
@@ -1589,6 +1831,8 @@ class DecouplerFunctionalAnalysisCapability(BaseCapability):
                 "retain_all_network_sources",
             ],
             metrics=metrics,
+            inference_contract=contract.inference_contract,
+            scientific_result=scientific_result,
         )
 
 
@@ -1698,7 +1942,7 @@ def _leave_one_out_summary(
     return pd.DataFrame(rows)
 
 
-class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
+class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapability):
     """Assess DEG sensitivity by re-fitting after each donor is removed."""
 
     CONTRACT_OPERATIONS = (
@@ -1732,6 +1976,7 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
         input_uri = contract.input_artifacts[0]
         _, payload = registry.get(input_uri)
         data = _coerce_data(payload)
+        self.ensure_inference_contract(contract, registry, data)
         # Prepare with the structural minimum so an underpowered LOO request
         # can produce an explicit, auditable skip artifact.  The ordinary
         # DEG/functional capabilities still require their configured minimum
@@ -1776,6 +2021,8 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
                 "scientific_robustness_claim_supported": False,
                 "scientific_robustness_limit": "leave-one-donor-out is a sensitivity analysis, not independent validation",
             }
+            scientific_result = _scientific_result(contract, table, metrics)
+            _record_scientific_result(metrics, contract, scientific_result)
             _register_table(
                 registry,
                 out_uri,
@@ -1817,6 +2064,8 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
                 output_artifacts=outputs,
                 executed_operations=["validate_leave_one_donor_qualification", "skip_insufficient_donors"],
                 metrics=metrics,
+                inference_contract=contract.inference_contract,
+                scientific_result=scientific_result,
             )
 
         # Fit the complete model first.  This is also used as the explicit
@@ -1915,6 +2164,8 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
             "n_genes": int(len(full_table)),
             "all_genes_retained_per_successful_fit": True,
         }
+        scientific_result = _scientific_result(contract, output_table, metrics)
+        _record_scientific_result(metrics, contract, scientific_result)
         _register_table(
             registry,
             out_uri,
@@ -1983,6 +2234,8 @@ class PyDESeq2LeaveOneDonorOutCapability(BaseCapability):
                 "record_fit_failures_without_claiming_robustness",
             ],
             metrics=metrics,
+            inference_contract=contract.inference_contract,
+            scientific_result=scientific_result,
         )
 
 

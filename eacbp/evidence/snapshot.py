@@ -685,6 +685,9 @@ def _validate_cross_references(
                 f"evidence {node.evidence_id} references missing source task {node.source_task_id!r}"
             )
         task = task_map[node.source_task_id]
+        inference_id = getattr(task, "inference_contract_id", None)
+        if node.inference_contract_id != inference_id:
+            raise SnapshotValidationError(f"evidence {node.evidence_id} inference contract differs from source task")
         if _status_value(task.status) != TaskStatus.SUCCESS.value:
             raise SnapshotValidationError(
                 f"evidence {node.evidence_id} is sourced from failed task {node.source_task_id!r}"
@@ -710,6 +713,8 @@ def _validate_cross_references(
                 raise SnapshotValidationError(
                     f"evidence {node.evidence_id} source artifact {uri!r} was created by a different task"
                 )
+            if inference_id and artifact_metadata[uri].summary_metrics.get("inference_contract_id") != inference_id:
+                raise SnapshotValidationError(f"artifact {uri} inference contract differs from source task")
         for raw_uri in node.data_origin_uris:
             uri = _artifact_uri(raw_uri, f"evidence {node.evidence_id} artifact")
             if not _external_source(uri) and uri not in local_artifacts:
@@ -727,6 +732,11 @@ def _validate_cross_references(
 
     linked_ids: set[str] = set()
     for claim in graph.claim_nodes.values():
+        expected_inference_ids = sorted({graph.evidence_nodes[eid].inference_contract_id
+                                         for eid in claim.support_evidence_ids + claim.contradiction_evidence_ids
+                                         if graph.evidence_nodes[eid].inference_contract_id})
+        if sorted(set(claim.inference_contract_ids)) != expected_inference_ids:
+            raise SnapshotValidationError(f"claim {claim.claim_id} inference contracts differ from cited evidence")
         linked_ids.update(claim.support_evidence_ids)
         linked_ids.update(claim.contradiction_evidence_ids)
     for evidence_id in linked_ids:

@@ -26,6 +26,7 @@ class EvidenceType(str, Enum):
     SENSITIVITY_ANALYSIS = "sensitivity_analysis"
     CELL_COMMUNICATION = "cell_communication"
     CELL_ANNOTATION = "cell_annotation"
+    STATISTICAL_RESULT = "statistical_result"
 
 
 class EvidencePolarity(str, Enum):
@@ -55,6 +56,7 @@ class ClaimType(str, Enum):
     STATE_TRANSITION = "state_transition"
     REGULATORY = "regulatory"
     MECHANISTIC_HYPOTHESIS = "mechanistic_hypothesis"
+    RESULT_SUMMARY = "result_summary"
 
 
 class ConfidenceScore(BaseModel):
@@ -75,6 +77,7 @@ class EvidenceNode(BaseModel):
     # Provenance
     source_task_id: str = Field(..., description="Task ID where this evidence was computed")
     source_artifact_uris: List[str] = Field(default_factory=list, description="Artifact URIs backing this evidence")
+    inference_contract_id: Optional[str] = Field(None, description="Identity of the audited estimand and inference settings")
     
     # Quantitative support details
     metrics: Dict[str, Any] = Field(default_factory=dict, description="e.g. {'p_val_adj': 1e-6, 'log2fc': 1.8, 'n_replicates': 6}")
@@ -97,6 +100,7 @@ class ClaimNode(BaseModel):
     # Evidence linkages
     support_evidence_ids: List[str] = Field(default_factory=list)
     contradiction_evidence_ids: List[str] = Field(default_factory=list)
+    inference_contract_ids: List[str] = Field(default_factory=list, description="Inference contracts of the cited evidence")
     
     confidence: ConfidenceScore = Field(default_factory=ConfidenceScore)
     provenance_summary: str = Field("", description="Traceable summary of evidence path")

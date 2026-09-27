@@ -8,7 +8,14 @@ from copy import deepcopy
 import time
 
 from eacbp.schemas.study import StudyManifest
-from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus, ExecutionFailureType
+from eacbp.schemas.task import (
+    ScientificResult,
+    ScientificResultStatus,
+    TaskContract,
+    TaskResult,
+    TaskStatus,
+    ExecutionFailureType,
+)
 from eacbp.schemas.artifact import ArtifactType
 from eacbp.schemas.evidence import (
     EvidenceNode,
@@ -288,9 +295,42 @@ class ScientificOrchestrator:
                         status=TaskStatus.POLICY_VIOLATION if exc.failure_type == "resource_policy" else TaskStatus.EXECUTION_FAILURE,
                         error_type=ExecutionFailureType(exc.failure_type), error_message=str(exc))
                 except Exception as exc:
-                    result = TaskResult(task_id=task.task_id, capability=task.capability,
-                        method_used=task.method or "unresolved", status=TaskStatus.EXECUTION_FAILURE,
-                        error_type=ExecutionFailureType.CODE_ERROR, error_message=f"{type(exc).__name__}: {exc}")
+                    message = f"{type(exc).__name__}: {exc}"
+                    inference_contract = task.inference_contract
+                    if task.capability in {"deg", "functional_activity", "donor_sensitivity"}:
+                        if inference_contract is None:
+                            try:
+                                implementation = self.capability_registry.get(task.capability, task.method)
+                                builder = getattr(implementation, "build_inference_contract", None)
+                                if callable(builder):
+                                    inference_contract = builder(task, self.artifact_registry)
+                                    task.inference_contract = inference_contract
+                            except Exception:
+                                inference_contract = None
+                        metrics = {"n_features_tested": 0, "n_features_supported": 0,
+                                   "scientific_result_status": ScientificResultStatus.NOT_ESTIMABLE.value}
+                        if inference_contract is not None:
+                            metrics["inference_contract_id"] = inference_contract.contract_id
+                        result = TaskResult(
+                            task_id=task.task_id,
+                            capability=task.capability,
+                            method_used=task.method or "unresolved",
+                            status=TaskStatus.EXECUTION_FAILURE,
+                            error_type=ExecutionFailureType.CODE_ERROR,
+                            error_message=message,
+                            metrics=metrics,
+                            inference_contract=inference_contract,
+                            scientific_result=ScientificResult(
+                                status=ScientificResultStatus.NOT_ESTIMABLE,
+                                summary=f"The requested estimand was not estimable. {message}",
+                                n_features_tested=0,
+                                n_features_supported=0,
+                            ),
+                        )
+                    else:
+                        result = TaskResult(task_id=task.task_id, capability=task.capability,
+                            method_used=task.method or "unresolved", status=TaskStatus.EXECUTION_FAILURE,
+                            error_type=ExecutionFailureType.CODE_ERROR, error_message=message)
                 self.task_history.append(result)
                 completed[task.task_id] = result.status
                 self.execution_state.mark_completed(task.task_id, result.status)
@@ -318,6 +358,9 @@ class ScientificOrchestrator:
     def _synthesize_study_claims(self, manifest):
         """Each sentence restates its own evidence; no disease-specific conclusions."""
         for index, node in enumerate(self.evidence_graph.evidence_nodes.values()):
+            if node.type == EvidenceType.STATISTICAL_RESULT:
+                self.claim_engine.create_result_summary(f"C_{node.evidence_id}", node.evidence_id)
+                continue
             if node.polarity != EvidencePolarity.SUPPORTING:
                 continue
             tier = LanguageTier.LEVEL_1_OBSERVATION

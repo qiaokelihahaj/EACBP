@@ -151,7 +151,9 @@ The task journal uses an OS process lock and atomic replacement. Artifact hashes
 
 ## Scope and migration
 
-Container deployment design and implementation gates (Chinese): [CONTAINERIZATION_PLAN.md](CONTAINERIZATION_PLAN.md). The plan uses the installed CLI for Linux batch jobs and evaluates Apptainer for Slurm; container images have not yet been implemented or validated.
+Container deployment design and implementation gates (Chinese): [CONTAINERIZATION_PLAN.md](CONTAINERIZATION_PLAN.md). The [P1 deployment guide](P1_DEPLOYMENT.md) provides a Python 3.12 CPU candidate Dockerfile and a one-study Slurm/Apptainer adapter using the existing CLI. Linux image builds and real cluster execution remain unvalidated.
+
+P1 also adds versioned inference contracts, explicit assumption and scientific-result states, and neutral summaries of audited inconclusive results. See the [P1 acceptance record](docs/P1_ACCEPTANCE.md) and [research acceptance workflow](docs/P1_RESEARCH_ACCEPTANCE.md) for direct PyDESeq2 comparisons and the distinction between software regression and real-study validation.
 
 ### Advanced biological analysis
 

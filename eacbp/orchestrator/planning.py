@@ -55,7 +55,16 @@ def resolve_task_contract(task, manifest, state, capability_registry, artifact_r
         operations = resolver(task.parameters)
     if operations is not None:
         task.allowed_operations = list(operations)
-    return capability_registry.prepare_contract(task, artifact_registry)
+    task = capability_registry.prepare_contract(task, artifact_registry)
+    if artifact_registry is not None:
+        implementation = capability_registry.get(task.capability, task.method)
+        builder = getattr(implementation, "build_inference_contract", None)
+        if callable(builder):
+            resolved = builder(task, artifact_registry)
+            if task.inference_contract is not None and task.inference_contract.contract_id != resolved.contract_id:
+                raise ValueError("supplied inference contract does not match the resolved input/design contract")
+            task.inference_contract = resolved
+    return task
 
 
 def preview_study_plan(manifest, config=None, capability_registry=None):

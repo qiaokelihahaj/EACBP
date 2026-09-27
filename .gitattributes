@@ -1,0 +1,2 @@
+docker/entrypoint.sh text eol=lf
+slurm/run_eacbp_container.sbatch text eol=lf

@@ -25,6 +25,7 @@ CAPABILITY_TESTS = {
         "tests/test_advanced_pipeline.py",
         "tests/test_inference_end_to_end.py",
         "tests/test_inference_audit_contract.py",
+        "tests/test_research_acceptance.py",
     ],
     "advanced-qc": [
         "tests/test_advanced_qc.py",

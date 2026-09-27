@@ -3,7 +3,16 @@ Global Capability Registry for discovering and resolving computational implement
 """
 
 from typing import Dict, List, Optional, Any, Iterable
-from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus, ExecutionFailureType
+from eacbp.schemas.task import (
+    AssumptionAssessment,
+    AssumptionStatus,
+    ScientificResult,
+    ScientificResultStatus,
+    TaskContract,
+    TaskResult,
+    TaskStatus,
+    ExecutionFailureType,
+)
 from eacbp.capabilities.base import BaseCapability, CapabilityDescriptor, ImplementationType
 from eacbp.capabilities.side_effect import SideEffectValidator
 from eacbp.artifact.registry import ArtifactRegistry
@@ -301,6 +310,98 @@ class CapabilityRegistry:
         except ExecutionControlError:
             raise
         except Exception as exc:
+            method = contract.method or "unresolved"
+            advanced_methods = {
+                "pydeseq2_pseudobulk_v1",
+                "decoupler_ulm_v2",
+                "pydeseq2_leave_one_donor_out_v1",
+            }
+            try:
+                implementation = self.get(contract.capability, contract.method)
+            except Exception:
+                implementation = None
+            is_advanced_statistics = method in advanced_methods or callable(
+                getattr(implementation, "build_inference_contract", None)
+            )
+            if is_advanced_statistics:
+                if contract.inference_contract is None:
+                    try:
+                        builder = getattr(implementation, "build_inference_contract", None)
+                        if callable(builder):
+                            contract.inference_contract = builder(contract, registry)
+                    except Exception:
+                        pass
+                message = f"{type(exc).__name__}: {exc}"
+                is_input_error = type(exc).__name__ == "AdvancedStatisticsInputError"
+                lower = message.lower()
+                failed_assumption = None
+                if is_input_error and any(token in lower for token in ("donor", "rank deficient", "residual degrees", "raw counts", "integer-valued", "negative values")):
+                    failed_assumption = (
+                        "donor_design_qualification" if "donor" in lower
+                        else "design_estimability" if "rank" in lower or "degrees" in lower
+                        else "raw_integer_counts"
+                    )
+                scientific_status = (
+                    ScientificResultStatus.ASSUMPTIONS_FAILED
+                    if failed_assumption else ScientificResultStatus.NOT_ESTIMABLE
+                )
+                assumptions = [
+                    AssumptionAssessment(
+                        name="donor_independence",
+                        status=AssumptionStatus.UNKNOWN,
+                        scope="biological sampling design",
+                        reason="Independence between biological donors is not established by metadata or design rank.",
+                    )
+                ]
+                if failed_assumption:
+                    assumptions.append(AssumptionAssessment(
+                        name=failed_assumption,
+                        status=AssumptionStatus.FAILED,
+                        scope="analysis prerequisite",
+                        reason=message,
+                    ))
+                else:
+                    assumptions.append(AssumptionAssessment(
+                        name="requested_estimate",
+                        status=AssumptionStatus.NOT_ASSESSABLE,
+                        scope="statistical fit",
+                        reason=message,
+                    ))
+                summary = (
+                    f"The requested estimand was not estimable because {failed_assumption} failed: {message}"
+                    if failed_assumption
+                    else f"The requested estimand was not estimable. {message}"
+                )
+                inference_contract = contract.inference_contract
+                metrics = {
+                    "scientific_result_status": scientific_status.value,
+                    "n_features_tested": 0,
+                    "n_features_supported": 0,
+                }
+                if inference_contract is not None:
+                    metrics["inference_contract_id"] = inference_contract.contract_id
+                return TaskResult(
+                    task_id=contract.task_id,
+                    capability=contract.capability,
+                    method_used=method,
+                    status=TaskStatus.SCIENTIFIC_FAILURE if is_input_error else TaskStatus.EXECUTION_FAILURE,
+                    error_type=(
+                        ExecutionFailureType.INSUFFICIENT_EVIDENCE
+                        if is_input_error
+                        else ExecutionFailureType.DEPENDENCY_ERROR if isinstance(exc, ImportError)
+                        else ExecutionFailureType.CODE_ERROR
+                    ),
+                    error_message=message,
+                    metrics=metrics,
+                    inference_contract=inference_contract,
+                    scientific_result=ScientificResult(
+                        status=scientific_status,
+                        summary=summary,
+                        n_features_tested=0,
+                        n_features_supported=0,
+                        assumptions=assumptions,
+                    ),
+                )
             return TaskResult(task_id=contract.task_id, capability=contract.capability,
                 method_used=contract.method or "unresolved", status=TaskStatus.EXECUTION_FAILURE,
                 error_type=ExecutionFailureType.DEPENDENCY_ERROR if isinstance(exc, ImportError) else ExecutionFailureType.CODE_ERROR,

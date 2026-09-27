@@ -11,6 +11,7 @@ from eacbp.schemas.evidence import (
     EvidenceNode,
     EvidenceType,
     EvidencePolarity,
+    ConfidenceScore,
 )
 from eacbp.evidence.graph import EvidenceGraph
 from eacbp.evidence.confidence import ConfidenceCalculator
@@ -62,6 +63,8 @@ class ClaimEngine:
         support_evidence_ids: Optional[List[str]] = None,
         contradiction_evidence_ids: Optional[List[str]] = None,
     ) -> ClaimNode:
+        if claim_type == ClaimType.RESULT_SUMMARY:
+            raise ValueError("Use create_result_summary for an audited neutral result")
         support_evidence_ids = support_evidence_ids or []
         contradiction_evidence_ids = contradiction_evidence_ids or []
         missing = set(support_evidence_ids + contradiction_evidence_ids) - self.evidence_graph.evidence_nodes.keys()
@@ -143,7 +146,32 @@ class ClaimEngine:
             confidence=confidence,
             provenance_summary=prov_summary,
             is_simulated=simulated,
+            inference_contract_ids=sorted({e.inference_contract_id for e in sup_nodes + contra_nodes if e.inference_contract_id}),
         )
 
+        self.evidence_graph.add_claim(claim)
+        return claim
+
+    def create_result_summary(self, claim_id: str, evidence_id: str) -> ClaimNode:
+        """Describe an audited result without promoting it to a positive discovery."""
+        node = self.evidence_graph.evidence_nodes.get(evidence_id)
+        if (node is None or node.type != EvidenceType.STATISTICAL_RESULT
+                or node.polarity != EvidencePolarity.NEUTRAL or not node.audit_passed
+                or not node.source_artifact_uris or not node.inference_contract_id):
+            raise ValueError("A result summary requires audited neutral statistical evidence and its inference contract")
+        if node.metrics.get("scientific_status") not in {"estimated_supported", "estimated_inconclusive", "not_estimable"}:
+            raise ValueError("An unsupported scientific state cannot be admitted as a result summary")
+        statement = node.summary
+        if node.is_simulated and not statement.startswith("[SIMULATED DATA] "):
+            statement = "[SIMULATED DATA] " + statement
+        claim = ClaimNode(
+            claim_id=claim_id, statement=statement,
+            language_tier=LanguageTier.LEVEL_1_OBSERVATION,
+            claim_type=ClaimType.RESULT_SUMMARY,
+            support_evidence_ids=[evidence_id],
+            inference_contract_ids=[node.inference_contract_id],
+            confidence=ConfidenceScore(), is_simulated=node.is_simulated,
+            provenance_summary=f"Audited result description from {evidence_id}; no positive or equivalence conclusion is implied.",
+        )
         self.evidence_graph.add_claim(claim)
         return claim

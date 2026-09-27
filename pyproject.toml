@@ -59,3 +59,7 @@ exclude = ["tests*", "outputs*", "temp*", "scripts*"]
 
 [tool.setuptools.package-data]
 "eacbp.webui" = ["static/*.html", "static/*.css", "static/*.js"]
+"eacbp.acceptance" = ["fixtures/*.json"]
+
+[tool.setuptools.data-files]
+"share/eacbp/slurm" = ["slurm/run_eacbp_container.sbatch"]

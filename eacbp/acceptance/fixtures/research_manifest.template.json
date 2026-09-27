@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "study_id": "replace_with_study_id",
+  "dataset_kind": "real",
+  "data_path": "path/to/fixed_dataset.h5ad",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "source": "replace_with_accession_or_full_citation",
+  "source_url": "https://replace-with-accession-or-publication",
+  "license": "replace_with_verified_license",
+  "species": "mus_musculus",
+  "species_metadata_key": null,
+  "counts_layer": "counts",
+  "contrast": {
+    "column": "condition",
+    "tested": "treated",
+    "reference": "control"
+  },
+  "donor": {
+    "column": "donor_id",
+    "biological_unit": "mouse",
+    "paired": true,
+    "minimum_per_condition": 2
+  },
+  "batch_column": "batch",
+  "covariates": ["batch"],
+  "design_formula": null,
+  "statistics": {
+    "alpha": 0.05,
+    "cooks_filter": true,
+    "independent_filter": true,
+    "fit_type": "parametric",
+    "size_factors_fit_type": "ratio",
+    "rtol": 0.000001,
+    "atol": 0.00000001
+  },
+  "resource_limits": {
+    "max_cells": null,
+    "max_genes": null,
+    "max_nonzero_counts": null,
+    "max_input_bytes": null,
+    "max_pseudobulk_working_bytes": 1000000000
+  },
+  "reference_environment": {
+    "python_version": "FILL_ME_IN",
+    "packages": {
+      "pydeseq2": "FILL_ME_IN",
+      "numpy": "FILL_ME_IN",
+      "pandas": "FILL_ME_IN",
+      "scipy": "FILL_ME_IN",
+      "formulaic": "FILL_ME_IN",
+      "anndata": "FILL_ME_IN"
+    },
+    "lockfile_path": "path/to/environment.lock",
+    "lockfile_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

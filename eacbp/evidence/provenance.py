@@ -86,6 +86,7 @@ def normalize_evidence_candidates(
         return []
 
     output_uris = {ArtifactURI.parse(uri).to_string() for uri in result.output_artifacts}
+    inference_id = getattr(result, "inference_contract_id", None)
     seen_ids: set[str] = set()
     admitted = []
     # Reuse metadata across candidates from the same task, including large
@@ -106,6 +107,8 @@ def normalize_evidence_candidates(
             raise ValueError("Evidence IDs must be non-empty and unique within a task")
         if node.source_task_id != contract.task_id:
             raise ValueError("Evidence must cite the current task as source_task_id")
+        if node.inference_contract_id not in (None, inference_id):
+            raise ValueError("Evidence inference contract differs from its audited result")
         sources = tuple(sorted({ArtifactURI.parse(uri).to_string()
                                 for uri in node.source_artifact_uris}))
         if not sources or not set(sources).issubset(output_uris):
@@ -113,6 +116,8 @@ def normalize_evidence_candidates(
         for uri in sources:
             if metadata_lookup(uri).created_by_task != contract.task_id:
                 raise ValueError("Evidence output artifact was created by a different task")
+            if inference_id and metadata_lookup(uri).summary_metrics.get("inference_contract_id") != inference_id:
+                raise ValueError("Evidence artifact inference contract differs from its audited result")
         if node.source_verified:
             raise ValueError("source_verified requires independent source verification; no trusted source receipt is available")
         if sources not in provenance_cache:
@@ -124,6 +129,7 @@ def normalize_evidence_candidates(
         node.is_simulated = bool(node.is_simulated or provenance.is_simulated
                                  or result.metrics.get("is_simulated"))
         node.audit_passed = True
+        node.inference_contract_id = inference_id
         seen_ids.add(node.evidence_id)
         admitted.append(node)
     return admitted

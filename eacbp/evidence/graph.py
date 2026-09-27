@@ -62,6 +62,11 @@ class EvidenceGraph:
             claim.support_evidence_ids.append(evidence_id)
         elif not is_support and evidence_id not in claim.contradiction_evidence_ids:
             claim.contradiction_evidence_ids.append(evidence_id)
+        claim.inference_contract_ids = sorted({
+            self.evidence_nodes[eid].inference_contract_id
+            for eid in claim.support_evidence_ids + claim.contradiction_evidence_ids
+            if eid in self.evidence_nodes and self.evidence_nodes[eid].inference_contract_id
+        })
 
     def get_claim_provenance(self, claim_id: str) -> Dict[str, Any]:
         """Traces a claim back to all supporting and contradicting evidence nodes and their source artifacts."""

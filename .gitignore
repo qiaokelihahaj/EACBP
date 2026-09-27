@@ -62,6 +62,8 @@ temp_tx_*/
 .artifacts/
 .agents/
 .cache/
+.pytest-basetemp-p1-*/
+.p1-wheel-install-smoke/
 
 # Data & outputs (if large or generated)
 data/raw/*

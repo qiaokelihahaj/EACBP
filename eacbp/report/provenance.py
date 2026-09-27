@@ -59,6 +59,7 @@ class SentenceProvenanceTracker:
                 "strength": ev.strength.value,
                 "score": ev.score,
                 "summary": ev.summary,
+                "inference_contract_id": ev.inference_contract_id,
                 "source_task": {
                     "task_id": task.task_id if task else ev.source_task_id,
                     "capability": task.capability if task else "unknown",
@@ -75,5 +76,6 @@ class SentenceProvenanceTracker:
             "causal_status": claim.causal_status,
             "confidence": claim.confidence.model_dump(),
             "evidence_count": len(evidence_chain),
+            "inference_contract_ids": list(claim.inference_contract_ids),
             "evidence_chain": evidence_chain,
         }

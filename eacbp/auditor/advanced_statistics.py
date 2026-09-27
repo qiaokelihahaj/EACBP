@@ -23,6 +23,7 @@ from scipy.stats import norm, t
 from eacbp.auditor.base import BaseAuditor, ValidationReport, ValidationSeverity
 from eacbp.capabilities.advanced_statistics import _coerce_data
 from eacbp.capabilities.sc_data import SCData
+from eacbp.schemas.task import AssumptionStatus, ScientificResultStatus
 
 
 METHODS = {
@@ -594,6 +595,229 @@ def _inference_errors(tables, metrics, params, details, method):
     return errors
 
 
+def _inference_identity_errors(contract, result, registry, details, params, data, method):
+    """Independently bind task, result, and artifact metadata to the resolved contract."""
+    errors: list[str] = []
+    requested = getattr(contract, "inference_contract", None)
+    reported = getattr(result, "inference_contract", None)
+    if requested is None and reported is None and not result.inference_contract_id:
+        # Older task payloads remain readable; they cannot produce a linked
+        # P1 result summary until rerun with the resolved contract.
+        return errors
+    if requested is None or reported is None:
+        return ["task and result must both carry the resolved inference contract"]
+    try:
+        # Revalidation checks that a stored ID still fingerprints the content.
+        type(reported).model_validate(reported.model_dump(mode="json"))
+    except Exception as exc:
+        errors.append(f"reported inference contract fingerprint is invalid: {exc}")
+    if requested.contract_id != reported.contract_id:
+        errors.append("TaskResult inference contract differs from the resolved TaskContract")
+    if result.inference_contract_id != reported.contract_id:
+        errors.append("TaskResult inference_contract_id does not match inference_contract")
+    if result.metrics.get("inference_contract_id") != reported.contract_id:
+        errors.append("result metrics lack the matching inference_contract_id")
+
+    if details is not None:
+        if reported.input_artifact_uris != list(contract.input_artifacts):
+            errors.append("inference contract input artifacts differ from the task inputs")
+        if reported.independent_unit != "donor" or reported.observation_unit != "cell":
+            errors.append("inference contract does not identify donor and cell units")
+        if reported.paired != details.paired:
+            errors.append("inference contract pairing differs from reconstructed metadata")
+        if reported.design_formula != details.formula:
+            errors.append("inference contract design differs from reconstructed metadata")
+        expected_alpha = float(params.get("alpha", 0.05))
+        if not np.isclose(reported.alpha, expected_alpha, rtol=0, atol=1e-12):
+            errors.append("inference contract alpha differs from the task parameters")
+        if not np.isclose(reported.confidence_level, 1 - expected_alpha, rtol=0, atol=1e-12):
+            errors.append("inference contract confidence level differs from alpha")
+        if reported.fdr_method != "benjamini_hochberg":
+            errors.append("inference contract FDR method differs from the executed method")
+        if not reported.fdr_family:
+            errors.append("inference contract lacks an FDR family")
+        target_cell_type = params.get("target_cell_type")
+        if target_cell_type is not None and reported.target_cell_type != str(target_cell_type):
+            errors.append("inference contract target cell type differs from task parameters")
+        expected_counts_source = (
+            f"layers.{params.get('counts_layer', params.get('raw_counts_layer', 'counts'))}"
+            if params.get("counts_layer", params.get("raw_counts_layer", "counts")) in (getattr(data, "layers", {}) or {})
+            else "X_explicitly_declared_raw_counts" if bool(params.get("allow_x_as_counts", False))
+            else f"missing:layers.{params.get('counts_layer', params.get('raw_counts_layer', 'counts'))}"
+        )
+        if reported.counts_source != expected_counts_source:
+            errors.append("inference contract counts source differs from the input artifact")
+
+        population = str(
+            params.get("target_population")
+            or target_cell_type
+            or f"all observations in {contract.input_artifacts[0]}"
+        )
+        if reported.target_population != population:
+            errors.append("inference contract target population differs from the task inputs")
+        expected_question = str(
+            params.get("scientific_question")
+            or params.get("question")
+            or f"{reported.contrast_spec.effect_definition} in {population}"
+        )
+        if reported.scientific_question != expected_question:
+            errors.append("inference contract scientific question differs from the request")
+        expected_family = str(
+            params.get("fdr_family")
+            or f"{contract.capability}:{target_cell_type or 'all_observations'}:{reported.contrast_spec.label}"
+        )
+        if reported.fdr_family != expected_family:
+            errors.append("inference contract FDR family differs from the task scope")
+        expected_sensitivity = params.get("sensitivity_plan", [])
+        expected_sensitivity = [expected_sensitivity] if isinstance(expected_sensitivity, str) else [str(v) for v in (expected_sensitivity or [])]
+        if method == "pydeseq2_leave_one_donor_out_v1" and "leave_one_donor_out" not in expected_sensitivity:
+            expected_sensitivity.append("leave_one_donor_out")
+        if reported.sensitivity_plan != expected_sensitivity:
+            errors.append("inference contract sensitivity plan differs from task parameters")
+        if method == "decoupler_ulm_v2":
+            expected_features = f"eligible prior-network sources overlapping {len(details.genes)} input genes"
+        elif method == "pydeseq2_leave_one_donor_out_v1":
+            expected_features = f"all {len(details.genes)} input genes under complete-donor refits"
+        else:
+            expected_features = f"all {len(details.genes)} input genes"
+        if reported.feature_scope != expected_features:
+            errors.append("inference contract feature scope differs from the input feature universe")
+    if not reported.estimand or not reported.scientific_question or not reported.feature_scope:
+        errors.append("inference contract lacks its question, estimand, or feature scope")
+    if reported.estimand != reported.contrast_spec.effect_definition:
+        errors.append("inference contract estimand differs from its contrast effect definition")
+
+    spec = reported.contrast_spec.as_dict()
+    reported_spec = result.metrics.get("contrast_spec", {})
+    for key in ("kind", "factor", "tested_level", "reference_level", "label", "effect_definition"):
+        if spec.get(key) != reported_spec.get(key):
+            errors.append(f"inference contract contrast {key} differs from result metrics")
+    if method == "decoupler_ulm_v2":
+        expected_vector = ["condition", spec.get("tested_level"), spec.get("reference_level")]
+    else:
+        expected_vector = reported_spec.get("vector")
+    if spec.get("vector") != expected_vector:
+        errors.append("inference contract contrast vector differs from reconstructed result semantics")
+
+    if registry is not None:
+        for uri in result.output_artifacts:
+            try:
+                metadata = registry.get_metadata(uri)
+                if metadata.summary_metrics.get("inference_contract_id") != reported.contract_id:
+                    errors.append(f"artifact {uri} lacks the matching inference_contract_id")
+                if metadata.parameters.get("inference_contract_id") != reported.contract_id:
+                    errors.append(f"artifact {uri} parameters lack the matching inference_contract_id")
+                if metadata.parameters.get("inference_contract") != reported.model_dump(mode="json"):
+                    errors.append(f"artifact {uri} does not preserve the resolved inference contract")
+            except Exception as exc:
+                errors.append(f"artifact inference contract provenance check failed for {uri}: {exc}")
+    return errors
+
+
+def _scientific_result_errors(result, tables, params, method, details):
+    """Recount tested and supported features from output rows instead of reported metrics."""
+    reported = getattr(result, "scientific_result", None)
+    if reported is None:
+        return [] if getattr(result, "inference_contract", None) is None else ["TaskResult lacks a typed ScientificResult"]
+    if getattr(result, "inference_contract", None) is None:
+        return ["ScientificResult is not linked to an inference contract"]
+    if not tables:
+        return ["ScientificResult cannot be audited because result tables are absent"]
+    table = tables[0]
+    if method == "pydeseq2_leave_one_donor_out_v1" and "left_out_donor" in table:
+        table = table.loc[table["left_out_donor"].astype(str) == "__full_model__"]
+    if "p_value" in table:
+        p_values = pd.to_numeric(table["p_value"], errors="coerce").to_numpy(dtype=float)
+        tested_mask = np.isfinite(p_values)
+        tested = int(tested_mask.sum())
+    elif "fdr_q_value" in table:
+        q_values = pd.to_numeric(table["fdr_q_value"], errors="coerce").to_numpy(dtype=float)
+        tested_mask = np.isfinite(q_values)
+        tested = int(tested_mask.sum())
+    else:
+        tested_mask = np.zeros(len(table), dtype=bool)
+        tested = 0
+    q_values = (
+        pd.to_numeric(table["fdr_q_value"], errors="coerce").to_numpy(dtype=float)
+        if "fdr_q_value" in table else np.full(len(table), np.nan)
+    )
+    alpha = float(params.get("alpha", 0.05))
+    if "significant_at_alpha" in table:
+        supported = int((table["significant_at_alpha"].fillna(False).astype(bool).to_numpy() & tested_mask).sum())
+    elif "fdr_q_value" in table:
+        supported = int((np.isfinite(q_values) & (q_values < alpha)).sum())
+    else:
+        supported = 0
+    assessment_names = [item.name for item in reported.assumptions]
+    errors = []
+    required_names = {"donor_independence", "raw_integer_counts", "design_full_rank"}
+    if len(assessment_names) != len(set(assessment_names)):
+        errors.append("ScientificResult assumption names must be unique")
+    assessments = {item.name: item for item in reported.assumptions}
+    missing = required_names - set(assessments)
+    if missing:
+        errors.append(f"ScientificResult lacks required assumption assessments: {sorted(missing)}")
+        return errors
+    if assessments["donor_independence"].status != AssumptionStatus.UNKNOWN:
+        errors.append("donor independence must remain unknown; design rank does not establish it")
+    if details is None:
+        errors.append("ScientificResult assumptions cannot be independently verified because input reconstruction failed")
+    else:
+        count_assessment = assessments["raw_integer_counts"]
+        if count_assessment.status != AssumptionStatus.PASSED:
+            errors.append("valid reconstructed raw counts must be assessed as passed")
+        if count_assessment.evidence.get("counts_source") != result.inference_contract.counts_source:
+            errors.append("raw integer-count assessment evidence differs from the input counts source")
+    skipped = bool(result.metrics.get("skipped")) or (
+        "status" in tables[0] and tables[0]["status"].astype(str).eq("skipped").all()
+    )
+    rank_assessment = assessments["design_full_rank"]
+    if details is not None and not skipped:
+        if rank_assessment.status != AssumptionStatus.PASSED:
+            errors.append("an estimated result must assess its independently reconstructed full-rank design as passed")
+        if rank_assessment.evidence.get("design_rank") != details.design_rank:
+            errors.append("full-rank assessment evidence differs from the reconstructed design rank")
+    elif rank_assessment.status == AssumptionStatus.PASSED:
+        errors.append("design rank cannot be marked passed when the requested model was not fitted")
+    # Successful output cannot use a producer-supplied failed flag as its own
+    # audit justification; input, count, and rank failures are checked above.
+    if any(item.status == AssumptionStatus.FAILED for item in reported.assumptions):
+        errors.append("a successful statistical result cannot self-certify a failed assumption")
+    if skipped or tested == 0:
+        expected_status = ScientificResultStatus.NOT_ESTIMABLE
+        reason = str(result.metrics.get("skip_reason") or "No finite feature-level test statistics were produced.")
+        expected_summary = f"The requested estimand was not estimable. {reason}"
+    elif supported:
+        expected_status = ScientificResultStatus.ESTIMATED_SUPPORTED
+        estimand = result.inference_contract.estimand
+        expected_summary = (
+            f"{supported} of {tested} tested features met the prespecified Benjamini-Hochberg "
+            f"q < {alpha:g} rule for {estimand}."
+        )
+    else:
+        expected_status = ScientificResultStatus.ESTIMATED_INCONCLUSIVE
+        estimand = result.inference_contract.estimand
+        expected_summary = (
+            f"Estimates were produced for {tested} tested features for {estimand}, "
+            f"but none met the prespecified Benjamini-Hochberg q < {alpha:g} rule. "
+            "This does not establish equivalence or absence of an effect."
+        )
+    if reported.n_features_tested != tested:
+        errors.append("ScientificResult n_features_tested differs from finite result-table p-values")
+    if reported.n_features_supported != supported:
+        errors.append("ScientificResult n_features_supported differs from the result-table FDR decisions")
+    if reported.status != expected_status:
+        errors.append("ScientificResult status differs from audited estimates and assumptions")
+    if reported.summary != expected_summary:
+        errors.append("ScientificResult summary differs from audited estimates and assumptions")
+    metrics = result.metrics
+    for key, expected in (("n_features_tested", tested), ("n_features_supported", supported),
+                          ("scientific_result_status", expected_status.value)):
+        if metrics.get(key) != expected:
+            errors.append(f"result metric {key} differs from the audited ScientificResult")
+    return errors
+
+
 def _check_summary_against_fits(summary: pd.DataFrame, primary: pd.DataFrame, details: _AuditInput, alpha: float = 0.05) -> list[str]:
     errors: list[str] = []
     required = {
@@ -680,6 +904,7 @@ class AdvancedStatisticsValidator(BaseAuditor):
             return report
         details: Optional[_AuditInput] = None
         tables: list[pd.DataFrame] = []
+        data: Optional[SCData] = None
 
         try:
             _, payload = registry.get(contract.input_artifacts[0])
@@ -700,6 +925,16 @@ class AdvancedStatisticsValidator(BaseAuditor):
                 tables.append(payload if isinstance(payload, pd.DataFrame) else pd.DataFrame(payload))
         except Exception as exc:
             errors.append(f"result table retrieval failed: {type(exc).__name__}: {exc}")
+
+        contract_errors = _inference_identity_errors(contract, result, registry, details, params, data, method)
+        result_errors_from_scientific = _scientific_result_errors(result, tables, params, method, details)
+        report.add_check(
+            "advanced_statistics_inference_contract",
+            not contract_errors,
+            ValidationSeverity.ERROR,
+            "; ".join(dict.fromkeys(contract_errors)) if contract_errors else "Task, result, contrast, FDR family, and artifact provenance carry one resolved inference contract.",
+        )
+        errors.extend(contract_errors)
 
         input_errors = [e for e in errors if e.startswith("input reconstruction") or "fewer than" in e]
         report.add_check(
@@ -772,7 +1007,7 @@ class AdvancedStatisticsValidator(BaseAuditor):
         )
         errors.extend(resource_errors)
 
-        result_errors: list[str] = []
+        result_errors: list[str] = list(result_errors_from_scientific)
         if details is not None:
             result_errors.extend(_inference_errors(tables, result.metrics, params, details, method))
         for table in tables:

@@ -37,6 +37,7 @@ def extract_evidence(contract, result, report, registry):
     outputs = [registry.get(uri) for uri in uris]
     cap = contract.capability
     metrics = result.metrics
+    inference_id = getattr(result, "inference_contract_id", None)
     evidence = []
 
     # Follow every parent, rather than just a shortest lineage path. Different
@@ -83,6 +84,7 @@ def extract_evidence(contract, result, report, registry):
             biological_context=context or {}, score=max(0, min(1, score)),
             strength=strength,
             source_task_id=contract.task_id, source_artifact_uris=uris,
+            inference_contract_id=inference_id,
             audit_passed=True, is_simulated=simulated,
             data_origin_uris=sorted(roots),
         ))
@@ -103,6 +105,20 @@ def extract_evidence(contract, result, report, registry):
         return evidence
 
     table = next((p for _, p in outputs if isinstance(p, pd.DataFrame)), None)
+    scientific_result = getattr(result, "scientific_result", None)
+    if inference_id and scientific_result is not None and cap in {"deg", "functional_activity"}:
+        scientific_status = getattr(scientific_result.status, "value", scientific_result.status)
+        if scientific_status in {"estimated_supported", "estimated_inconclusive", "not_estimable"}:
+            add(
+                EvidenceType.STATISTICAL_RESULT,
+                scientific_result.summary,
+                {"scientific_status": scientific_status,
+                 "n_features_tested": scientific_result.n_features_tested,
+                 "n_features_supported": scientific_result.n_features_supported,
+                 "alpha": metrics.get("alpha", contract.parameters.get("alpha", 0.05))},
+                score=0, suffix="result_summary", polarity=EvidencePolarity.NEUTRAL,
+                strength=EvidenceStrength.INSUFFICIENT,
+            )
     if cap == "liana_communication":
         add(EvidenceType.CELL_COMMUNICATION,
             f"LIANA inferred {metrics.get('n_unique_interactions', 0)} ligand–receptor interactions across {len(metrics.get('donor_condition_groups', []))} donor-condition groups. Ranks are not FDR; inferred communication does not establish signaling or causality.",

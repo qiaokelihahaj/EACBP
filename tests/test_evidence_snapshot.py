@@ -129,6 +129,19 @@ def test_snapshot_roundtrip_rebuilds_graph_and_report_without_execution(tmp_path
     assert "Observed quality metrics" in first
 
 
+@pytest.mark.parametrize("target_node", ["evidence", "claim"])
+def test_snapshot_rejects_inference_identity_not_owned_by_source(tmp_path, target_node):
+    registry, manifest, result, report, graph = _fixture(tmp_path)
+    if target_node == "evidence":
+        graph.evidence_nodes["E1"].inference_contract_id = "foreign"
+    else:
+        graph.claim_nodes["C1"].inference_contract_ids = ["foreign"]
+    with pytest.raises(SnapshotValidationError, match="inference contract"):
+        write_study_snapshot(tmp_path / "invalid.snapshot.json", manifest=manifest,
+            config={}, summary={"status": "success"}, evidence_graph=graph,
+            artifact_registry=registry, task_history=[result], audit_reports=[report])
+
+
 def test_snapshot_rejects_payload_tampering_and_missing_files(tmp_path):
     target, registry, _, _, _, _ = _write(tmp_path)
     metadata = registry.get_metadata("json://snap/result/v1")
