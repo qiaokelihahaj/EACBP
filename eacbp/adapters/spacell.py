@@ -7,7 +7,6 @@ from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
-from scipy.spatial import cKDTree
 from scipy import sparse
 
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
@@ -16,6 +15,11 @@ from eacbp.capabilities.sc_data import SCData
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
 from eacbp.adapters.base import BaseAgentAdapter
+from eacbp.capabilities.spatial.domain import (
+    build_spatial_knn_indices,
+    extract_spatial_coordinates,
+    resolve_spatial_sections,
+)
 
 
 def _kmeans_clustering(
@@ -90,25 +94,8 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
         )
 
     def _extract_spatial_coordinates(self, data: SCData) -> np.ndarray:
-        """Extracts (N, 2) or (N, 3) spatial coordinates from SCData or generates deterministic layout."""
-        if "spatial" in data.obsm and isinstance(data.obsm["spatial"], np.ndarray):
-            coords = data.obsm["spatial"]
-            if coords.shape[0] == data.n_obs and coords.shape[1] >= 2:
-                return np.asarray(coords[:, :2], dtype=np.float32)
-
-        # Check obs columns
-        for x_col, y_col in [("x_coord", "y_coord"), ("spatial_x", "spatial_y"), ("x", "y"), ("X", "Y")]:
-            if x_col in data.obs.columns and y_col in data.obs.columns:
-                x = data.obs[x_col].to_numpy(dtype=np.float32)
-                y = data.obs[y_col].to_numpy(dtype=np.float32)
-                return np.column_stack([x, y])
-
-        # Fallback: deterministic spatial grid layout based on cell index and conditions
-        n = data.n_obs
-        side = int(np.ceil(np.sqrt(n)))
-        grid_x, grid_y = np.meshgrid(np.arange(side), np.arange(side))
-        coords = np.column_stack([grid_x.flatten()[:n], grid_y.flatten()[:n]]).astype(np.float32)
-        return coords
+        """Extract validated measured 2D/3D coordinates without inventing a layout."""
+        return extract_spatial_coordinates(data)
 
     def _execute_agent(
         self,
@@ -138,8 +125,10 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
         if n_cells < 2 or not np.isfinite(coords).all():
             raise ValueError("Spatial neighborhoods require at least two cells with finite coordinates.")
         k_neighbors = min(max(1, k_neighbors), n_cells - 1)
-        _, candidate_indices = cKDTree(coords).query(coords, k=k_neighbors + 1)
-        knn_indices = np.array([row[row != i][:k_neighbors] for i, row in enumerate(candidate_indices)])
+        sections, section_receipt = resolve_spatial_sections(data, contract.parameters)
+        knn_indices, _ = build_spatial_knn_indices(coords, k_neighbors=k_neighbors, section_labels=sections)
+        if not any(len(indices) for indices in knn_indices):
+            raise ValueError("No within-section spatial neighbors are available.")
 
         # 3. Determine cell type labels for microenvironment composition
         if "cell_type" in data.obs.columns:
@@ -161,7 +150,7 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
             nbr_indices = knn_indices[i]
             nbr_types = cell_type_series.iloc[nbr_indices]
             for ct in nbr_types:
-                neighborhood_composition[i, ct_to_idx[ct]] += 1.0 / k_neighbors
+                neighborhood_composition[i, ct_to_idx[ct]] += 1.0 / len(nbr_indices)
 
         # 4. Spatial Niche / Domain Identification (K-Means on neighborhood composition)
         n_domains = min(n_domains, n_cells)
@@ -180,14 +169,18 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
                 tgt_ct = ct_to_idx[cell_type_series.iloc[nbr_idx]]
                 observed_contacts[src_ct, tgt_ct] += 1.0
 
-        # Calculate expected contact rates under random spatial mixing
-        type_counts = cell_type_series.value_counts()
+        # Descriptive expected contacts under label mixing within each section.
         expected_contacts = np.zeros((n_types, n_types), dtype=np.float32)
-        for i, ct_a in enumerate(unique_cell_types):
-            count_a = type_counts.get(ct_a, 0)
-            for j, ct_b in enumerate(unique_cell_types):
-                count_b = type_counts.get(ct_b, 0)
-                expected_contacts[i, j] = (count_a * count_b * k_neighbors) / max(n_cells, 1)
+        for section in np.unique(sections):
+            positions = np.flatnonzero(sections == section)
+            if len(positions) < 2:
+                continue
+            counts = cell_type_series.iloc[positions].value_counts()
+            section_k = min(k_neighbors, len(positions) - 1)
+            for i, ct_a in enumerate(unique_cell_types):
+                for j, ct_b in enumerate(unique_cell_types):
+                    eligible_receivers = counts.get(ct_b, 0) - int(ct_a == ct_b)
+                    expected_contacts[i, j] += counts.get(ct_a, 0) * max(0, eligible_receivers) * section_k / (len(positions) - 1)
 
         # Interaction enrichment ratio
         contact_enrichment = (observed_contacts + 1.0) / (expected_contacts + 1.0)
@@ -195,8 +188,8 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
         # 6. Global Moran's I spatial autocorrelation for top marker genes
         moran_results = {}
         # Construct symmetric spatial weight matrix W
-        rows = np.repeat(np.arange(n_cells), k_neighbors)
-        W = sparse.csr_matrix((np.ones(rows.size), (rows, knn_indices.ravel())), shape=(n_cells, n_cells))
+        rows = np.repeat(np.arange(n_cells), [len(indices) for indices in knn_indices])
+        W = sparse.csr_matrix((np.ones(rows.size), (rows, np.concatenate(knn_indices))), shape=(n_cells, n_cells))
         W = W.maximum(W.T)
         W_sum = W.sum()
 
@@ -206,8 +199,10 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
                 gene_name = data.var["gene_name"].iloc[g_idx] if "gene_name" in data.var.columns else f"Gene_{g_idx}"
                 x = data.X[:, g_idx]
                 x = x.toarray().ravel() if sparse.issparse(x) else np.asarray(x).ravel()
-                x_mean = np.mean(x)
-                x_diff = x - x_mean
+                x_diff = np.asarray(x, dtype=float).copy()
+                for section in np.unique(sections):
+                    positions = np.flatnonzero(sections == section)
+                    x_diff[positions] -= np.mean(x[positions])
                 denom = np.sum(x_diff ** 2)
                 if denom > 1e-8:
                     num = float(x_diff @ (W @ x_diff))
@@ -220,10 +215,13 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
         out_data.obs["spacell_niche"] = domain_labels
         out_data.obsm["spatial"] = coords
         out_data.obsm["neighborhood_composition"] = neighborhood_composition
+        out_data.obsp["spatial_connectivities"] = W
         out_data.uns["spacell_spatial_metrics"] = {
             "k_neighbors": k_neighbors,
             "n_domains": n_domains,
             "morans_i": moran_results,
+            **section_receipt,
+            "inference_scope": "within_section_descriptive_colocalization",
         }
 
         # 8. Create summary metrics Table
@@ -276,6 +274,7 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
                 "n_cells": n_cells,
                 "n_domains": n_domains,
                 "k_neighbors": k_neighbors,
+                **section_receipt,
             },
         )
 
@@ -314,10 +313,13 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
             "cell_types_evaluated": unique_cell_types,
             "niche_profiles": niche_summary_rows,
             "morans_i_spatial_autocorrelation": moran_results,
+            **section_receipt,
+            "inference_scope": "within_section_descriptive_colocalization",
             "biological_reasoning": (
                 f"SpaCell identified {n_domains} distinct spatial microenvironments across {n_cells} cells. "
                 f"Microenvironment composition reveals spatial colocalization and contact enrichment between "
-                f"reactive cell populations."
+                f"observed cell populations within sections. These descriptive contacts do not establish "
+                f"communication or inference across biological donors."
             ),
         }
         self._register_versioned_artifact(
@@ -354,6 +356,8 @@ class SpaCellAgentAdapter(BaseAgentAdapter):
                 "n_domains": n_domains,
                 "k_neighbors": k_neighbors,
                 "mean_contact_enrichment": float(contact_enrichment.mean()),
+                **section_receipt,
+                "inference_scope": "within_section_descriptive_colocalization",
             },
             logs=f"SpaCell successfully analyzed spatial domains and neighborhood microenvironments for {n_cells} cells.",
         )

@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
 
-from eacbp.schemas.task import TaskContract, TaskResult
+from eacbp.schemas.task import TaskContract, TaskResult, ScientificResultStatus
 from eacbp.schemas.artifact import ArtifactType
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.capabilities.sc_data import SCData
@@ -41,6 +41,52 @@ class StatisticalValidator(BaseAuditor):
 
         meta, payload = registry.get(target_uri)
         cap_name = contract.capability
+
+        # Recount baseline scientific completion from persisted rows, never
+        # from the executor's counts/status. Old receipts without this new
+        # summary stay readable; they cannot satisfy typed completion checks.
+        baseline_methods = {"donor_pseudobulk_welch_v1", "single_cell_descriptive_v1", "state_abundance_donor_welch_v1"}
+        if (cap_name in {"deg", "differential_abundance"} and result.method_used in baseline_methods
+                and (meta.summary_metrics.get("scientific_result_schema_version") == 1 or result.scientific_result is not None)):
+            table = payload if isinstance(payload, pd.DataFrame) else pd.DataFrame(payload)
+            tested, supported, valid_table = 0, 0, False
+            try:
+                descriptive = result.method_used == "single_cell_descriptive_v1"
+                p = pd.to_numeric(table["p_value"], errors="raise")
+                q = pd.to_numeric(table["fdr_q_value"], errors="raise")
+                unit = "single_cell_exploratory" if descriptive else "donor_pseudobulk" if cap_name == "deg" else "donor_proportion"
+                valid_table = bool(table["statistical_unit"].eq(unit).all())
+                if descriptive:
+                    valid_table = valid_table and bool(p.isna().all() and q.isna().all()
+                        and table["status"].eq("not_estimated").all())
+                else:
+                    valid_table = valid_table and bool(p.between(0, 1).all() and q.between(0, 1).all())
+                    effect = pd.to_numeric(table["log2_fold_change" if cap_name == "deg" else "log2_ratio_condition_a_vs_b"], errors="raise")
+                    valid_table = valid_table and bool(np.isfinite(effect).all())
+                    if len(table) and valid_table:
+                        # Reconstruct BH here independently of executor helpers,
+                        # without requiring a newer optional SciPy API.
+                        probabilities = p.to_numpy()
+                        order = np.argsort(probabilities, kind="mergesort")
+                        adjusted = probabilities[order] * len(table) / np.arange(1, len(table) + 1)
+                        expected_q = np.empty(len(table), dtype=float)
+                        expected_q[order] = np.clip(np.minimum.accumulate(adjusted[::-1])[::-1], 0, 1)
+                        valid_table = bool(np.allclose(q, expected_q, atol=1e-6))
+                    tested = len(table)
+                    supported = int(((q < 0.05) & (effect.abs() > 0.5)).sum()) if cap_name == "deg" else int((q < 0.05).sum())
+            except (KeyError, TypeError, ValueError):
+                valid_table = False
+            expected_status = (ScientificResultStatus.ESTIMATED_SUPPORTED if supported else
+                               ScientificResultStatus.ESTIMATED_INCONCLUSIVE if tested else ScientificResultStatus.NOT_ESTIMABLE)
+            science = result.scientific_result
+            report.add_check(
+                name="baseline_scientific_result", severity=ValidationSeverity.ERROR,
+                passed=bool(valid_table and science is not None and science.status == expected_status
+                            and science.n_features_tested == tested and science.n_features_supported == supported),
+                message="Recounted baseline scientific status and tested/supported features from persisted statistical rows.",
+                metrics={"expected_status": expected_status.value, "n_features_tested": tested,
+                         "n_features_supported": supported, "valid_table": valid_table},
+            )
 
         # =====================================================================
         # 1. Pseudoreplication & DEG Degrees of Freedom Audit
@@ -89,10 +135,18 @@ class StatisticalValidator(BaseAuditor):
                     severity=ValidationSeverity.ERROR, message="FDR values must be finite and in [0, 1].")
 
         # =====================================================================
-        # 2. Clustering Stability Audit
+        # 2. Clustering separation description (not a stability experiment)
         # =====================================================================
         elif cap_name == "clustering" and meta.type == ArtifactType.ANNDATA:
-            sil_score = meta.summary_metrics.get("silhouette_score", 0.0)
+            sil_score = meta.summary_metrics.get("silhouette_score")
+            if sil_score is None:
+                report.add_check(
+                    name="clustering_separation_silhouette", passed=False,
+                    severity=ValidationSeverity.WARNING,
+                    message="Silhouette was not calculated; no separation or stability estimate is available from this check.",
+                    metrics={"silhouette_score": None, "evaluated": False},
+                )
+                return report
             passed_sil = sil_score >= 0.10
             report.add_check(
                 name="clustering_separation_silhouette",
@@ -185,7 +239,7 @@ class StatisticalValidator(BaseAuditor):
         elif cap_name in ("genetic_perturbation_simulation", "genetic_perturbation", "compound_perturbation_simulation", "compound_perturbation"):
             # Check expression non-negativity for AnnData output
             if meta.type == ArtifactType.ANNDATA:
-                data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+                data = SCData.from_payload(payload)
                 if hasattr(data.X, "tocsr"):
                     x_min = float(np.min(data.X.data)) if len(data.X.data) > 0 else 0.0
                 else:

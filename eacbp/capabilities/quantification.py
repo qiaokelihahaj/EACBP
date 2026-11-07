@@ -363,7 +363,19 @@ class FASTQQuantificationCapability(BaseCapability):
             "data_origin": data_origin,
         }
         if extra:
-            provenance.update(extra)
+            for key, value in extra.items():
+                if key in {"input_file_hashes", "reference_hashes"} and isinstance(value, Mapping):
+                    # HDF5 treats slashes in mapping keys as group paths. Keep
+                    # full source paths as string values under safe stable keys
+                    # so AnnData can round-trip the provenance unchanged.
+                    provenance[key] = {
+                        f"file_{index:04d}": {"path": str(path), "sha256": str(digest)}
+                        for index, (path, digest) in enumerate(
+                            sorted(value.items(), key=lambda item: str(item[0]))
+                        )
+                    }
+                else:
+                    provenance[key] = value
         sc_data.uns["quantification_provenance"] = provenance
         sc_data.uns["is_simulated"] = bool(is_simulated)
         sc_data.uns["data_origin"] = data_origin

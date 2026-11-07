@@ -337,6 +337,8 @@ def _update_run_config(run_dir: Path, **updates: Any) -> dict[str, Any]:
     _write_json(path, payload)
     if "source" in updates and updates["source"] is not None:
         _write_json(run_dir / "source.json", updates["source"])
+    if "config" in updates:
+        _write_json(run_dir / "config.json", updates["config"])
     return payload
 
 
@@ -385,6 +387,148 @@ def _record_failure(run_dir: Path, exc: BaseException, *, source: Mapping[str, A
     return failure
 
 
+def _autonomous_request_summary(summary, *, manifest, config, orchestrator):
+    """Certify requested coverage from executed results and durable admission.
+
+    Pipeline success alone can include omitted or blocked scientific branches.
+    Requested coverage is persisted before snapshots so fresh runs, resume and
+    portable reports share the same completion claim.
+    """
+    request = config.get("autonomous_analysis") or config.get("analysis_request")
+    if request is None:
+        return summary
+    from eacbp.schemas.audit import stable_fingerprint
+    from eacbp.schemas.task import TaskStatus, ScientificResultStatus
+
+    records = orchestrator.artifact_registry.list_audit_records(status="passed")
+    reports = {report.target_task_id: report for report in orchestrator.audit_reports}
+    admitted = []
+    for result in orchestrator.task_history:
+        report = reports.get(result.task_id)
+        if result.status != TaskStatus.SUCCESS or report is None or not report.overall_passed or report.stop_rule_triggered:
+            continue
+        if request.get("requirement_contract") is None and result.capability in {"deg", "donor_sensitivity"}:
+            scientific = result.scientific_result
+            if scientific is None or scientific.status in {ScientificResultStatus.NOT_ESTIMABLE, ScientificResultStatus.ASSUMPTIONS_FAILED}:
+                continue
+        if request.get("requirement_contract") is None and result.capability == "donor_sensitivity" and (result.metrics.get("skipped") or result.metrics.get("all_requested_fits_completed") is not True):
+            continue
+        for record in records:
+            contract = record.contract
+            if record.task_id != result.task_id or stable_fingerprint(contract) != record.contract_fingerprint:
+                continue
+            if request.get("requirement_contract") is not None:
+                from eacbp.artifact.registry import ArtifactRegistry
+
+                payload = ArtifactRegistry._result_payload(result)
+                if (record.input_artifacts != result.input_artifacts
+                        or record.result_fingerprint != ArtifactRegistry._result_identity(payload)):
+                    continue
+                commit = orchestrator.artifact_registry.get_task_commit(record.signature)
+                if (commit is None or commit.get("output_hashes") != record.artifact_hashes
+                        or not isinstance(commit.get("result"), Mapping)):
+                    continue
+                committed = deepcopy(commit["result"])
+                if result.capability == "dataset_audit":
+                    # Dataset audit alone acquires deterministic planning
+                    # decisions after publication of its compute receipt.
+                    payload.get("metrics", {}).pop("planning_decisions", None)
+                    committed.get("metrics", {}).pop("planning_decisions", None)
+                if stable_fingerprint(payload) != stable_fingerprint(committed):
+                    continue
+            recorded_method = contract.get("method")
+            if not recorded_method:
+                continue
+            if recorded_method != result.method_used:
+                try:
+                    # Contracts may retain a registered request alias while
+                    # results truthfully report the canonical implementation.
+                    recorded_method = orchestrator.capability_registry.get(result.capability, recorded_method).implementation_id
+                except (AttributeError, KeyError, ValueError):
+                    continue
+            if (record.task_id == result.task_id and record.overall_passed and not record.stop_rule_triggered
+                    and contract.get("capability") == result.capability and recorded_method == result.method_used
+                    and record.output_artifacts and set(record.output_artifacts) == set(result.output_artifacts)):
+                admitted.append((result, contract))
+                break
+
+    requirement_contract = request.get("requirement_contract")
+    if requirement_contract is not None:
+        from eacbp.application.analysis_requirements import evaluate_requirement_coverage
+
+        if (not isinstance(requirement_contract, Mapping)
+                or requirement_contract.get("question") != request.get("question")
+                or requirement_contract.get("source_sha256") != request.get("source_sha256")):
+            raise ValueError("Scientific requirement contract differs from the saved question or source")
+        capabilities = getattr(orchestrator, "capability_registry", None)
+        available = capabilities.list_capabilities() if capabilities is not None else None
+        coverage = evaluate_requirement_coverage(
+            requirement_contract, admitted, task_history=orchestrator.task_history,
+            pipeline_status=summary.get("status"), available_capabilities=available,
+        )
+        gaps = list(dict.fromkeys([*request.get("scientific_gaps", []), *coverage["scientific_gaps"]]))
+        summary.update(coverage)
+        summary.update(
+            analysis_request_status="complete" if summary.get("status") == "success" and not gaps else "partial",
+            scientific_gaps=gaps,
+            analysis_completion_checks=deepcopy(coverage["requirement_completion_checks"]),
+            autonomy_kind=request.get("autonomy_kind", "deterministic_rule_driven"),
+            policy_version=request.get("policy_version"), scientific_question=request.get("question"),
+            analysis_limitations=list(request.get("limitations", [])),
+            autonomous_decisions=deepcopy(request.get("decisions", [])),
+        )
+        return summary
+
+    # A historical run without the frozen contract retains its original scope.
+    # Re-parsing the question here would silently change saved scientific work.
+    required = [(capability, None) for capability in ("dataset_audit", "qc", "normalization", "integration", "clustering")]
+    for capability in ("cluster_markers", "rna_velocity"):
+        if config.get("analysis_extensions", {}).get(capability) not in (None, False):
+            required.append((capability, None))
+    targets = list(manifest.biological_design.target_cell_types)
+    if request.get("intent") == "condition_comparison":
+        for target in targets:
+            required.extend((capability, target) for capability in ("subset_cells", "deg", "donor_sensitivity"))
+
+    population_outputs = {}
+    for result, contract in admitted:
+        if result.capability == "subset_cells":
+            target = contract.get("parameters", {}).get("cell_type") or result.metrics.get("subset_cell_type")
+            population_outputs.setdefault(target, set()).update(result.output_artifacts)
+    checks = []
+    gaps = list(request.get("scientific_gaps", []))
+    if request.get("intent") == "condition_comparison" and not targets:
+        gaps.append("The requested population comparison has no qualified target population")
+    for capability, target in required:
+        matches = []
+        for result, contract in admitted:
+            if result.capability != capability:
+                continue
+            if target is not None:
+                params = contract.get("parameters", {})
+                declared = params.get("target_cell_type") or result.metrics.get("target_cell_type")
+                if capability == "subset_cells":
+                    declared = params.get("cell_type") or result.metrics.get("subset_cell_type")
+                if declared is not None and declared != target:
+                    continue
+                if capability in {"deg", "donor_sensitivity"} and not population_outputs.get(target, set()).intersection(result.input_artifacts):
+                    continue
+            matches.append(result.task_id)
+        checks.append({"capability": capability, "target_cell_type": target,
+                       "status": "passed" if matches else "missing_or_unadmitted", "task_ids": sorted(matches)})
+        if not matches:
+            scope = f" for population {target!r}" if target is not None else ""
+            gaps.append(f"Requested {capability}{scope} did not produce a successful, estimable, independently admitted result")
+    summary.update(
+        analysis_request_status="complete" if summary.get("status") == "success" and not gaps else "partial",
+        autonomy_kind=request.get("autonomy_kind", "deterministic_rule_driven"),
+        policy_version=request.get("policy_version"), scientific_question=request.get("question"),
+        scientific_gaps=gaps, analysis_limitations=list(request.get("limitations", [])),
+        autonomous_decisions=deepcopy(request.get("decisions", [])), analysis_completion_checks=checks,
+    )
+    return summary
+
+
 def _execute_run(
     *,
     run_dir: Path,
@@ -397,6 +541,22 @@ def _execute_run(
 ) -> tuple[dict[str, Any], Any]:
     registry = registry if registry is not None else _make_registry(run_dir / "artifacts")
     orchestrator = _make_orchestrator(registry)
+    if not resume and config.get("research_purpose") is not None:
+        from eacbp.application.analysis_requirements import freeze_plan_requirements
+        from eacbp.orchestrator.planning import build_study_tasks
+
+        if config.get("analysis_request") is not None:
+            raise ValueError("analysis_request is generated by a new run; do not supply a historical request")
+        initial_tasks = build_study_tasks(manifest, config, orchestrator.capability_registry)
+        source_sha256 = (source or {}).get("sha256")
+        contract = freeze_plan_requirements(purpose=config["research_purpose"],
+                                            tasks=initial_tasks, source_sha256=source_sha256)
+        config = {**config, "analysis_request": {
+            "question": config["research_purpose"], "source_sha256": source_sha256,
+            "autonomy_kind": "explicit_research_purpose", "policy_version": "research_purpose_v1",
+            "requirement_contract": contract, "limitations": contract["policy_limitations"],
+        }}
+        _update_run_config(run_dir, config=config)
     execution_config = deepcopy(dict(config))
     if resume:
         execution_config["resume"] = True
@@ -405,6 +565,7 @@ def _execute_run(
     options = {"execution_context": execution_context} if execution_context is not None else {}
     summary = orchestrator.run_study(manifest, execution_config, **options)
     summary = dict(_jsonable(summary))
+    summary = _autonomous_request_summary(summary, manifest=manifest, config=config, orchestrator=orchestrator)
     summary["run_dir"] = str(run_dir)
     summary["report"] = str(run_dir / "report.md")
     summary["snapshot"] = str(run_dir / "snapshot.json")
@@ -420,7 +581,7 @@ def _execute_run(
     return summary, orchestrator
 
 
-def _run_study(*, manifest, config: Mapping[str, Any] | None, data: str | Path, run_dir: str | Path, execution_context=None) -> dict[str, Any]:
+def _run_study(*, manifest, config: Mapping[str, Any] | None, data: str | Path, run_dir: str | Path, execution_context=None, expected_source_sha256: str | None = None) -> dict[str, Any]:
     """Run one fresh study and return its persisted summary.
 
     This public helper is useful to callers that want the CLI lifecycle but do
@@ -445,12 +606,26 @@ def _run_study(*, manifest, config: Mapping[str, Any] | None, data: str | Path, 
         _write_json(run_path / "summary.json", _summary_failure(run_path, exc))
         raise exc
     source_before = _hash_file(source_path)
+    if expected_source_sha256 is not None and source_before != expected_source_sha256:
+        exc = ValueError("Input h5ad differs from the confirmed preview; check the plan and confirm again")
+        _record_failure(run_path, exc)
+        raise exc
     source = _source_record(source_path, before=source_before)
     manifest = _manifest_for_input(manifest, None, source_path, source_before)
     _write_run_config(run_path, manifest=manifest, config=config, source=source)
     _update_run_config(run_path, config_cwd=str(run_cwd), run_cwd=str(run_cwd))
     try:
         payload = _import_h5ad(source_path)
+        preparation = None
+        autonomous = config.get("autonomous_analysis")
+        if autonomous is not None:
+            if not isinstance(autonomous, Mapping) or autonomous.get("source_sha256") != source_before:
+                raise ValueError("Autonomous decisions must describe the exact imported source SHA256")
+            from eacbp.application.autonomous import prepare_input
+
+            payload, preparation = prepare_input(payload, autonomous)
+            _write_json(run_path / "input_preparation.json", preparation)
+            _write_json(run_path / "autonomy.json", autonomous)
         source_after = _hash_file(source_path)
         source = _source_record(source_path, before=source_before, after=source_after)
         _update_run_config(run_path, source=source, import_completed=False)
@@ -467,8 +642,9 @@ def _run_study(*, manifest, config: Mapping[str, Any] | None, data: str | Path, 
             artifact_type=__import__("eacbp.schemas.artifact", fromlist=["ArtifactType"]).ArtifactType.ANNDATA,
             study_id=manifest.study_id,
             created_by_task="task_000_ingest",
-            operation="h5ad_import",
-            parameters={"source_file": str(source_path), "source_sha256": source_before},
+            operation="h5ad_import_and_autonomous_preparation" if preparation is not None else "h5ad_import",
+            parameters={"source_file": str(source_path), "source_sha256": source_before,
+                        **({"input_preparation": preparation} if preparation is not None else {})},
             summary_metrics={"n_obs": payload.n_obs, "n_vars": payload.n_vars},
         )
         _update_run_config(run_path, manifest=manifest, source=source, import_completed=True)
@@ -567,10 +743,11 @@ def _render_report(run_dir: Path, output: str | Path | None = None) -> Path:
     return target
 
 
-def run_study(*, manifest, config=None, data, run_dir, execution_context=None):
+def run_study(*, manifest, config=None, data, run_dir, execution_context=None, expected_source_sha256=None):
     path = _prepare_new_run_dir(run_dir)
     with _run_lock(path):
-        return _run_study(manifest=manifest, config=config, data=data, run_dir=path, execution_context=execution_context)
+        return _run_study(manifest=manifest, config=config, data=data, run_dir=path,
+                          execution_context=execution_context, expected_source_sha256=expected_source_sha256)
 
 
 def resume_study(*, run_dir, execution_context=None):
@@ -657,7 +834,8 @@ def export_study(*, run_dir: str | Path, output: str | Path) -> dict[str, Any]:
             raise ValueError("Study export requires a completed evidence snapshot")
         files = {item.relative_to(path).as_posix(): item
                  for pattern in ("run_config.json", "manifest.json", "config.json", "source.json",
-                                 "summary.json", "summaries/*.json", "snapshots/*.json", "report.md", "error.json")
+                                 "summary.json", "summaries/*.json", "snapshots/*.json", "report.md", "error.json",
+                                 "autonomy.json", "input_preparation.json")
                  for item in path.glob(pattern) if item.is_file()}
         bundle = export_artifact_bundle(path / "artifacts", output,
                                         snapshot_paths=snapshots, run_files=files,

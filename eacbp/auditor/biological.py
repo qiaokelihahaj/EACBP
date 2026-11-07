@@ -50,23 +50,44 @@ class BiologicalValidator(BaseAuditor):
 
         # 1. Annotation & Marker Coherence Audit
         if cap_name == "clustering" and meta.type == ArtifactType.ANNDATA:
-            data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-            gene_names = list(data.var["gene_name"]) if "gene_name" in data.var.columns else []
+            data = SCData.from_payload(payload)
+            gene_names = set(data.var["gene_name"].astype(str)) if "gene_name" in data.var.columns else set(data.var.index.astype(str))
             cell_types = data.obs["cell_type"].unique() if "cell_type" in data.obs.columns else []
 
+            marker_reference = contract.parameters.get("marker_reference", CANONICAL_MARKERS)
+            valid_reference = (
+                isinstance(marker_reference, dict)
+                and bool(marker_reference)
+                and all(
+                    isinstance(label, str) and bool(label.strip())
+                    and isinstance(markers, (list, tuple)) and bool(markers)
+                    and all(isinstance(marker, str) and bool(marker.strip()) for marker in markers)
+                    for label, markers in marker_reference.items()
+                )
+            )
+
             matched_markers = {}
-            for ct in cell_types:
-                if ct in CANONICAL_MARKERS:
-                    expected = CANONICAL_MARKERS[ct]
+            for ct in cell_types if valid_reference else []:
+                if ct in marker_reference:
+                    expected = marker_reference[ct]
                     present = [m for m in expected if m in gene_names]
                     matched_markers[ct] = present
 
+            missing_types = [str(ct) for ct, markers in matched_markers.items() if not markers]
+            unreferenced_types = [str(ct) for ct in cell_types if not valid_reference or ct not in marker_reference]
+
             report.add_check(
                 name="canonical_marker_representation",
-                passed=len(matched_markers) > 0,
+                passed=valid_reference and bool(matched_markers) and not missing_types,
                 severity=ValidationSeverity.INFO,
-                message=f"Verified presence of canonical marker genes across identified cell types: {matched_markers}",
-                metrics={"matched_markers": matched_markers}
+                message=f"Marker representation in the feature universe: {matched_markers}; this check does not establish expression coherence or annotation accuracy.",
+                metrics={
+                    "matched_markers": matched_markers,
+                    "reference_source": "task_parameters" if "marker_reference" in contract.parameters else "builtin_brain_markers",
+                    "valid_reference": valid_reference,
+                    "cell_types_without_present_markers": missing_types,
+                    "cell_types_without_reference": unreferenced_types,
+                }
             )
 
         # 2. DEG Top Candidate Biological Coherence

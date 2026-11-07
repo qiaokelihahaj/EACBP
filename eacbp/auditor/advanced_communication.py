@@ -19,6 +19,7 @@ from scipy import stats
 
 from eacbp.auditor.base import BaseAuditor, ValidationReport, ValidationSeverity
 from eacbp.artifact.registry import ArtifactRegistry
+from eacbp.capabilities.biological_units import complete_identity, resolve_donor_role
 from eacbp.capabilities.sc_data import SCData
 
 
@@ -244,7 +245,7 @@ class LianaValidator(BaseAuditor):
                 raise ValueError("LIANA result must have one input and at least one output artifact")
             input_meta, input_payload = registry.get(contract.input_artifacts[0])
             output_meta, output_payload = registry.get(result.output_artifacts[0])
-            data = input_payload if isinstance(input_payload, SCData) else SCData.from_dict(input_payload)
+            data = SCData.from_payload(input_payload)
             ranks = output_payload if isinstance(output_payload, pd.DataFrame) else pd.DataFrame(output_payload)
             parameters = output_meta.parameters
             summary_metrics = output_meta.summary_metrics
@@ -302,12 +303,17 @@ class LianaValidator(BaseAuditor):
             if not isinstance(rank_aggregate, Mapping) or rank_aggregate.get("return_all_lrs") is not True:
                 errors.append("LIANA rank_aggregate was not configured with return_all_lrs=True")
 
-            donor_col = str(parameters["donor_col"])
+            donor_role = resolve_donor_role(data.obs, parameters)
+            donor_col = donor_role.column
+            if donor_col is None:
+                raise ValueError(donor_role.limitation)
             condition_col = str(parameters["condition_col"])
             cell_type_col = str(parameters["cell_type_col"])
             for column in (donor_col, condition_col, cell_type_col):
                 if column not in data.obs.columns:
                     raise ValueError(f"Input metadata column {column!r} is absent")
+            if not complete_identity(data.obs[donor_col]):
+                raise ValueError("Donor metadata contain missing values")
             donor_values = data.obs[donor_col].astype(str).str.strip()
             condition_values = data.obs[condition_col].astype(str).str.strip()
             cell_type_values = data.obs[cell_type_col].astype(str).str.strip()

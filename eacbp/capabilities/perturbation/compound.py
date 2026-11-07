@@ -155,8 +155,8 @@ class CompoundPerturbationCapability(BaseCapability):
             raise ValueError("mode must be one of: real, demo, simulation")
 
         # Handle input either as SCData or Table
-        if isinstance(payload, SCData) or (isinstance(payload, dict) and "X" in payload):
-            data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        if meta.type in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA):
+            data = SCData.from_payload(payload)
             n_cells, n_genes = data.X.shape
             if int(n_cells) * int(n_genes) > MAX_COMPOUND_ELEMENTS:
                 raise ValueError(

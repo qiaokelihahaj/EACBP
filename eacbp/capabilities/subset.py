@@ -28,9 +28,7 @@ class SubsetCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        meta, payload = registry.get(in_uri)
-
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        meta, data = registry.get_scdata(in_uri)
         
         target_cell_type = contract.parameters.get("cell_type")
         if not target_cell_type:
@@ -51,12 +49,17 @@ class SubsetCapability(BaseCapability):
         subset_data = data.subset_obs(mask)
 
         # Re-compute local PCA on the subpopulation
-        local_pca = compute_pca(subset_data.X, n_components=min(15, subset_data.n_obs, subset_data.n_vars))
+        seed = int(contract.parameters.get("random_seed", 42))
+        local_pca = compute_pca(
+            subset_data.X,
+            n_components=min(15, subset_data.n_obs, subset_data.n_vars),
+            random_seed=seed,
+        )
         subset_data.obsm["X_pca"] = local_pca
 
         # Sub-cluster into granular sub-states
         from eacbp.capabilities.clustering import simple_kmeans
-        sub_labels = simple_kmeans(local_pca, k=3, random_seed=contract.parameters.get("random_seed", 42))
+        sub_labels = simple_kmeans(local_pca, k=3, random_seed=seed)
         if target_cell_type.lower() == "microglia":
             subset_data.obs["microglia_state"] = [f"M{c+1}" for c in sub_labels]
         subset_data.obs["sub_state"] = [f"S{c+1}" for c in sub_labels]
@@ -72,7 +75,7 @@ class SubsetCapability(BaseCapability):
             created_by_task=contract.task_id,
             operation=f"subset_{target_cell_type.lower()}",
             parent_uris=[in_uri],
-            parameters={"cell_type": target_cell_type, "obs_key": obs_key},
+            parameters={"cell_type": target_cell_type, "obs_key": obs_key, "random_seed": seed},
             summary_metrics={
                 "parent_cells": data.n_obs,
                 "subset_cells": subset_data.n_obs,

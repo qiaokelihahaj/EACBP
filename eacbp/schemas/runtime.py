@@ -25,14 +25,14 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 class RunConfig(BaseModel):
     """Caller supplied analysis options.
 
-    The fields below cover the options used by the built-in planner.  Extra
-    values remain accepted deliberately: external capability plugins have
-    historically added their own options to ``current_state``.  Unknown
-    options are retained as config values and therefore receive the same
-    precedence guarantee as declared fields.
+    The fields below cover the options used by the built-in planner. Unknown
+    top-level options are rejected rather than silently leaving a requested
+    method at its default. Plugins put their options under their registered
+    capability in ``capability_parameters`` or ``analysis_extensions``; their
+    descriptor owns validation of those options.
     """
 
-    model_config = ConfigDict(extra="allow", validate_assignment=True)
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     method_profile: Optional[Literal["baseline", "standard"]] = None
     mode: Optional[Literal["demo", "real"]] = None
@@ -42,6 +42,18 @@ class RunConfig(BaseModel):
     target_parameters: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
     analysis_extensions: Optional[Dict[str, Union[StrictBool, Dict[str, Any]]]] = None
     advanced_analysis: Optional[StrictBool] = None
+    autonomous_analysis: Optional[Dict[str, Any]] = None
+    research_purpose: Optional[Literal["overview", "deg", "abundance", "trajectory", "batch", "annotation"]] = None
+    analysis_request: Optional[Dict[str, Any]] = None
+
+    # Explicit compatibility fields for the old current_state entry point.
+    # ExecutionState moves these into the observation plane before execution.
+    batches: Optional[List[str]] = None
+    observed_conditions: Optional[List[str]] = None
+    condition_metadata_complete: Optional[StrictBool] = None
+    min_replicates: Optional[int] = None
+    biological_replication_sufficient: Optional[StrictBool] = None
+    paired_donors_observed: Optional[StrictBool] = None
 
     quant_tool: Optional[str] = None
     target_gene: Optional[str] = None
@@ -88,6 +100,7 @@ class RunConfig(BaseModel):
     PROTECTED_KEYS: ClassVar[Set[str]] = {
         "method_profile", "mode", "resume", "method_overrides",
         "capability_parameters", "target_parameters", "analysis_extensions", "advanced_analysis",
+        "autonomous_analysis", "research_purpose", "analysis_request",
         "quant_tool", "target_gene", "target_genes", "perturbation_type",
         "perturbation_targets", "cellrank_terminal_states", "threads",
         "work_dir", "index_path", "t2g_path", "star_bin", "genome_dir",

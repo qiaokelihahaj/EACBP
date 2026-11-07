@@ -55,8 +55,15 @@ def spatial_registry(tmp_path):
 
 @pytest.fixture
 def synthetic_spatial_data():
-    """Generates standard synthetic spatial single-cell AD dataset."""
-    return create_synthetic_spatial_ad_study(n_cells=300, n_genes=50, random_seed=42)
+    """Use the generator's single simulated coordinate canvas, without random donor IDs.
+
+    Those IDs are unrelated to measured section identity. These spatial tests
+    exercise one simulated section and make no biological-donor inference.
+    """
+    data = create_synthetic_spatial_ad_study(n_cells=300, n_genes=50, random_seed=42)
+    data.obs.drop(columns=["mouse_id"], inplace=True)
+    data.obs["section_id"] = "simulated_single_section"
+    return data
 
 
 # ==============================================================================
@@ -208,12 +215,12 @@ def test_spatial_domain_capability_execution(spatial_registry, synthetic_spatial
     assert out_uri == "adata://AD_study/spatial_domains/v4"
     assert reg.exists(out_uri)
 
-    meta, payload = reg.get(out_uri)
+    meta = reg.get_metadata(out_uri)
     assert meta.type == ArtifactType.SPATIAL_DATA
     assert meta.summary_metrics["n_domains"] == 4
     assert meta.summary_metrics["silhouette_score"] > -1.0
 
-    out_data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+    out_data = reg.load_scdata(out_uri)
     assert "spatial_domain" in out_data.obs.columns
     assert "spatial" in out_data.obsm
     assert "X_spatial_pca" in out_data.obsm

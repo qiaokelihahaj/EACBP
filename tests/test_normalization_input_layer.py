@@ -18,9 +18,7 @@ def test_corrected_layer_normalization_preserves_original_counts(tmp_path):
     task = TaskContract(task_id="norm", capability="normalization", input_artifacts=[uri],
                         parameters={"input_layer": "corrected_counts", "target_sum": 100})
     result = NormalizationCapability().execute(task, reg)
-    _, out = reg.get(result.output_artifacts[0])
-    if isinstance(out, dict):
-        out = SCData.from_dict(out)
+    out = reg.load_scdata(result.output_artifacts[0])
     np.testing.assert_array_equal(out.layers["counts"], raw)
     np.testing.assert_array_equal(out.layers["corrected_counts"], corrected)
     np.testing.assert_allclose(out.X, np.log1p(corrected / corrected.sum(axis=1)[:, None] * 100), rtol=1e-6)

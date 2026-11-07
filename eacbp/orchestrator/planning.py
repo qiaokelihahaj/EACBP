@@ -13,6 +13,7 @@ from eacbp.schemas.runtime import RunConfig
 
 def build_study_tasks(manifest, state, capability_registry):
     """Assemble the same built-in and registered extension DAG for all callers."""
+    capability_registry.validate_run_config(state, manifest=manifest)
     planner_input = deepcopy(state)
     if "analysis_extensions" in planner_input:
         planner_input["analysis_extensions"] = {
@@ -22,6 +23,16 @@ def build_study_tasks(manifest, state, capability_registry):
     tasks = ComputationalDAGPlanner.build_study_plan(manifest, planner_input, expand_targets=False)
     extensions = capability_registry.plan_extensions(manifest, state, tasks)
     tasks.extend(extensions)
+    # Preserve the audited candidate branch before the primary threshold mask
+    # can reject an all-filtered input. Its outputs never feed normalization.
+    for review in extensions:
+        if review.capability != "qc_review":
+            continue
+        matching = [task for task in tasks if task.capability == "qc"
+                    and task.input_artifacts == review.input_artifacts]
+        if len(matching) != 1:
+            raise ValueError("QC review must match exactly one primary QC input")
+        matching[0].depends_on.append(review.task_id)
     scopes = {task.task_id: capability_registry.describe(task.capability, task.method).scope
               for task in extensions}
     if len(manifest.biological_design.target_cell_types) > 1:
@@ -40,6 +51,8 @@ def build_study_tasks(manifest, state, capability_registry):
             *(producers[uri] for uri in task.input_artifacts
               if uri in producers and producers[uri] != task.task_id),
         ]))
+    from eacbp.orchestrator.research_scope import select_research_tasks
+    tasks = select_research_tasks(tasks, state, manifest)
     return ComputationalDAGPlanner.order_tasks(tasks)
 
 
@@ -48,6 +61,13 @@ def resolve_task_contract(task, manifest, state, capability_registry, artifact_r
     router = router if router is not None else CapabilityRouter(capability_registry)
     task.parameters["study_id"] = manifest.study_id
     task.method = router.resolve_method(task.capability, manifest, state)
+    if task.method == "scanpy_leiden_umap_v1":
+        # The legacy DAG injects a K-means default before routing. It is not
+        # an effective Leiden option. Explicit unsupported user options still
+        # reach the strict descriptor and are rejected.
+        supplied = state.get("capability_parameters", {}).get("clustering", {})
+        if "k_clusters" not in supplied:
+            task.parameters.pop("k_clusters", None)
     implementation = capability_registry.get(task.capability, task.method)
     operations = getattr(implementation, "contract_operations", None)
     resolver = getattr(implementation, "resolve_contract_operations", None)
@@ -74,7 +94,13 @@ def preview_study_plan(manifest, config=None, capability_registry=None):
     No task capability is executed. Dataset audit may later change methods,
     contrasts or omit branches; this document is not a resolved execution receipt.
     """
-    state = RunConfig.from_mapping(config).to_mapping()
+    config_error = None
+    try:
+        state = RunConfig.from_mapping(config).to_mapping()
+    except (ValueError, TypeError) as exc:
+        config_error = str(exc)
+        state = {}
+    explicit_profile = "method_profile" in state
     state.setdefault("method_profile", "baseline" if state.get("mode") == "demo" else "standard")
     registry = capability_registry if capability_registry is not None else create_default_capability_registry()
     preview = {
@@ -85,6 +111,7 @@ def preview_study_plan(manifest, config=None, capability_registry=None):
         "tasks": [],
         "external_inputs": [],
         "missing_parameters": [],
+        "unused_configuration": [],
         "errors": [],
         "notices": [
             "Methods and contrasts are provisional until dataset audit; unsupported branches may be omitted.",
@@ -92,7 +119,11 @@ def preview_study_plan(manifest, config=None, capability_registry=None):
             "Runtime-hour/GPU policies are checked at Python task boundaries and external commands are supervised; in-process computation is not forcibly preempted.",
         ],
     }
-    if "method_profile" not in RunConfig.from_mapping(config).to_mapping():
+    if config_error is not None:
+        preview["errors"].append({"task_id": None, "message": config_error})
+        preview["valid"] = False
+        return preview
+    if not explicit_profile:
         preview["notices"].append(
             "Default profile assumes the supplied mode; run-time metadata identifying simulated input can select baseline instead."
         )
@@ -103,6 +134,16 @@ def preview_study_plan(manifest, config=None, capability_registry=None):
         preview["valid"] = False
         return preview
     outputs = {uri for task in tasks for uri in task.expected_outputs}
+    planned_capabilities = {task.capability for task in tasks}
+    for namespace in ("method_overrides", "capability_parameters"):
+        for name in state.get(namespace, {}):
+            if name not in planned_capabilities:
+                preview["unused_configuration"].append(f"{namespace}.{name}")
+    if preview["unused_configuration"]:
+        preview["notices"].append(
+            "Configuration not applied by this provisional plan: "
+            + ", ".join(preview["unused_configuration"])
+        )
     preview["external_inputs"] = sorted({uri for task in tasks for uri in task.input_artifacts if uri not in outputs})
     for task in tasks:
         try:

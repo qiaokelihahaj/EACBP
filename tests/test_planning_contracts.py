@@ -17,6 +17,41 @@ def study(targets=("Microglia", "Neurons")):
         species="human", tissue="brain", target_cell_types=list(targets)))
 
 
+@pytest.mark.parametrize("config,path", [
+    ({"method_overides": {"deg": "invalid"}}, "method_overides"),
+    ({"method_overrides": {"degg": "invalid"}}, "method_overrides"),
+    ({"capability_parameters": {"degg": {"alpha": .01}}}, "capability_parameters"),
+    ({"analysis_extensions": {"donor_sensitivty": False}}, "analysis_extensions"),
+    ({"target_parameters": {"Microglia": {"degg": {"alpha": .01}}}}, "target_parameters.Microglia"),
+    ({"target_parameters": {"Microgli": {"deg": {"alpha": .01}}}}, "Microgli"),
+])
+def test_preview_rejects_misspelled_configuration_names_without_computation(config, path):
+    registry = create_default_capability_registry()
+    with patch.object(registry, "execute_contract", side_effect=AssertionError("must not compute")):
+        preview = preview_study_plan(study(), config, registry)
+    assert preview["valid"] is False
+    assert path in str(preview["errors"])
+    assert not preview["tasks"]
+
+
+def test_runtime_plan_rejects_unknown_capability_before_building_tasks():
+    registry = create_default_capability_registry()
+    with patch.object(ComputationalDAGPlanner, "build_study_plan", side_effect=AssertionError("must not plan")):
+        with pytest.raises(ValueError, match="degg"):
+            build_study_tasks(study(), {"method_overrides": {"degg": "invalid"}}, registry)
+
+
+def test_preview_reports_valid_configuration_for_inactive_capability():
+    preview = preview_study_plan(study(), {
+        "capability_parameters": {"cell_annotation": {"model_path": "not_loaded.pkl"}},
+        "method_overrides": {"cell_annotation": "celltypist_local_v1"},
+    })
+    assert preview["valid"], preview["errors"]
+    assert set(preview["unused_configuration"]) == {
+        "capability_parameters.cell_annotation", "method_overrides.cell_annotation"}
+    assert any("not applied" in notice for notice in preview["notices"])
+
+
 class Extension(BaseCapability):
     def __init__(self, scope, plan_factory):
         super().__init__("extension", "extension_v1", descriptor=CapabilityDescriptor(
@@ -58,6 +93,21 @@ def test_registered_extension_uses_same_target_expansion_and_parameter_overrides
         assert second.input_artifacts == first.expected_outputs
         assert first.parameters["target_branch"] == target
     assert registry.describe("extension").to_dict()["scope"] == "per_target"
+
+
+def test_registered_plugin_configuration_namespace_survives_validation():
+    registry = create_default_capability_registry()
+    registry.register(Extension("per_target", target_plan))
+    config = {"analysis_extensions": {"extension": {"count": 2}},
+              "method_overrides": {"extension": "extension_v1"},
+              "capability_parameters": {"extension": {"plugin_option": "kept"}},
+              "target_parameters": {"neurons": {"extension": {"count": 3}}}}
+    preview = preview_study_plan(study(), config, registry)
+    assert preview["valid"], preview["errors"]
+    selected = [task for task in preview["tasks"] if task["task_id"] == "extension_first_neurons"]
+    assert len(selected) == 1
+    assert selected[0]["parameters"]["count"] == 3
+    assert selected[0]["parameters"]["plugin_option"] == "kept"
 
 
 def test_shared_scope_overrides_legacy_target_parameter_markers():
@@ -253,4 +303,4 @@ def test_spatial_preprocessing_preserves_coordinates(tmp_path, capability, param
     assert result.status == TaskStatus.SUCCESS, result.error_message
     assert artifacts.get_metadata(source).type == ArtifactType.SPATIAL_DATA
     assert artifacts.get_metadata(output).type == ArtifactType.ANNDATA
-    assert np.array_equal(artifacts.load_payload(output).obsm["spatial"], coordinates)
+    assert np.array_equal(artifacts.load_scdata(output).obsm["spatial"], coordinates)

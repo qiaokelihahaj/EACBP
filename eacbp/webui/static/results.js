@@ -31,30 +31,75 @@ function resultCard(title,description){
   card.append(el("h3",title),el("p",description,"hint"));
   return card;
 }
-function resultSource(card,uri){if(uri)card.append(el("p","产物来源 · "+uri,"result-source"));}
+function resultSource(card,uri){if(uri){const details=el("details",null,"result-technical-details");details.append(el("summary","查看结果来源"),el("p","产物来源 · "+uri,"result-source"));card.append(details);}}
+function resultGuidance(card,text){const guide=el("p",null,"result-reading-guide");guide.append(el("strong","怎么看："),document.createTextNode(text));card.append(guide);}
 const resultCategories=[
-  {key:"quality",title:"数据质量与实验设计",description:"输入数据与 QC 检查。",capabilities:["dataset_audit","qc"]},
-  {key:"composition",title:"细胞组成与聚类",description:"展示已审计的细胞嵌入预览；差异丰度等尚无专属图表时，任务状态和证据仍可在这里、报告及证据包中查看。",capabilities:["clustering","subset_cells","differential_abundance"]},
-  {key:"deg",title:"基因表达比较",description:"展示差异表达预览和已审计完整结果表的分页查询。",capabilities:["deg"]},
-  {key:"trajectory",title:"轨迹与其他分析任务",description:"当前没有专属轨迹或其他扩展任务图表；请查看保存报告及完整证据包中的审计记录。",capabilities:["trajectory_inference","fate_prediction","cellrank_fate","donor_sensitivity","functional_activity","doublet_detection","cell_annotation","background_removal","cell_cell_communication","knowledge_retrieval","spatial_domain","spatial_deg"]}
+  {key:"quality",title:"数据质量与实验设计",description:"先看过滤后保留了多少细胞，再核对实验分组和质量提醒。",capabilities:["dataset_audit","qc"]},
+  {key:"composition",title:"细胞组成与聚类",description:"查看细胞如何分组；丰度比较的具体结果请查看分析报告。",capabilities:["clustering","subset_cells","differential_abundance"]},
+  {key:"deg",title:"基因表达比较",description:"查看两组之间的表达变化，也可以搜索和下载完整基因结果。",capabilities:["deg"]},
+  {key:"trajectory",title:"轨迹与其他分析任务",description:"这些任务暂未提供专属图表；查看下方状态，并在分析报告或完整证据包中读取结果。",capabilities:["trajectory_inference","fate_prediction","cellrank_fate","donor_sensitivity","functional_activity","doublet_detection","cell_annotation","background_removal","cell_cell_communication","knowledge_retrieval","spatial_domain","spatial_deg"]}
 ];
-function resultGroup(root,category){const section=el("section",null,"research-question-group");section.append(el("h2",category.title),el("p",category.description,"hint"));const rows=(state.resultTasks||[]).filter(task=>category.capabilities.includes(task.capability));if(rows.length){const list=el("div",null,"task-coverage");for(const task of rows){const row=el("div",null,"task-coverage-row"),description=el("div");description.append(el("strong",capabilities[task.capability]||task.capability),el("small",[task.task_id,task.method].filter(Boolean).join(" · ")||"快照未记录方法"));row.append(description,badge(task.status));if(task.audited)row.append(el("small","通过快照回执校验"));else row.append(el("small","产物未作为已审计结果展示","task-not-audited"));list.append(row);}section.append(list);}else section.append(el("p","快照未记录此类任务。","task-empty"));const cards=el("div",null,"results-grid");section.append(cards);root.append(section);return cards;}
+function resultStepStatus(category,available){
+  const tasks=(state.resultTasks||[]).filter(task=>category.capabilities.includes(task.capability));
+  if(available)return "已有可读图表"+(tasks.some(task=>!task.audited)?"；还有任务需要检查。":"。先结合下方说明阅读。");
+  if(!tasks.length)return "当前结果记录未包含此类任务；这不表示已得出“没有差异”的结论。";
+  if(tasks.some(task=>["pending","queued","running","ready","created"].includes(task.status)))return "有任务尚未完成；先看任务状态，完成后刷新结果。";
+  if(tasks.some(task=>task.status!=="success"))return "有任务未完成或未通过；先查看任务状态和报告中的原因。";
+  if(tasks.some(task=>!task.audited))return "任务已完成，但尚无可展示的已校验结果；请查看报告和质量提醒。";
+  return "任务已有通过记录校验的结果，但本页没有对应图表；请查看报告和上方提醒。";
+}
+function renderResultReadingPath(available){
+  const guide=el("section",null,"result-start-guide");guide.id="results-reading-path";guide.setAttribute("aria-label","结果阅读顺序");
+  guide.append(el("h2","第一次看结果？按这 3 步读"),el("p","先确认数据质量，再了解细胞组成，最后看基因比较。图表缺失时，先查看任务状态；记录校验通过也需要结合实验设计解释。","hint"));
+  const steps=el("ol",null,"result-guide-steps");
+  const descriptions={quality:["先看数据质量","核对保留细胞和报告中的质量提醒；保留率高低本身不能判断数据是否合格。","查看质量控制"],composition:["再看细胞组成","每个点是一个细胞；先了解分组，结合标记基因核对细胞类型。","查看细胞分布"],deg:["最后看基因比较","先确认比较的是哪两组和哪个方向，再一起看变化幅度与 FDR。","查看基因比较"]};
+  for(const category of resultCategories.slice(0,3)){
+    const [title,description,label]=descriptions[category.key],step=el("li",null,"result-guide-step");step.dataset.resultStep=category.key;
+    step.append(el("h3",title),el("p",description,"hint"),el("p",resultStepStatus(category,available[category.key]),"result-guide-status"));
+    const hasTasks=(state.resultTasks||[]).some(task=>category.capabilities.includes(task.capability));
+    const action=el("button",available[category.key]?label:hasTasks?"查看任务状态":"查看运行情况","button secondary result-guide-action");action.type="button";
+    action.onclick=()=>{const section=$("result-"+category.key);if(section){section.scrollIntoView({block:"start"});section.querySelector("h2").focus({preventScroll:true});}else selectDetailTab("events");};step.append(action);steps.append(step);
+  }
+  const report=el("button","先读分析报告","button ghost");report.type="button";report.onclick=()=>selectDetailTab("report");
+  const actions=el("div",null,"result-guide-actions");actions.append(report,el("small","报告用于核对实验设计、未完成任务和解释限制。","hint"));guide.append(steps,actions);return guide;
+}
+function resultTaskBadge(task){
+  const names={pending:"等待执行",execution_failure:"执行未完成",method_failure:"分析方法未通过",scientific_failure:"结果未通过科学检查",policy_violation:"任务未通过运行规则检查"};
+  const value=badge(task.status);if(names[task.status]){value.textContent=names[task.status];value.className="status "+(task.status==="pending"?"queued":"failed");}return value;
+}
+function resultGroup(root,category){
+  const section=el("section",null,"research-question-group"),heading=el("h2",category.title);section.id="result-"+category.key;heading.tabIndex=-1;section.append(heading,el("p",category.description,"hint"));
+  const rows=(state.resultTasks||[]).filter(task=>category.capabilities.includes(task.capability));
+  if(rows.length){const list=el("div",null,"task-coverage");for(const task of rows){
+    const row=el("div",null,"task-coverage-row"),description=el("div"),details=el("details",null,"result-technical-details");
+    description.append(el("strong",capabilities[task.capability]||task.capability));
+    details.append(el("summary","任务与方法详情"),el("small",[task.task_id,task.method].filter(Boolean).join(" · ")||"快照未记录方法"));description.append(details);
+    row.append(description,resultTaskBadge(task));
+    if(task.audited)row.append(el("small","结果已通过记录校验"));else row.append(el("small","尚无可展示的已校验结果","task-not-audited"));
+    list.append(row);
+  }section.append(list);}
+  const cards=el("div",null,"results-grid");section.append(cards);root.append(section);return cards;
+}
 function numberText(value){return typeof value==="number"&&Number.isFinite(value)?value.toLocaleString(undefined,{maximumFractionDigits:3}):"—";}
 function renderResults(data){
   const root=$("results-content");root.replaceChildren();resultCharts=[];state.resultTasks=data.tasks||[];state.resultWarnings=data.warnings||[];
   if(data.notice)root.append(notice(data.notice));
   for(const warning of data.warnings||[])root.append(notice(typeof warning==="string"?warning:JSON.stringify(warning),"warning"));
-  const groups=Object.fromEntries(resultCategories.map(category=>[category.key,resultGroup(root,category)]));
+  const available={quality:Boolean(data.qc),composition:Boolean(data.embedding),deg:Boolean(data.deg?.length)};
+  root.append(renderResultReadingPath(available));
+  const categories=resultCategories.filter(category=>available[category.key]||state.resultTasks.some(task=>category.capabilities.includes(task.capability)));
+  const groups=Object.fromEntries(categories.map(category=>[category.key,resultGroup(root,category)]));
   if(data.qc)groups.quality.append(renderQc(data.qc));
   if(data.embedding)groups.composition.append(renderEmbedding(data.embedding));
   if(data.deg?.length)groups.deg.append(renderDeg(data.deg));
-  groups.deg.append(renderDegTableQuery());
-  if(!data.qc&&!data.embedding&&!data.deg?.length)root.prepend(el("div","当前快照没有可展示的 QC、聚类或 DEG 预览。未通过校验的产物不会用于绘图；仍可查看下方任务状态，并下载通过校验的完整证据包。","results-empty"));
+  if(groups.deg)groups.deg.append(renderDegTableQuery());
+  if(!data.qc&&!data.embedding&&!data.deg?.length)root.prepend(el("div","暂时没有可展示的图表。请查看下方任务状态或分析报告；未通过校验的结果不会用于绘图。完整证据包也需要通过校验后才能下载。","results-empty"));
   const reportLink=el("button","查看保存的分析报告","button secondary");reportLink.onclick=()=>selectDetailTab("report");root.append(reportLink);
   requestAnimationFrame(()=>{for(const chart of resultCharts)if(chart.canvas.isConnected)chart.redraw();});
 }
 function renderQc(qc){
   const card=resultCard("质量控制","查看本次过滤前后的细胞数量。");
+  resultGuidance(card,"保留细胞将进入后续分析。保留率受样本质量和过滤阈值影响，数值高低本身不能证明数据合格；请同时查看报告中的质量提醒。");
   const summary=el("div",null,"result-summary");
   for(const [label,value] of [["输入细胞",qc.initial_cells],["保留细胞",qc.retained_cells],["过滤细胞",qc.filtered_cells]]){
     const item=el("div");item.append(el("strong",numberText(value)),el("small",label));summary.append(item);
@@ -116,6 +161,7 @@ function bindReadout(canvas,readout,getPoints,describe){
 }
 function renderEmbedding(data){
   const card=resultCard(data.label||"细胞二维分布","展示 "+numberText(data.shown_cells)+" / "+numberText(data.total_cells)+" 个细胞"+(data.sampled?" · 已抽样；图例计数对应展示样本":"")+"。");
+  resultGuidance(card,"每个点代表一个细胞。颜色可按算法分组或细胞类型切换；算法分组需要结合标记基因核对，不能直接当作细胞类型。抽样图中的点数也不能直接用于比较细胞丰度。");
   const toolbar=el("div",null,"chart-toolbar"),label=el("label","颜色分组"),select=el("select");select.id="embedding-group";label.htmlFor=select.id;
   for(const [value,text] of [["cluster","聚类"],["cell_type","细胞类型"]]){const option=el("option",text);option.value=value;select.append(option);}
   toolbar.append(label,select);card.append(toolbar);
@@ -145,17 +191,26 @@ function renderEmbedding(data){
   if(data.omitted_nonfinite)card.append(el("p","已省略 "+data.omitted_nonfinite+" 个含非有限坐标的细胞。","hint"));resultSource(card,data.source_uri);return card;
 }
 function scientificNumber(value){if(typeof value!=="number"||!Number.isFinite(value))return "—";return value!==0&&Math.abs(value)<.001?value.toExponential(2):value.toLocaleString(undefined,{maximumFractionDigits:4});}
+function statisticalUnitText(value){return {donor_pseudobulk:"按供体汇总后比较",single_cell_exploratory:"单细胞探索；不能替代独立生物学重复",unknown:"统计单位未记录，请查看报告"}[value]||value||"统计单位请查看报告";}
+function resultGeneTerms(){
+  const details=el("details",null,"result-technical-details result-gene-terms"),list=el("dl");
+  details.append(el("summary","不懂 FDR / log2FC？看白话解释"));
+  for(const [title,text] of [["log2FC：估计的表达变化","0 附近表示估计变化较小，绝对值越大表示变化幅度越大。按标准 log2 倍数定义，+1 对应约 2 倍，−1 对应约一半。正负方向必须以本次效应定义为准；请先核对哪组相对哪组。"],["FDR：同时比较很多基因后的统计指标","用于减少从大量基因中筛选时的假阳性。阈值 0.05 是筛选规则，不表示某个基因有 95% 的概率真实，也不能说明它在生物学上重要。未达到阈值也不能证明两组完全一样。"],["下一步怎么做","先确认细胞类型、比较方向和独立生物学重复，再找关心的基因。结合变化幅度、FDR 与报告中的限制，挑选需要后续验证的候选基因。"]])list.append(el("dt",title),el("dd",text));
+  details.append(list);return details;
+}
 function renderDeg(datasets){
-  const card=resultCard("差异表达","按 FDR 从小到大预览最多 200 个基因；搜索和筛选仅作用于当前预览，完整结果保留在产物目录。");card.classList.add("result-wide");
+  const card=resultCard("哪些基因表达发生了变化？","按 FDR 从小到大预览最多 200 个基因；这里的搜索和筛选仅作用于预览，搜索全部基因请使用下方完整结果表。");card.classList.add("result-wide");
+  resultGuidance(card,"每个点代表一个基因。横轴 log2FC 表示变化幅度与正负方向，纵轴越高表示 FDR 越小。FDR 是多基因检验后校正的统计指标；需结合变化幅度和实验设计判断，比较方向以本次结果的效应定义为准。");
+  card.append(resultGeneTerms());
   const toolbar=el("div",null,"chart-toolbar"),contrast=el("select"),threshold=el("select"),search=el("input"),only=el("input");
   contrast.id="deg-contrast";contrast.setAttribute("aria-label","选择差异表达结果");
-  for(const [i,d] of datasets.entries()){const option=el("option",(d.target_cell_type||"全部细胞")+" · "+(d.contrast_label||((d.condition_a||"A")+" / "+(d.condition_b||"B")))+" · "+d.task_id);option.value=String(i);contrast.append(option);}
+  for(const [i,d] of datasets.entries()){const option=el("option",(d.target_cell_type||"全部细胞")+" · "+(d.contrast_label||((d.condition_a||"A")+" / "+(d.condition_b||"B")))+" · 结果 "+(i+1));option.value=String(i);contrast.append(option);}
   threshold.id="deg-threshold";threshold.setAttribute("aria-label","FDR 显示阈值");
   for(const v of [.01,.05,.1]){const option=el("option","FDR < "+v);option.value=String(v);threshold.append(option);}threshold.value="0.05";
   search.type="search";search.placeholder="搜索基因…";search.setAttribute("aria-label","搜索差异表达基因");
   only.type="checkbox";only.id="deg-only";const onlyLabel=el("label",null,"check-label");onlyLabel.append(only,document.createTextNode("仅显示低于阈值的基因"));
   toolbar.append(contrast,threshold,onlyLabel);card.append(toolbar,search);
-  const caption=el("p",null,"hint");card.append(caption);
+  const caption=el("p",null,"hint"),methodDetails=el("details",null,"result-technical-details"),methodText=el("p",null,"hint");methodDetails.append(el("summary","查看方法、阈值与结果定义"),methodText);card.append(caption,methodDetails);
   const {canvas,readout}=chartArea(card,"差异表达火山图：横轴 log2 fold change，纵轴负 log10 FDR；下方提供基因表。");
   const previewDetails=el("details",null,"preview-table-details"),previewSummary=el("summary","展开前 100 条预览基因表"),tableWrap=el("div",null,"results-table-wrap"),table=el("table",null,"results-table");tableWrap.append(table);
   const tableNote=el("p",null,"hint"),source=el("p",null,"result-source");previewDetails.append(previewSummary,tableWrap,tableNote,source);card.append(previewDetails);
@@ -166,9 +221,10 @@ function renderDeg(datasets){
     const valid=rows.filter(r=>Number.isFinite(r.log2_fold_change)&&Number.isFinite(r.fdr_q_value)&&r.fdr_q_value>=0&&r.fdr_q_value<=1);
     const points=valid.map(r=>({...r,x:r.log2_fold_change,y:-Math.log10(Math.max(r.fdr_q_value,1e-300))}));
     hit=drawScatter(canvas,points,{xLabel:"log2 fold change",yLabel:"−log10 FDR",reference:-Math.log10(limit),color:p=>p.fdr_q_value<limit?(p.x>=0?"#b86d46":"#337ba0"):"#9aa99f"});
-    caption.textContent="方法："+d.method+" · 统计单位："+(d.statistical_unit||"见报告")+" · 返回 "+numberText(d.shown_genes)+" / "+numberText(d.total_genes)+" 个基因 · 当前匹配 "+rows.length+" 个。灰色为未低于阈值，橙 / 蓝色区分正 / 负变化。";
-    caption.textContent+=" 分析 alpha："+(d.alpha??0.05)+"；显示筛选不会改变分析结论。"+(d.effect_definition?" 效应定义："+d.effect_definition:"");
-    table.replaceChildren();const head=el("thead"),heading=el("tr");for(const text of ["基因","log2 fold change","FDR q 值","p 值"]){const th=el("th",text);th.scope="col";heading.append(th);}head.append(heading);table.append(head);
+    caption.textContent="本次比较："+(d.contrast_label||((d.condition_a||"A")+" / "+(d.condition_b||"B")))+" · "+statisticalUnitText(d.statistical_unit)+"。预览 "+numberText(d.shown_genes)+" / "+numberText(d.total_genes)+" 个基因，当前匹配 "+rows.length+" 个。橙色 / 蓝色分别表示低于当前 FDR 阈值的正 / 负变化，灰色表示未低于阈值。";
+    caption.textContent+=" 显示筛选不会改变分析结论。"+(d.effect_definition?" 本次效应定义："+d.effect_definition:"本次效应定义未记录；请核对报告后再解释正负方向。");
+    methodText.textContent="任务："+d.task_id+" · 方法："+(d.method||"未记录")+" · 原始统计单位："+(d.statistical_unit||"未记录")+" · 分析 alpha："+(d.alpha??0.05)+(d.effect_definition?" · 效应定义："+d.effect_definition:"");
+    table.replaceChildren();const head=el("thead"),heading=el("tr");for(const text of ["基因","表达变化（log2FC）","校正后显著性（FDR）","p 值"]){const th=el("th",text);th.scope="col";heading.append(th);}head.append(heading);table.append(head);
     const body=el("tbody");for(const r of rows.slice(0,100)){const tr=el("tr");for(const value of [r.gene,scientificNumber(r.log2_fold_change),scientificNumber(r.fdr_q_value),scientificNumber(r.p_value)])tr.append(el("td",value));body.append(tr);}table.append(body);
     tableNote.textContent=(rows.length?"表格展示当前匹配的前 "+Math.min(rows.length,100)+" 项。":"没有匹配的基因。")+"缺失或非法统计值不绘图；FDR 为 0 时按 10⁻³⁰⁰ 显示。完整结果保留在产物目录。";
     source.textContent="产物来源 · "+d.source_uri;
@@ -179,13 +235,15 @@ function renderDeg(datasets){
   return card;
 }
 function renderDegTableQuery(){
-  const card=resultCard("已审计完整 DEG 表","独立于最多 200 行的图表预览。目录与每次分页查询均检查当前快照、成功任务和唯一通过审计回执；未重算差异分析。单表上限 512 MB；每次请求的完整来源哈希读取预算为 2 GB。点“查询”后才扫描完整表。");card.classList.add("result-wide");
-  const toolbar=el("div",null,"chart-toolbar deg-query-toolbar"),discover=el("button","发现已审计 DEG 表","button secondary"),task=el("select"),query=el("input"),size=el("select"),fdr=el("input"),sig=el("input"),fc=el("input"),run=el("button","查询第 1 页","button primary"),download=el("button","下载完整 CSV","button ghost");
-  task.setAttribute("aria-label","完整 DEG 结果表");task.add(new Option("先发现已审计结果表",""));query.type="search";query.maxLength=200;query.placeholder="搜索完整 gene ID（最多 200 字符）";query.setAttribute("aria-label","完整结果表中的基因 ID 搜索");
+  const card=resultCard("搜索全部基因结果","先读取可用结果表，再输入基因编号或设置筛选条件，点击“查询”。查询覆盖完整表；下载 CSV 可保存整张表，不受当前筛选影响。");card.classList.add("result-wide");
+  const limits=el("details",null,"result-technical-details");limits.append(el("summary","查看结果校验与读取限制"),el("p","目录、每次分页查询及下载均校验当前快照、成功任务和通过审计的记录，不重算差异分析。单表上限 512 MB，二进制表展开上限 128 MB；每次请求的完整来源哈希读取预算为 2 GB。CSV 便于阅读；精确数值类型和缺失值请以完整证据包中的原表为准。点“查询”后才读取完整表。","hint"));card.append(limits);
+  const toolbar=el("div",null,"chart-toolbar deg-query-toolbar"),discover=el("button","读取可用结果表","button secondary"),task=el("select"),query=el("input"),size=el("select"),fdr=el("input"),sig=el("input"),fc=el("input"),run=el("button","查询第 1 页","button primary"),download=el("button","下载完整 CSV","button ghost");
+  task.setAttribute("aria-label","完整基因结果表");task.add(new Option("先读取可用结果表",""));query.type="search";query.maxLength=200;query.placeholder="搜索基因编号（最多 200 字符）";query.setAttribute("aria-label","完整结果表中的基因 ID 搜索");
   size.setAttribute("aria-label","每页行数");size.add(new Option("每页 25 行","25"));size.add(new Option("每页 50 行","50"));size.add(new Option("每页 100 行","100"));size.value="50";
   fdr.type="number";fdr.min="0";fdr.max="1";fdr.step="0.01";fdr.value="0.05";fdr.setAttribute("aria-label","FDR 最大值");sig.type="checkbox";const fdrLabel=el("label",null,"check-label deg-fdr-filter");fdrLabel.append(sig,document.createTextNode(" 仅 FDR ≤ "),fdr);
-  fc.type="number";fc.min="0";fc.step="0.1";fc.placeholder="可选最小 |log2FC|";fc.setAttribute("aria-label","最小绝对 log2 fold change");const tableLabel=el("label","结果表");tableLabel.append(task);toolbar.append(discover,tableLabel,query,size,fdrLabel,fc,run,download);card.append(toolbar);
-  const status=el("p","尚未发现完整 DEG 表。","hint"),warnings=el("div"),pageNav=el("div",null,"table-pagination"),previous=el("button","← 上一页","button ghost"),pageText=el("strong","—"),next=el("button","下一页 →","button ghost"),tableWrap=el("div",null,"results-table-wrap"),table=el("table",null,"results-table"),foot=el("p","","hint");tableWrap.append(table);pageNav.append(previous,pageText,next);card.append(status,warnings,tableWrap,pageNav,foot);run.disabled=true;download.disabled=true;previous.disabled=true;next.disabled=true;
+  fc.type="number";fc.min="0";fc.step="0.1";fc.placeholder="可选最小 |log2FC|";fc.setAttribute("aria-label","最小绝对 log2 fold change");const tableLabel=el("label","结果表");tableLabel.append(task);toolbar.append(discover,tableLabel,query,run,download);card.append(toolbar);
+  const optionalFilters=el("details",null,"result-technical-details deg-optional-filters"),filterToolbar=el("div",null,"chart-toolbar");optionalFilters.append(el("summary","按 FDR / 变化幅度筛选（可选）"),el("p","初次阅读可以保留默认值。筛选只改变当前展示，不会重新计算分析；CSV 下载始终包含完整结果。","hint"));filterToolbar.append(size,fdrLabel,fc);optionalFilters.append(filterToolbar);card.append(optionalFilters);
+  const status=el("p","点击“读取可用结果表”开始。","hint"),warnings=el("div"),pageNav=el("div",null,"table-pagination"),previous=el("button","← 上一页","button ghost"),pageText=el("strong","—"),next=el("button","下一页 →","button ghost"),tableWrap=el("div",null,"results-table-wrap"),table=el("table",null,"results-table"),foot=el("p","","hint");tableWrap.append(table);pageNav.append(previous,pageText,next);card.append(status,warnings,tableWrap,pageNav,foot);run.disabled=true;download.disabled=true;previous.disabled=true;next.disabled=true;
   let tables=[],page=1;state.degQuerySequence=state.degQuerySequence||0;
   function drawRows(rows){table.replaceChildren();const head=el("thead"),heading=el("tr");for(const name of ["完整 gene ID","log2 fold change","FDR q 值","p 值"]){const th=el("th",name);th.scope="col";heading.append(th);}head.append(heading);table.append(head);const body=el("tbody");for(const row of rows){const tr=el("tr");for(const value of [row.gene,scientificNumber(row.log2_fold_change),scientificNumber(row.fdr_q_value),scientificNumber(row.p_value)])tr.append(el("td",value));body.append(tr);}table.append(body);}
   function setOptions(){task.replaceChildren(new Option(tables.length?"选择完整 DEG 表":"未发现可查询表",""));for(const item of tables){const label=[item.target_cell_type||"全部细胞",(item.contrast_label||((item.condition_a||"A")+" / "+(item.condition_b||"B"))),item.method||"方法未记录",item.task_id].join(" · ");task.add(new Option(label,item.task_id));}if(tables.length)task.value=tables[0].task_id;run.disabled=!task.value;download.disabled=!task.value;}
@@ -198,7 +256,7 @@ function renderDegTableQuery(){
     const params=new URLSearchParams({id:id,task_id:taskId,page:String(targetPage),size:filters.size,q:filters.q,significant_only:String(sig.checked)});
     if(filters.fdr!==null){params.set("fdr_max",filters.fdr);params.set("significant_only","true");}
     if(filters.abs_log2fc_min!==null)params.set("abs_log2fc_min",filters.abs_log2fc_min);
-    run.disabled=true;status.textContent="正在校验运行快照并扫描 "+taskId+" 的完整 CSV 表…";
+    run.disabled=true;status.textContent="正在校验运行快照并读取 "+taskId+" 的完整结果表…";
     try{
       const result=await api("/api/results/deg?"+params.toString());
       if(state.selected!==id||task.value!==taskId||state.degQuerySequence!==sequence||JSON.stringify(tableFilter())!==filtersKey)return;

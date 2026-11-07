@@ -180,6 +180,12 @@ def _expand_target_branches(tasks: List[TaskContract], targets: List[str], curre
             if clone.capability == "subset_cells":
                 if clone.parameters.get("cell_type") != target:
                     raise ValueError(f"Subset cell_type must match its target branch: {target!r}")
+            if task.parameters.get("fit_receipts_uri"):
+                from eacbp.capabilities.fit_diagnostics import fit_receipts_uri
+                mapped_receipt = mapping[task.parameters["fit_receipts_uri"]]
+                branch_receipt = fit_receipts_uri(clone.expected_outputs[0])
+                clone.expected_outputs = [branch_receipt if uri == mapped_receipt else uri for uri in clone.expected_outputs]
+                clone.parameters["fit_receipts_uri"] = branch_receipt
             expanded.append(clone)
     return expanded
 
@@ -699,8 +705,29 @@ class ComputationalDAGPlanner:
         if current_state.get("advanced_analysis") or current_state.get("analysis_extensions"):
             from eacbp.orchestrator.advanced_plan import extend_plan
             tasks = extend_plan(tasks, manifest, current_state)
+        autonomous = current_state.get("autonomous_analysis")
+        if autonomous is not None:
+            intent = autonomous.get("intent")
+            if intent not in {"exploration", "condition_comparison"}:
+                raise ValueError("Unsupported autonomous analysis intent")
+            selected = {"dataset_audit", "qc", "normalization", "integration", "clustering"}
+            if intent == "condition_comparison":
+                selected.update({"subset_cells", "deg", "donor_sensitivity"})
+            # The question-scoped native entry must not acquire an unrelated
+            # disease/trajectory/simulation branch from the legacy full plan.
+            # Registered shared extensions are appended by build_study_tasks.
+            tasks = [task for task in tasks if task.capability in selected]
         if expand_targets and len(manifest.biological_design.target_cell_types) > 1:
             tasks = _expand_target_branches(tasks, list(manifest.biological_design.target_cell_types), current_state)
+        # Derive diagnostic output identities after target expansion so every
+        # population owns a distinct, admitted batch of actual fit attempts.
+        from eacbp.capabilities.fit_diagnostics import fit_receipts_uri
+        for task in tasks:
+            if (task.capability == "deg" and task.method == "pydeseq2_pseudobulk_v1") or (task.capability == "donor_sensitivity" and task.method == "pydeseq2_leave_one_donor_out_v1"):
+                receipt_uri = fit_receipts_uri(task.expected_outputs[0])
+                task.parameters["fit_receipts_uri"] = receipt_uri
+                if receipt_uri not in task.expected_outputs:
+                    task.expected_outputs.append(receipt_uri)
         producers = {uri: task.task_id for task in tasks for uri in task.expected_outputs}
         for task in tasks:
             task.depends_on = list(dict.fromkeys(producers[uri] for uri in task.input_artifacts

@@ -1,7 +1,7 @@
 '''
 Test Suite for EACBP Unified FASTQ-to-Biology Pipeline.
-Verifies FASTQQuantificationCapability, non-spatial Cell-Cell Communication (CCI),
-and full 6-plane autonomous scientific OS execution from raw FASTQ to final biological claims and report.
+Verifies FASTQQuantificationCapability and explicit rejection of spatial CCI
+when non-spatial FASTQ inputs supply no measured tissue coordinates.
 '''
 
 import pytest
@@ -79,15 +79,14 @@ def test_fastq_quantification_capability(tmp_path):
     assert result.output_artifacts[0] == f"adata://{study_id}/raw/v1"
     assert registry.exists(f"adata://{study_id}/raw/v1")
 
-    meta, payload = registry.get(f"adata://{study_id}/raw/v1")
+    meta, data = registry.get_scdata(f"adata://{study_id}/raw/v1")
     assert meta.type == ArtifactType.ANNDATA
-    data = SCData.from_dict(payload) if isinstance(payload, dict) else payload
     assert data.n_obs == 300
     assert data.n_vars == 80
     assert "Kat8" in data.var["gene_name"].values
 
 
-def test_non_spatial_cell_cell_communication(tmp_path):
+def test_non_spatial_input_cannot_produce_spatial_communication(tmp_path):
     storage_dir = tmp_path / "artifacts_cci"
     registry = ArtifactRegistry(storage_dir=str(storage_dir))
     capability = CellCellCommunicationCapability()
@@ -116,21 +115,12 @@ def test_non_spatial_cell_cell_communication(tmp_path):
         expected_outputs=[f"table://{study_id}/spatial_cci/v1"],
     )
 
-    result = capability.execute(contract, registry)
-    assert result.status == TaskStatus.SUCCESS
-    assert registry.exists(f"table://{study_id}/spatial_cci/v1")
-
-    meta, cci_df = registry.get(f"table://{study_id}/spatial_cci/v1")
-    assert meta.type == ArtifactType.TABLE
-    assert isinstance(cci_df, pd.DataFrame)
-    assert not cci_df.empty
-    assert "sender_cell_type" in cci_df.columns
-    assert "receiver_cell_type" in cci_df.columns
-    assert "ligand" in cci_df.columns
-    assert "receptor" in cci_df.columns
+    with pytest.raises(ValueError, match="Measured spatial coordinates not found"):
+        capability.execute(contract, registry)
+    assert not registry.exists(f"table://{study_id}/spatial_cci/v1")
 
 
-def test_full_fastq_to_biology_autonomous_pipeline(tmp_path):
+def test_fastq_pipeline_rejects_spatial_cci_without_measurements(tmp_path):
     storage_dir = tmp_path / "artifacts_full_fastq_study"
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -193,10 +183,12 @@ def test_full_fastq_to_biology_autonomous_pipeline(tmp_path):
         }
     )
 
-    assert summary["status"] == "success", summary["failures"]
+    assert summary["status"] == "failed"
+    assert any(failure["task_id"] == "task_010_cell_cell_communication"
+               and "Measured spatial coordinates not found" in failure["error"]
+               for failure in summary["failures"])
+    assert not registry.exists(f"table://{study_id}/spatial_cci/v1")
     assert summary["is_simulated"] is True
-    assert summary["tasks_executed"] >= 11
-    assert summary["artifacts_created"] >= 14
     assert summary["claims_count"] >= 4
 
     # Verify all audits passed

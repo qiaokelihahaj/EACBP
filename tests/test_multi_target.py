@@ -110,4 +110,4 @@ def test_real_branch_execution_resume_and_failure_isolation(tmp_path, missing_ta
             resumed = orchestrator.run_study(study, {'resume': True})
             assert resumed['status'] == 'success', resumed
             assert resumed['evidence_nodes_count'] == first['evidence_nodes_count']
-    assert registry.get('adata://s/annotated/v4')[1].n_obs == 128
+    assert registry.load_scdata('adata://s/annotated/v4').n_obs == 128

@@ -103,6 +103,38 @@ def test_external_nonzero_preserves_diagnostics():
     assert "reason" in caught.value.stderr
 
 
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_execution_environment_records_active_versions_for_shadowed_distributions(monkeypatch, reverse_order):
+    from importlib import metadata
+    import platform
+    from types import SimpleNamespace
+    from eacbp.orchestrator.checkpoint import execution_environment
+
+    installed = [
+        SimpleNamespace(metadata={"Name": "NumPy"}, version="2.3.5"),
+        SimpleNamespace(metadata={"Name": "numpy"}, version="2.5.3"),
+        SimpleNamespace(metadata={"Name": "Some_Package"}, version="0.1"),
+        SimpleNamespace(metadata={"Name": "some.package"}, version="9.9"),
+        SimpleNamespace(metadata={"Name": None}, version="unknown"),
+    ]
+    active_versions = {"numpy": "2.3.5", "some-package": "0.1"}
+    resolve_version = Mock(side_effect=active_versions.__getitem__)
+    monkeypatch.setattr(metadata, "distributions", lambda: reversed(installed) if reverse_order else iter(installed))
+    monkeypatch.setattr(metadata, "version", resolve_version)
+    monkeypatch.setattr(platform, "python_version", lambda: "3.12.1")
+    monkeypatch.setattr(platform, "platform", lambda: "test-platform")
+
+    environment = execution_environment()
+
+    assert environment["distributions"] == active_versions
+    assert [call.args for call in resolve_version.call_args_list] == [("numpy",), ("some-package",)]
+    assert set(environment) == {"python", "platform", "distributions", "source_sha256"}
+    assert environment["python"] == "3.12.1"
+    assert environment["platform"] == "test-platform"
+    assert len(environment["source_sha256"]) == 64
+    int(environment["source_sha256"], 16)
+
+
 def _resumable_study(tmp_path, monkeypatch):
     from eacbp.orchestrator.dag import ComputationalDAGPlanner
     from eacbp.orchestrator.loop import ScientificOrchestrator

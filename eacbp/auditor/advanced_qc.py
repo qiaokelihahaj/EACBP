@@ -208,8 +208,8 @@ class AdvancedQCValidator(BaseAuditor):
         try:
             _, source = registry.get(contract.input_artifacts[0])
             _, output = registry.get(result.output_artifacts[0])
-            source = source if isinstance(source, SCData) else SCData.from_dict(source)
-            output = output if isinstance(output, SCData) else SCData.from_dict(output)
+            source = SCData.from_payload(source)
+            output = SCData.from_payload(output)
             params = contract.parameters
             if not source.obs.index.is_unique or not output.obs.index.is_unique:
                 raise ValueError("Unique observation IDs are required to audit cell correspondence")

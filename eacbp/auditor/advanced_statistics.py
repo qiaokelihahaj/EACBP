@@ -21,8 +21,11 @@ from scipy import sparse
 from scipy.stats import norm, t
 
 from eacbp.auditor.base import BaseAuditor, ValidationReport, ValidationSeverity
-from eacbp.capabilities.advanced_statistics import _coerce_data
+from eacbp.capabilities.biological_units import complete_identity, resolve_donor_role
 from eacbp.capabilities.sc_data import SCData
+from eacbp.capabilities.fit_diagnostics import SCHEMA as FIT_RECEIPT_SCHEMA, canonical_sha256
+from eacbp.numerics import benjamini_hochberg
+from eacbp.schemas.artifact import ArtifactType
 from eacbp.schemas.task import AssumptionStatus, ScientificResultStatus
 
 
@@ -68,6 +71,152 @@ class _AuditInput:
     design: pd.DataFrame
     design_rank: int
     residual_df: int
+
+
+def _fit_receipt_errors(contract, result, registry, details, tables) -> list[str]:
+    """Check registered diagnostics against independently reconstructed inputs."""
+    uri = contract.parameters.get("fit_receipts_uri")
+    if not uri:
+        return []  # Old tasks remain usable; they cannot supply per-fit diagnostics.
+    errors: list[str] = []
+    try:
+        meta, payload = registry.get(str(uri))
+        science_outputs = [value for value in result.output_artifacts if value != uri]
+        if (meta.type != ArtifactType.JSON or uri not in contract.expected_outputs
+                or uri not in result.output_artifacts):
+            raise ValueError("fit receipts are not a declared registered JSON output")
+        if (payload.get("schema") != FIT_RECEIPT_SCHEMA
+                or payload.get("task_id") != contract.task_id
+                or payload.get("method") != result.method_used
+                or payload.get("input_artifact") != contract.input_artifacts[0]
+                or payload.get("input_sha256") != registry.get_metadata(contract.input_artifacts[0]).sha256_hash
+                or payload.get("science_outputs") != science_outputs
+                or meta.created_by_task != contract.task_id
+                or meta.parent_uris != [contract.input_artifacts[0], *science_outputs]):
+            raise ValueError("fit receipts differ from task, input, method, or registered lineage")
+        if (result.metrics.get("fit_receipts_uri") != uri
+                or result.metrics.get("fit_receipts_sha256") != meta.sha256_hash
+                or result.metrics.get("fit_receipts_status") != "available"):
+            raise ValueError("fit receipt metrics do not bind the registered payload")
+        fits = payload.get("fits")
+        if not isinstance(fits, list) or result.metrics.get("n_fit_receipts") != len(fits):
+            raise ValueError("fit receipt count differs from the registered payload")
+        skipped = bool(result.metrics.get("skipped"))
+        if skipped:
+            if fits or payload.get("fit_status") != "not_attempted" or not payload.get("not_attempted_reason"):
+                raise ValueError("skipped analysis must declare that no fit was attempted")
+            return []
+        if details is None:
+            raise ValueError("fit receipts cannot be audited without reconstructed input")
+        is_loo = result.method_used == "pydeseq2_leave_one_donor_out_v1"
+        expected_donors = set(details.donors_a) | set(details.donors_b) if is_loo else set()
+        donors = [fit.get("left_out_donor") for fit in fits]
+        if donors.count(None) != 1 or set(donors) != {None, *expected_donors} or len(donors) != 1 + len(expected_donors):
+            raise ValueError("fit receipts do not cover exactly the full model and every requested donor fold")
+        if len({fit.get("fit_id") for fit in fits}) != len(fits):
+            raise ValueError("fit receipts have duplicate fit IDs")
+        # Re-aggregate count sums independently without densifying the source
+        # cell-by-gene matrix. Only the donor-by-gene table is materialized.
+        bulk_rows = []
+        for _, row in details.metadata.iterrows():
+            positions = np.flatnonzero(
+                (details.obs[details.donor_col].astype(str).to_numpy() == str(row["donor"]))
+                & (details.obs[details.condition_col].astype(str).to_numpy() == str(row["condition"]))
+            )
+            if sparse.issparse(details.counts):
+                vector = np.asarray(details.counts[positions].sum(axis=0)).ravel()
+            else:
+                vector = np.zeros(len(details.genes), dtype=np.int64)
+                for position in positions:
+                    vector += np.asarray(details.counts[position], dtype=np.int64)
+            bulk_rows.append(vector)
+        bulk = pd.DataFrame(bulk_rows, index=details.metadata.index, columns=details.genes)
+        from formulaic import model_matrix
+
+        def check_frame(record, expected, label, *, integer=False):
+            if not isinstance(record, dict) or canonical_sha256(record.get("frame")) != record.get("sha256"):
+                raise ValueError(f"{label} frame hash differs")
+            frame = record["frame"]
+            if frame.get("index") != [str(value) for value in expected.index]:
+                raise ValueError(f"{label} sample IDs differ from reconstructed inputs")
+            if set(frame.get("columns", [])) != set(map(str, expected.columns)):
+                raise ValueError(f"{label} columns differ from reconstructed inputs")
+            actual = pd.DataFrame(frame["data"], index=frame["index"], columns=frame["columns"])
+            expected = expected.copy()
+            expected.index = expected.index.astype(str)
+            expected.columns = expected.columns.astype(str)
+            expected = expected.loc[actual.index, actual.columns]
+            if integer and actual.to_numpy().dtype.kind not in "biu":
+                raise ValueError(f"{label} counts are not serialized integers")
+            if not actual.astype(object).equals(expected.astype(object)):
+                raise ValueError(f"{label} values differ from independently reconstructed inputs")
+
+        for fit in fits:
+            donor = fit.get("left_out_donor")
+            label = "full model" if donor is None else f"donor {donor}"
+            try:
+                receipt = {key: value for key, value in fit.items() if key != "receipt_sha256"}
+                if canonical_sha256(receipt) != fit.get("receipt_sha256"):
+                    raise ValueError("receipt content hash differs")
+                identity = {key: fit[key] for key in (
+                    "task_id", "method", "left_out_donor", "counts_sha256",
+                    "metadata_sha256", "design_formula", "contrast")}
+                if (fit.get("fit_id") != canonical_sha256(identity)
+                        or fit.get("task_id") != contract.task_id or fit.get("method") != result.method_used
+                        or fit.get("design_formula") != details.formula
+                        or fit.get("contrast") != result.metrics.get("contrast_spec")):
+                    raise ValueError("fit identity, formula, or contrast differs from the task")
+                fit_metadata = details.metadata if donor is None else details.metadata.loc[details.metadata.donor.astype(str) != donor]
+                fit_bulk = bulk.loc[fit_metadata.index]
+                check_frame(fit.get("counts"), fit_bulk, label + " counts", integer=True)
+                check_frame(fit.get("metadata"), fit_metadata, label + " metadata")
+                if (fit.get("counts_sha256") != fit["counts"]["sha256"]
+                        or fit.get("metadata_sha256") != fit["metadata"]["sha256"]
+                        or fit.get("sample_ids") != list(fit["counts"]["frame"]["index"])):
+                    raise ValueError("fit input hashes or sample list differ")
+                expected_status = "failed" if donor in result.metrics.get("failed_fits", {}) else "completed"
+                if fit.get("status") != expected_status:
+                    raise ValueError("fit status differs from actual result coverage")
+                if expected_status == "failed":
+                    failure = fit.get("error") or {}
+                    if f"{failure.get('type')}: {failure.get('message')}" != result.metrics["failed_fits"][donor]:
+                        raise ValueError("failed fit does not retain its reported exception")
+                elif fit.get("error") is not None:
+                    raise ValueError("completed fit has an error")
+                if fit.get("design_matrix") is not None:
+                    fit_design = pd.DataFrame(model_matrix(details.formula, fit_metadata), index=fit_metadata.index)
+                    check_frame(fit["design_matrix"], fit_design, label + " design")
+                elif expected_status == "completed":
+                    raise ValueError("completed fit lacks its actual design matrix")
+                actual_trend = fit.get("actual_dispersion_trend")
+                if actual_trend not in {None, "parametric", "mean"}:
+                    raise ValueError("unsupported actual dispersion trend")
+                if (actual_trend is None) != (fit.get("dispersion_trend_source") is None):
+                    raise ValueError("actual dispersion trend lacks an observed-state source")
+                if actual_trend is not None and fit.get("dispersion_trend_source") != "dds.uns.disp_function_type":
+                    raise ValueError("dispersion trend was not observed from fitted state")
+                options = fit.get("effective_options", {})
+                if expected_status == "completed":
+                    expected_options = {"alpha": float(contract.parameters.get("alpha", .05)),
+                        "cooks_filter": bool(contract.parameters.get("cooks_filter", True)),
+                        "independent_filter": bool(contract.parameters.get("independent_filter", True)),
+                        "min_replicates": max(2, int(contract.parameters.get("min_replicates", 2)))}
+                    if any(options.get(key) != value for key, value in expected_options.items()):
+                        raise ValueError("effective inference options differ from the task")
+                versions = fit.get("software_versions", {})
+                if (versions.get("pydeseq2") != meta.software_versions.get("pydeseq2")
+                        or not versions.get("python") or versions.get("pydeseq2") in {None, "unavailable"}):
+                    raise ValueError("fit software versions differ from registered provenance")
+                if not isinstance(fit.get("warnings"), list) or not fit.get("warning_capture_scope"):
+                    raise ValueError("fit warning records lack their capture scope")
+                for warning in fit["warnings"]:
+                    if not all(key in warning for key in ("message", "category", "filename", "lineno")):
+                        raise ValueError("fit warning record is incomplete")
+            except Exception as exc:
+                errors.append(f"fit receipt {label}: {exc}")
+    except Exception as exc:
+        errors.append(f"fit receipt audit failed: {type(exc).__name__}: {exc}")
+    return errors
 
 
 def _dense(value: Any, *, max_bytes: Optional[int] = None) -> np.ndarray:
@@ -187,8 +336,7 @@ def _formula(params: Mapping[str, Any], paired: bool, covariates: list[str]) -> 
             raise ValueError("design formula is empty")
         if not formula.startswith("~"):
             formula = "~" + formula
-        cleaned = re.sub(r"\bC\s*\(\s*([^)]*)\s*\)", r"\1", formula)
-        variables = set(re.findall(r"[A-Za-z_]\w*", cleaned))
+        variables = _formula_variables(formula)
         extra: list[str] = []
         if paired and "donor" not in variables:
             extra.append("donor")
@@ -203,6 +351,22 @@ def _formula(params: Mapping[str, Any], paired: bool, covariates: list[str]) -> 
     return "~" + " + ".join(terms)
 
 
+def _formula_variables(formula: str) -> set[str]:
+    cleaned = re.sub(r"\bC\s*\(\s*([^)]*)\s*\)", r"\1", formula)
+    return set(re.findall(r"[A-Za-z_]\w*", cleaned))
+
+
+def _condition_factor_in_formula(requested: str, details: _AuditInput) -> str:
+    """Independently map a source condition alias onto a modeled factor."""
+    variables = _formula_variables(details.formula)
+    for candidate in dict.fromkeys((requested, details.condition_col, "condition")):
+        if candidate in variables:
+            return candidate
+    raise ValueError(
+        f"condition factor {requested!r} is not included in reconstructed design {details.formula!r}"
+    )
+
+
 def _reconstruct_input(
     data: SCData,
     params: Mapping[str, Any],
@@ -215,17 +379,15 @@ def _reconstruct_input(
     if len(obs) != counts.shape[0]:
         raise ValueError("observation metadata length does not match counts")
     condition_col = _resolve_column(obs, params.get("condition_col"), ("condition",), "condition")
-    donor_col = _resolve_column(
-        obs,
-        params.get("donor_col"),
-        ("donor", "donor_id", "mouse_id", "sample_id", "sample"),
-        "donor",
-    )
+    donor_role = resolve_donor_role(obs, params)
+    donor_col = donor_role.column
+    if donor_col is None:
+        raise ValueError(donor_role.limitation)
     if obs[[condition_col, donor_col]].isna().any().any():
         raise ValueError("donor/condition metadata contain missing values")
     condition_values = obs[condition_col].astype(str)
     donor_values = obs[donor_col].astype(str)
-    if donor_values.str.lower().isin({"nan", "none", "<na>", "nat"}).any():
+    if not complete_identity(obs[donor_col]):
         raise ValueError("donor metadata contain missing values")
     observed = list(pd.unique(condition_values))
     condition_a = str(params.get("condition_a", result_metrics.get("condition_a", "")))
@@ -500,6 +662,171 @@ def _table_statistics_errors(table: pd.DataFrame, params: Mapping[str, Any]) -> 
     return errors
 
 
+def _loo_multiple_testing_errors(primary: pd.DataFrame, expected_genes: set[str]) -> tuple[list[str], dict[str, Any]]:
+    """Check p-values and BH-adjusted q-values separately within every LOO fit."""
+    required = {"gene", "left_out_donor", "p_value", "fdr_q_value", "log2_fold_change", "status", "status_reason"}
+    missing = sorted(required - set(primary.columns))
+    metrics: dict[str, Any] = {"n_fit_groups": 0, "expected_gene_count": len(expected_genes), "fits": {}}
+    if missing:
+        return [f"LOO multiple-testing table lacks columns {missing}"], metrics
+
+    errors: list[str] = []
+    for fit_id, fit in primary.groupby(primary["left_out_donor"].astype(str), sort=False):
+        label = str(fit_id)
+        gene_keys = fit["gene"].astype(str)
+        if gene_keys.duplicated().any() or set(gene_keys) != expected_genes:
+            errors.append(f"LOO fit {label} does not contain one row per gene in the FDR family")
+        p_values = pd.to_numeric(fit["p_value"], errors="coerce").to_numpy(dtype=float)
+        q_values = pd.to_numeric(fit["fdr_q_value"], errors="coerce").to_numpy(dtype=float)
+        effects = pd.to_numeric(fit["log2_fold_change"], errors="coerce").to_numpy(dtype=float)
+        statuses = fit["status"].astype(str).to_numpy()
+        reasons = fit["status_reason"].fillna("").astype(str).to_numpy()
+        finite_p = np.isfinite(p_values)
+        finite_q = np.isfinite(q_values)
+        finite_effect = np.isfinite(effects)
+        if np.isinf(p_values).any() or (finite_p & ((p_values < 0) | (p_values > 1))).any():
+            errors.append(f"LOO fit {label} contains an invalid raw p-value")
+        if np.isinf(q_values).any() or (finite_q & ((q_values < 0) | (q_values > 1))).any():
+            errors.append(f"LOO fit {label} contains an invalid adjusted p-value")
+        if (finite_q & ~finite_p).any() or (finite_q & ~finite_effect).any():
+            errors.append(f"LOO fit {label} has an adjusted p-value without a finite effect and raw p-value")
+
+        for position in range(len(fit)):
+            if finite_q[position]:
+                if statuses[position] != "estimated":
+                    errors.append(f"LOO fit {label} finite adjusted p-values must have estimated status")
+                    break
+            elif finite_p[position] and finite_effect[position]:
+                if (statuses[position] != "estimated_fdr_missing"
+                        or "independent_filter" not in reasons[position]):
+                    errors.append(
+                        f"LOO fit {label} filtered adjusted p-values require the independent-filtering status and reason"
+                    )
+                    break
+            elif not finite_p[position]:
+                if statuses[position] != "not_estimated" or not reasons[position].strip():
+                    errors.append(f"LOO fit {label} missing raw p-values require an explicit not-estimated reason")
+                    break
+
+        finite_q_count = int(finite_q.sum())
+        max_bh_difference = None
+        if finite_q_count:
+            # PyDESeq2's independent filtering leaves filtered q-values NA;
+            # the reported finite q-values are BH-adjusted over that finite-q family.
+            expected_q = benjamini_hochberg(p_values[finite_q])
+            difference = np.abs(q_values[finite_q] - expected_q)
+            max_bh_difference = float(difference.max()) if difference.size else 0.0
+            if not np.allclose(q_values[finite_q], expected_q, rtol=1e-6, atol=1e-8):
+                errors.append(f"LOO fit {label} adjusted p-values do not match within-fit BH correction")
+        else:
+            errors.append(f"LOO fit {label} has no finite adjusted p-values to verify")
+        metrics["fits"][label] = {
+            "n_genes": int(len(fit)),
+            "n_finite_p_values": int(finite_p.sum()),
+            "n_finite_q_values": finite_q_count,
+            "n_filtered_q_values": int((finite_p & ~finite_q & finite_effect).sum()),
+            "max_absolute_bh_difference": max_bh_difference,
+        }
+    metrics["n_fit_groups"] = len(metrics["fits"])
+    return list(dict.fromkeys(errors)), metrics
+
+
+def _loo_pseudoreplication_errors(
+    details: Optional[_AuditInput],
+    primary: Optional[pd.DataFrame],
+    params: Mapping[str, Any],
+    *,
+    skipped: bool,
+) -> tuple[list[str], dict[str, Any]]:
+    """Verify the independently reconstructed donor-condition analysis units."""
+    metrics: dict[str, Any] = {
+        "statistical_unit": "donor_pseudobulk",
+        "pseudobulk_unit": "donor_condition",
+        "donor_independence": "unknown",
+        "confirmatory_allowed": False,
+    }
+    if details is None:
+        return ["donor-condition pseudobulk cannot be independently reconstructed"], metrics
+
+    metadata = details.metadata
+    required = {"donor", "condition"}
+    if not required.issubset(metadata.columns):
+        return ["reconstructed pseudobulk metadata lacks canonical donor/condition columns"], metrics
+    if metadata.empty or metadata.index.duplicated().any():
+        return ["reconstructed donor-condition pseudobulk units are empty or duplicated"], metrics
+    unit_pairs = set(zip(metadata["donor"].astype(str), metadata["condition"].astype(str)))
+    if len(unit_pairs) != len(metadata):
+        return ["reconstructed pseudobulk has more than one sample per donor-condition unit"], metrics
+
+    obs = details.obs
+    condition_values = obs[details.condition_col].astype(str)
+    donor_values = obs[details.donor_col].astype(str)
+    selected = condition_values.isin([details.condition_a, details.condition_b])
+    cell_pairs = set(zip(donor_values.loc[selected], condition_values.loc[selected]))
+    if unit_pairs != cell_pairs:
+        return ["pseudobulk sample units do not match observed donor-condition groups"], metrics
+
+    donors_a = set(metadata.loc[metadata["condition"].astype(str) == details.condition_a, "donor"].astype(str))
+    donors_b = set(metadata.loc[metadata["condition"].astype(str) == details.condition_b, "donor"].astype(str))
+    if details.paired and donors_a != donors_b:
+        return ["paired pseudobulk units do not contain both conditions for every donor"], metrics
+
+    metrics.update({
+        "n_pseudobulk_samples_full": int(len(metadata)),
+        "n_donor_condition_units": int(len(unit_pairs)),
+        "n_donors": int(len(set(metadata["donor"].astype(str)))),
+        "donor_counts_by_condition": {
+            details.condition_a: len(donors_a),
+            details.condition_b: len(donors_b),
+        },
+        "paired": bool(details.paired),
+    })
+    if skipped or primary is None:
+        return [], metrics
+
+    if not {"left_out_donor", "statistical_unit", "pseudobulk_unit", "paired"}.issubset(primary.columns):
+        return ["LOO result lacks donor-pseudobulk unit labels"], metrics
+    supplied = params.get("contrast")
+    if (isinstance(supplied, (list, tuple)) and len(supplied) == 3
+            and all(isinstance(value, str) for value in supplied)):
+        condition_a, condition_b = str(supplied[1]), str(supplied[2])
+    else:
+        condition_a, condition_b = details.condition_a, details.condition_b
+
+    errors: list[str] = []
+    fit_metrics: dict[str, Any] = {}
+    for fit_id, rows in primary.groupby(primary["left_out_donor"].astype(str), sort=False):
+        fit_metadata = (
+            metadata if str(fit_id) == "__full_model__"
+            else metadata.loc[metadata["donor"].astype(str) != str(fit_id)]
+        )
+        expected_counts = {
+            "n_pseudobulk_samples": len(fit_metadata),
+            "n_donors_condition_a": fit_metadata.loc[
+                fit_metadata["condition"].astype(str) == condition_a, "donor"
+            ].astype(str).nunique(),
+            "n_donors_condition_b": fit_metadata.loc[
+                fit_metadata["condition"].astype(str) == condition_b, "donor"
+            ].astype(str).nunique(),
+        }
+        for column, expected in expected_counts.items():
+            if column not in rows:
+                errors.append(f"LOO fit {fit_id} lacks {column}")
+                continue
+            actual = pd.to_numeric(rows[column], errors="coerce")
+            if actual.isna().any() or not np.equal(actual.to_numpy(dtype=float), expected).all():
+                errors.append(f"LOO fit {fit_id} {column} differs from reconstructed donor-condition units")
+        if not rows["statistical_unit"].astype(str).eq("donor_pseudobulk").all():
+            errors.append(f"LOO fit {fit_id} does not declare donor_pseudobulk as its statistical unit")
+        if not rows["pseudobulk_unit"].astype(str).eq("donor_condition").all():
+            errors.append(f"LOO fit {fit_id} does not declare donor_condition as its pseudobulk unit")
+        if not rows["paired"].astype(str).str.casefold().eq(str(details.paired).casefold()).all():
+            errors.append(f"LOO fit {fit_id} paired status differs from the reconstructed design")
+        fit_metrics[str(fit_id)] = {key: int(value) for key, value in expected_counts.items()}
+    metrics["fits"] = fit_metrics
+    return list(dict.fromkeys(errors)), metrics
+
+
 def _inference_errors(tables, metrics, params, details, method):
     """Reconstruct result semantics from the request, independently of the executor."""
     errors = []
@@ -518,10 +845,11 @@ def _inference_errors(tables, metrics, params, details, method):
             if (factor not in {"condition", details.condition_col} or tested == reference
                     or {tested, reference} != {details.condition_a, details.condition_b}):
                 raise ValueError("categorical contrast does not match the requested conditions")
+            factor = _condition_factor_in_formula(str(factor), details)
             label = f"{tested} versus {reference}"
             definition = (f"Donor-level covariate-adjusted OLS difference in inferred activity for {label}"
                           if activity else f"PyDESeq2 log2 fold change for {label}")
-            vector = list(supplied)
+            vector = [factor, tested, reference]
         else:
             vector_array = np.asarray(supplied, dtype=float)
             if (vector_array.ndim != 1 or not len(vector_array) or not np.isfinite(vector_array).all()
@@ -828,28 +1156,62 @@ def _check_summary_against_fits(summary: pd.DataFrame, primary: pd.DataFrame, de
     if not required.issubset(summary.columns):
         return [f"LOO summary is missing columns {sorted(required - set(summary.columns))}"]
     genes = set(details.genes)
-    if set(summary["gene"].astype(str)) != genes or summary["gene"].astype(str).duplicated().any():
+    summary_gene_keys = summary["gene"].astype(str)
+    if set(summary_gene_keys) != genes or summary_gene_keys.duplicated().any():
         errors.append("LOO summary does not contain exactly one row per input gene")
         return errors
     primary = primary.copy()
     if "left_out_donor" not in primary:
         return errors + ["LOO primary output lacks left_out_donor"]
+    if details.genes:
+        primary_gene_keys = primary["gene"].astype(str)
+        primary_gene_positions = primary_gene_keys.groupby(primary_gene_keys, sort=False).indices
+        summary_gene_positions = summary_gene_keys.groupby(summary_gene_keys, sort=False).indices
+        primary_donor_keys = primary["left_out_donor"].astype(str).to_numpy()
+        primary_effects = (
+            pd.to_numeric(primary["log2_fold_change"], errors="coerce")
+            if "log2_fold_change" in primary
+            else pd.Series(np.nan, index=primary.index, dtype=float)
+        )
+        primary_q_values = (
+            pd.to_numeric(primary["fdr_q_value"], errors="coerce")
+            if "fdr_q_value" in primary
+            else pd.Series(np.nan, index=primary.index, dtype=float)
+        )
+    else:
+        primary_gene_positions = {}
+        summary_gene_positions = {}
+        primary_donor_keys = np.asarray([], dtype=str)
+        primary_effects = pd.Series(dtype=float)
+        primary_q_values = pd.Series(dtype=float)
+    requested_fits: int | None = None
     for gene in details.genes:
-        base = primary.loc[(primary["gene"].astype(str) == gene) & (primary["left_out_donor"].astype(str) == "__full_model__")]
-        fits = primary.loc[(primary["gene"].astype(str) == gene) & (primary["left_out_donor"].astype(str) != "__full_model__")]
-        row = summary.loc[summary["gene"].astype(str) == gene].iloc[0]
-        effects = pd.to_numeric(fits.get("log2_fold_change", pd.Series(dtype=float)), errors="coerce").dropna()
-        q_values = pd.to_numeric(fits.get("fdr_q_value", pd.Series(dtype=float)), errors="coerce").dropna()
-        baseline_lfc = pd.to_numeric(base.get("log2_fold_change", pd.Series(dtype=float)), errors="coerce").dropna()
-        baseline_q = pd.to_numeric(base.get("fdr_q_value", pd.Series(dtype=float)), errors="coerce").dropna()
-        if len(base) != 1:
+        positions = primary_gene_positions.get(gene, np.asarray([], dtype=np.intp))
+        gene_donors = primary_donor_keys[positions]
+        baseline_positions = positions[gene_donors == "__full_model__"]
+        fit_positions = positions[gene_donors != "__full_model__"]
+        row = summary.iloc[summary_gene_positions[gene][0]]
+        raw_effects = primary_effects.iloc[fit_positions]
+        effects = raw_effects.loc[np.isfinite(raw_effects.to_numpy(dtype=float))]
+        fit_q_values = primary_q_values.iloc[fit_positions]
+        q_values = fit_q_values.loc[np.isfinite(fit_q_values.to_numpy(dtype=float))]
+        baseline_lfc = primary_effects.iloc[baseline_positions]
+        baseline_lfc = baseline_lfc.loc[np.isfinite(baseline_lfc.to_numpy(dtype=float))]
+        baseline_q_values = primary_q_values.iloc[baseline_positions]
+        baseline_q = baseline_q_values.loc[np.isfinite(baseline_q_values.to_numpy(dtype=float))]
+        if len(baseline_positions) != 1:
             errors.append(f"gene {gene} lacks one full-model baseline row")
             continue
         expected_n = len(effects)
         if int(row["n_estimated_loo"]) != expected_n:
             errors.append(f"gene {gene} has incorrect n_estimated_loo")
-        requested = int(pd.to_numeric(primary["n_requested_fits"], errors="coerce").dropna().iloc[0]) if "n_requested_fits" in primary and primary["n_requested_fits"].notna().any() else 0
-        expected_coverage = expected_n / requested if requested else np.nan
+        if requested_fits is None:
+            requested_fits = (
+                int(pd.to_numeric(primary["n_requested_fits"], errors="coerce").dropna().iloc[0])
+                if "n_requested_fits" in primary and primary["n_requested_fits"].notna().any()
+                else 0
+            )
+        expected_coverage = expected_n / requested_fits if requested_fits else np.nan
         actual_coverage = pd.to_numeric(pd.Series([row["estimated_coverage"]]), errors="coerce").iloc[0]
         if np.isfinite(expected_coverage) and (not np.isfinite(actual_coverage) or not np.isclose(actual_coverage, expected_coverage)):
             errors.append(f"gene {gene} has incorrect estimated coverage")
@@ -858,16 +1220,26 @@ def _check_summary_against_fits(summary: pd.DataFrame, primary: pd.DataFrame, de
             actual_direction = pd.to_numeric(pd.Series([row["direction_consistency"]]), errors="coerce").iloc[0]
             if not np.isfinite(actual_direction) or not np.isclose(actual_direction, expected_direction):
                 errors.append(f"gene {gene} has incorrect direction consistency")
+        else:
+            actual_direction = pd.to_numeric(pd.Series([row["direction_consistency"]]), errors="coerce").iloc[0]
+            if pd.notna(actual_direction):
+                errors.append(f"gene {gene} has unsupported direction consistency")
         if len(effects):
             for column, expected_value in (("min_log2_fold_change", effects.min()), ("max_log2_fold_change", effects.max()), ("median_log2_fold_change", effects.median())):
                 actual = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
                 if not np.isfinite(actual) or not np.isclose(actual, expected_value):
                     errors.append(f"gene {gene} has incorrect {column}")
+        else:
+            for column in ("min_log2_fold_change", "max_log2_fold_change", "median_log2_fold_change"):
+                if pd.notna(pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]):
+                    errors.append(f"gene {gene} has unsupported {column}")
         if len(q_values) and len(baseline_q):
             expected_retention = float(((q_values.to_numpy() < alpha) == (float(baseline_q.iloc[0]) < alpha)).mean())
             actual_retention = pd.to_numeric(pd.Series([row["significance_retention"]]), errors="coerce").iloc[0]
             if not np.isfinite(actual_retention) or not np.isclose(actual_retention, expected_retention):
                 errors.append(f"gene {gene} has incorrect significance retention")
+        elif pd.notna(pd.to_numeric(pd.Series([row["significance_retention"]]), errors="coerce").iloc[0]):
+            errors.append(f"gene {gene} has unsupported significance retention")
         for column, threshold in (("n_significant_loo", alpha), ("n_significant_loo_fdr05", 0.05)):
             if column not in row or row[column] != int(q_values.lt(threshold).sum()):
                 errors.append(f"gene {gene} has incorrect {column}")
@@ -908,7 +1280,7 @@ class AdvancedStatisticsValidator(BaseAuditor):
 
         try:
             _, payload = registry.get(contract.input_artifacts[0])
-            data = payload if isinstance(payload, SCData) else _coerce_data(payload)
+            data = SCData.from_payload(payload)
             details = _reconstruct_input(data, params, result.metrics, method)
             if method != "pydeseq2_leave_one_donor_out_v1":
                 threshold = max(2, int(params.get("min_donors", 2)))
@@ -921,7 +1293,11 @@ class AdvancedStatisticsValidator(BaseAuditor):
             if contract.expected_outputs and list(result.output_artifacts) != list(contract.expected_outputs):
                 errors.append("result output artifacts do not satisfy expected_outputs")
             for uri in result.output_artifacts:
-                _, payload = registry.get(uri)
+                metadata, payload = registry.get(uri)
+                if uri == params.get("fit_receipts_uri"):
+                    continue
+                if metadata.type != ArtifactType.TABLE:
+                    raise ValueError(f"scientific output {uri} is not a table")
                 tables.append(payload if isinstance(payload, pd.DataFrame) else pd.DataFrame(payload))
         except Exception as exc:
             errors.append(f"result table retrieval failed: {type(exc).__name__}: {exc}")
@@ -935,6 +1311,19 @@ class AdvancedStatisticsValidator(BaseAuditor):
             "; ".join(dict.fromkeys(contract_errors)) if contract_errors else "Task, result, contrast, FDR family, and artifact provenance carry one resolved inference contract.",
         )
         errors.extend(contract_errors)
+
+        receipt_errors = _fit_receipt_errors(contract, result, registry, details, tables)
+        report.add_check(
+            "advanced_statistics_fit_receipts", not receipt_errors,
+            ValidationSeverity.ERROR,
+            "; ".join(receipt_errors) if receipt_errors else (
+                "Registered per-fit inputs, design, contrast, coverage, warnings and software provenance were checked."
+                if params.get("fit_receipts_uri") else
+                "Per-fit diagnostics are unavailable for this legacy task; no diagnostic completeness is certified."
+            ),
+            {"diagnostics_available": bool(params.get("fit_receipts_uri"))},
+        )
+        errors.extend(receipt_errors)
 
         input_errors = [e for e in errors if e.startswith("input reconstruction") or "fewer than" in e]
         report.add_check(
@@ -952,19 +1341,70 @@ class AdvancedStatisticsValidator(BaseAuditor):
                 design_errors.append("reported design rank does not match the reconstructed design")
             if result.metrics.get("design") is not None and str(result.metrics["design"]) != details.formula:
                 design_errors.append("reported design formula does not match parameters and metadata")
+            if (method == "pydeseq2_leave_one_donor_out_v1"
+                    and result.metrics.get("residual_degrees_of_freedom") is not None
+                    and int(result.metrics["residual_degrees_of_freedom"]) != details.residual_df):
+                design_errors.append("reported full-model residual degrees of freedom do not match the reconstructed design")
             for table in tables:
                 if "design" in table:
                     values = {str(v) for v in table["design"].dropna().unique()}
                     if values and values != {details.formula}:
                         design_errors.append("result table design formula differs from reconstructed design")
-                if "design_rank" in table:
-                    ranks = pd.to_numeric(table["design_rank"], errors="coerce").dropna()
-                    if len(ranks) and not np.all(ranks.astype(int) == details.design_rank):
-                        design_errors.append("result table design rank differs from reconstructed design")
-                if "residual_degrees_of_freedom" in table:
-                    residual = pd.to_numeric(table["residual_degrees_of_freedom"], errors="coerce").dropna()
-                    if len(residual) and not np.all(residual.astype(int) == details.residual_df):
-                        design_errors.append("result table residual degrees of freedom differs from reconstructed design")
+                if (method == "pydeseq2_leave_one_donor_out_v1"
+                        and "left_out_donor" in table):
+                    skipped_fit_table = (
+                        not table.empty
+                        and "status" in table
+                        and table["status"].astype(str).eq("skipped").all()
+                    )
+                    if skipped_fit_table:
+                        # An explicit underpowered skip has no fitted full or
+                        # leave-one-donor-out models.  Its placeholder row
+                        # must not be interpreted as a fit group; the input
+                        # design is still independently reconstructed above.
+                        for diagnostic in ("design_rank", "residual_degrees_of_freedom"):
+                            if diagnostic in table and table[diagnostic].notna().any():
+                                design_errors.append(
+                                    f"skipped LOO output cannot claim fitted {diagnostic} values"
+                                )
+                    elif "design_rank" not in table:
+                        design_errors.append("LOO result table lacks per-fit design_rank")
+                    else:
+                        for fit_id, fit_rows in table.groupby(table["left_out_donor"].astype(str), sort=False):
+                            fit_metadata = (
+                                details.metadata
+                                if fit_id == "__full_model__"
+                                else details.metadata.loc[details.metadata["donor"].astype(str) != fit_id]
+                            )
+                            try:
+                                fit_design = details.design.loc[fit_metadata.index].to_numpy(dtype=float)
+                                expected_rank = int(np.linalg.matrix_rank(fit_design))
+                                expected_residual_df = int(len(fit_metadata) - expected_rank)
+                            except Exception as exc:
+                                design_errors.append(f"LOO fit {fit_id} design cannot be independently reconstructed: {exc}")
+                                continue
+                            ranks = pd.to_numeric(fit_rows["design_rank"], errors="coerce")
+                            if ranks.isna().any() or not np.equal(ranks.to_numpy(dtype=float), expected_rank).all():
+                                design_errors.append(f"LOO fit {fit_id} design rank differs from its reconstructed fit design")
+                            if "residual_degrees_of_freedom" not in fit_rows:
+                                design_errors.append(f"LOO fit {fit_id} lacks residual_degrees_of_freedom")
+                            else:
+                                residual = pd.to_numeric(fit_rows["residual_degrees_of_freedom"], errors="coerce")
+                                if residual.isna().any() or not np.equal(
+                                    residual.to_numpy(dtype=float), expected_residual_df
+                                ).all():
+                                    design_errors.append(
+                                        f"LOO fit {fit_id} residual degrees of freedom differ from its reconstructed fit design"
+                                    )
+                else:
+                    if "design_rank" in table:
+                        ranks = pd.to_numeric(table["design_rank"], errors="coerce").dropna()
+                        if len(ranks) and not np.all(ranks.astype(int) == details.design_rank):
+                            design_errors.append("result table design rank differs from reconstructed design")
+                    if "residual_degrees_of_freedom" in table:
+                        residual = pd.to_numeric(table["residual_degrees_of_freedom"], errors="coerce").dropna()
+                        if len(residual) and not np.all(residual.astype(int) == details.residual_df):
+                            design_errors.append("result table residual degrees of freedom differs from reconstructed design")
                 if "covariates" in table:
                     expected_covariates = ",".join(details.covariates)
                     values = {str(v) for v in table["covariates"].dropna().unique()}
@@ -1069,6 +1509,42 @@ class AdvancedStatisticsValidator(BaseAuditor):
                         baseline = primary.loc[primary["left_out_donor"].astype(str) == "__full_model__"]
                         if set(baseline["gene"].astype(str)) != genes or baseline["gene"].astype(str).duplicated().any():
                             loo_errors.append("LOO full-model baseline does not preserve the full gene universe")
+
+                        supplied_contrast = params.get("contrast")
+                        if (isinstance(supplied_contrast, (list, tuple))
+                                and len(supplied_contrast) == 3
+                                and all(isinstance(value, str) for value in supplied_contrast)):
+                            expected_condition_a, expected_condition_b = map(str, supplied_contrast[1:])
+                        else:
+                            expected_condition_a, expected_condition_b = details.condition_a, details.condition_b
+
+                        def check_fit_metadata_counts(rows, fit_metadata, label):
+                            expected = {
+                                "n_pseudobulk_samples": int(len(fit_metadata)),
+                                "n_donors_condition_a": int(
+                                    fit_metadata.loc[
+                                        fit_metadata["condition"].astype(str) == expected_condition_a, "donor"
+                                    ].astype(str).nunique()
+                                ),
+                                "n_donors_condition_b": int(
+                                    fit_metadata.loc[
+                                        fit_metadata["condition"].astype(str) == expected_condition_b, "donor"
+                                    ].astype(str).nunique()
+                                ),
+                            }
+                            for column, count in expected.items():
+                                if column not in rows:
+                                    loo_errors.append(f"LOO {label} lacks {column}")
+                                    continue
+                                observed_count = pd.to_numeric(rows[column], errors="coerce")
+                                if observed_count.isna().any() or not np.equal(
+                                    observed_count.to_numpy(dtype=float), count
+                                ).all():
+                                    loo_errors.append(
+                                        f"LOO {label} {column} does not match reconstructed fit metadata"
+                                    )
+
+                        check_fit_metadata_counts(baseline, details.metadata, "full-model")
                         donor_ids = set(details.donors_a) | set(details.donors_b)
                         observed = set(primary.loc[primary["left_out_donor"].astype(str) != "__full_model__", "left_out_donor"].astype(str))
                         if not observed.issubset(donor_ids):
@@ -1092,6 +1568,12 @@ class AdvancedStatisticsValidator(BaseAuditor):
                             donor_rows = primary.loc[primary["left_out_donor"].astype(str) == donor]
                             if set(donor_rows["gene"].astype(str)) != genes or donor_rows["gene"].astype(str).duplicated().any():
                                 loo_errors.append(f"LOO donor {donor} does not have a complete gene table")
+                            donor_fit_metadata = details.metadata.loc[
+                                details.metadata["donor"].astype(str) != donor
+                            ]
+                            check_fit_metadata_counts(
+                                donor_rows, donor_fit_metadata, f"donor {donor}"
+                            )
                             expected_removed = 2 if details.paired else 1
                             if "removed_sample_count" not in donor_rows or set(pd.to_numeric(donor_rows["removed_sample_count"], errors="coerce").dropna().astype(int)) != {expected_removed}:
                                 loo_errors.append(f"LOO donor {donor} does not remove the expected complete donor sample")
@@ -1100,7 +1582,8 @@ class AdvancedStatisticsValidator(BaseAuditor):
                         summary = next((table for table in tables[1:] if {"direction_consistency", "estimated_coverage"}.issubset(table.columns)), None)
                         if summary is None and {"direction_consistency", "estimated_coverage"}.issubset(primary.columns):
                             summary = primary.drop_duplicates("gene")
-                        if len(contract.expected_outputs) >= 2 and summary is None:
+                        science_outputs = [uri for uri in contract.expected_outputs if uri != params.get("fit_receipts_uri")]
+                        if len(science_outputs) >= 2 and summary is None:
                             loo_errors.append("expected LOO summary output is absent")
                         if summary is not None:
                             loo_errors.extend(_check_summary_against_fits(summary, primary, details, float(params.get("alpha", 0.05))))
@@ -1116,6 +1599,52 @@ class AdvancedStatisticsValidator(BaseAuditor):
             "; ".join(dict.fromkeys(loo_errors)) if loo_errors else ("Every requested donor LOO fit removes the complete donor and has independently checked effect sensitivity." if method == "pydeseq2_leave_one_donor_out_v1" else "Not applicable to this method."),
         )
         errors.extend(loo_errors)
+
+        if method == "pydeseq2_leave_one_donor_out_v1":
+            loo_primary = tables[0] if tables else None
+            loo_skipped = bool(result.metrics.get("skipped")) or (
+                loo_primary is not None
+                and "status" in loo_primary
+                and loo_primary["status"].astype(str).eq("skipped").all()
+            )
+            if details is None:
+                fdr_errors, fdr_metrics = ["LOO FDR cannot be checked without reconstructed input genes"], {}
+            elif loo_skipped:
+                fdr_errors = []
+                fdr_metrics = {"skipped": True, "n_fit_groups": 0, "expected_gene_count": len(details.genes), "fits": {}}
+            elif loo_primary is None:
+                fdr_errors, fdr_metrics = ["LOO FDR cannot be checked because the primary table is absent"], {}
+            else:
+                fdr_errors, fdr_metrics = _loo_multiple_testing_errors(loo_primary, set(details.genes))
+            report.add_check(
+                "multiple_testing_correction",
+                not fdr_errors,
+                ValidationSeverity.ERROR,
+                "; ".join(dict.fromkeys(fdr_errors)) if fdr_errors else (
+                    "No fit was run; the explicit skip is retained without an FDR claim."
+                    if loo_skipped else
+                    "Every full or donor-deleted fit has independently checked within-fit BH values and explicit NA status."
+                ),
+                fdr_metrics,
+            )
+            errors.extend(fdr_errors)
+
+            pseudoreplication_errors, pseudoreplication_metrics = _loo_pseudoreplication_errors(
+                details,
+                loo_primary,
+                params,
+                skipped=loo_skipped,
+            )
+            report.add_check(
+                "pseudoreplication_audit",
+                not pseudoreplication_errors,
+                ValidationSeverity.ERROR,
+                "; ".join(dict.fromkeys(pseudoreplication_errors)) if pseudoreplication_errors else (
+                    "Donor-condition pseudobulk units and complete-donor fit units were checked; donor independence remains unknown."
+                ),
+                pseudoreplication_metrics,
+            )
+            errors.extend(pseudoreplication_errors)
 
         report.add_check(
             "advanced_statistics_integrity",

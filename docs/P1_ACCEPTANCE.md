@@ -46,9 +46,17 @@ See [P1_DEPLOYMENT.md](../P1_DEPLOYMENT.md) for the CPU image and Slurm/Apptaine
 workflow. Each job invokes the existing `run`, `resume`, or `report` CLI for one
 study. Scheduler controls do not introduce a second workflow engine.
 
-The development host has no usable Linux Docker daemon, Slurm commands, or
-Apptainer runtime. Image builds, container smoke execution, and actual scheduler
-execution require a suitable host and remain deployment acceptance work.
+Docker Desktop and WSL Linux are available on the development host. A hashed
+Linux/Python 3.12 environment covering all five scientific extras passes
+`pip check` for 103 installed packages; see
+[CURRENT_INTEGRATION_ACCEPTANCE.md](CURRENT_INTEGRATION_ACCEPTANCE.md) for the
+current Linux integration results. The Docker Desktop proxy was configured to
+use the existing local Clash listener after the direct registry connection
+timed out. The pinned CPU image then built successfully and its non-root cache
+write probe passed. The synthetic end-to-end container smoke passed run, resume,
+report, export, import, and restored report with networking disabled and a read-only
+root filesystem. See [DOCKER_ACCEPTANCE.md](DOCKER_ACCEPTANCE.md) for details. Slurm and
+Apptainer are unavailable locally, and no cluster target was supplied.
 
 ## Validation record
 
@@ -79,6 +87,7 @@ $env:MPLCONFIGDIR = "$PWD\.cache\matplotlib"
 ```
 
 No real biological dataset or cluster configuration was supplied for this run.
-Real-study acceptance, a clean Linux image build, container smoke execution, and
-Slurm execution remain unperformed. No Git commit, push, image publication, or
-cluster submission was made.
+Real-study acceptance and Slurm execution remain unperformed. The Linux image
+build succeeded after Docker Desktop proxy configuration; its synthetic
+container lifecycle smoke is tracked in [DOCKER_ACCEPTANCE.md](DOCKER_ACCEPTANCE.md).
+No Git commit, push, image publication, or cluster submission was made.

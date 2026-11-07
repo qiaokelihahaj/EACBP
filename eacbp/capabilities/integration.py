@@ -13,28 +13,44 @@ from eacbp.capabilities.base import BaseCapability, ImplementationType
 from eacbp.capabilities.sc_data import SCData
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
+from eacbp.schemas.audit import stable_fingerprint
 
 
-def compute_pca(X: Any, n_components: int = 30) -> np.ndarray:
+def compute_pca(X: Any, n_components: int = 30, random_seed: int = 42) -> np.ndarray:
     """Fast PCA dimensionality reduction compatible with sparse and dense matrices using scipy."""
+    return _compute_pca_with_route(X, n_components, random_seed)[0]
+
+
+def _compute_pca_with_route(X: Any, n_components: int, random_seed: int):
+    """Record the existing numerical route without changing its computation."""
     if hasattr(X, "tocsr"):
         X_sp = X.tocsr().astype(np.float32)
         k = min(n_components, max(1, X_sp.shape[0] - 2), max(1, X_sp.shape[1] - 2))
+        v0 = np.random.default_rng(random_seed).standard_normal(min(X_sp.shape))
         try:
             from scipy.sparse.linalg import svds
-            u, s, vt = svds(X_sp, k=k)
-            return u[:, ::-1] * s[::-1]
+            u, s, vt = svds(X_sp, k=k, v0=v0)
+            return u[:, ::-1] * s[::-1], {
+                "algorithm": "uncentered_sparse_truncated_svd", "zero_center": False,
+                "solver": "scipy.sparse.linalg.svds", "fallback_used": False,
+            }
         except Exception:
             X_dense = X_sp.toarray()
             X_centered = X_dense - np.mean(X_dense, axis=0, keepdims=True)
             u, s, vt = np.linalg.svd(X_centered, full_matrices=False)
-            return u[:, :k] * s[:k]
+            return u[:, :k] * s[:k], {
+                "algorithm": "centered_dense_svd_fallback", "zero_center": True,
+                "solver": "numpy.linalg.svd", "fallback_used": True,
+            }
     else:
         X_dense = np.asarray(X, dtype=np.float32)
         X_centered = X_dense - np.mean(X_dense, axis=0, keepdims=True)
         u, s, vt = np.linalg.svd(X_centered, full_matrices=False)
         k = min(n_components, X_dense.shape[0], X_dense.shape[1])
-        return u[:, :k] * s[:k]
+        return u[:, :k] * s[:k], {
+            "algorithm": "centered_dense_svd", "zero_center": True,
+            "solver": "numpy.linalg.svd", "fallback_used": False,
+        }
 
 
 def calculate_batch_mixing_score(
@@ -93,9 +109,7 @@ class IntegrationCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        meta, payload = registry.get(in_uri)
-
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        meta, data = registry.get_scdata(in_uri)
         
         # Use highly variable genes if available
         if "highly_variable" in data.var.columns:
@@ -105,14 +119,14 @@ class IntegrationCapability(BaseCapability):
             X_use = data.X
 
         n_comps = contract.parameters.get("n_components", 20)
-        pca_emb = compute_pca(X_use, n_components=n_comps)
+        seed = int(contract.parameters.get("random_seed", 42))
+        pca_emb, pca_route = _compute_pca_with_route(X_use, n_components=n_comps, random_seed=seed)
 
         batch_col = contract.parameters.get("batch_col") or ("batch" if "batch" in data.obs.columns else None)
         if batch_col is not None and batch_col not in data.obs.columns:
             raise ValueError(f"Batch metadata column '{batch_col}' is not present")
         batches = data.obs[batch_col].values if batch_col else np.array(["b1"] * data.n_obs)
 
-        seed = int(contract.parameters.get("random_seed", 42))
         pre_mixing = calculate_batch_mixing_score(pca_emb, batches, random_seed=seed)
 
         if self.implementation_id == "batch_mean_centering_v1" and batch_col:
@@ -142,6 +156,30 @@ class IntegrationCapability(BaseCapability):
             "pre_batch_mixing": pre_mixing,
             "post_batch_mixing": post_mixing,
         }
+        if self.implementation_id == "no_correction_v1":
+            # This receipt describes the historical route; it does not rename
+            # uncentered sparse SVD as centered PCA or claim convergence.
+            import hashlib
+            representation = np.ascontiguousarray(integrated_emb)
+            digest = hashlib.sha256()
+            digest.update(stable_fingerprint({"shape": representation.shape,
+                                               "dtype": representation.dtype.str}).encode())
+            digest.update(representation.tobytes())
+            mask = (np.asarray(hvg_mask, dtype=bool) if "highly_variable" in data.var
+                    else np.ones(data.n_vars, dtype=bool))
+            integrated_data.uns["integration"]["representation_receipt"] = {
+                "schema_version": 1, "method": self.implementation_id,
+                "source_artifact_uri": in_uri, "source_sha256": meta.sha256_hash,
+                "cell_order_sha256": stable_fingerprint(data.obs.index.astype(str).tolist()),
+                "feature_order_sha256": stable_fingerprint(data.var.index.astype(str).tolist()),
+                "feature_selection": "highly_variable" if "highly_variable" in data.var else "all_features",
+                "feature_mask_sha256": stable_fingerprint(mask.tolist()),
+                "n_features_used": int(mask.sum()), "requested_n_components": int(n_comps),
+                "actual_n_components": int(representation.shape[1]), "random_seed": seed,
+                "representation_key": "X_pca", "representation_shape": list(representation.shape),
+                "representation_sha256": "sha256:" + digest.hexdigest(),
+                "batch_correction_applied": False, **pca_route,
+            }
 
         uri_obj = ArtifactURI.parse(in_uri)
         out_uri = f"adata://{uri_obj.study_id}/integrated/v3"

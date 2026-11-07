@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from eacbp.artifact.registry import ArtifactRegistry
+from eacbp.artifact.storage import ArtifactDependencyError, PayloadSerializer
 from eacbp.artifact.transaction import TaskArtifactTransaction
 from eacbp.auditor.base import ValidationReport
 from eacbp.capabilities.sc_data import SCData
@@ -88,6 +89,23 @@ def test_results_show_admitted_qc_embedding_and_deg_without_mutation(tmp_path):
     assert "未重新执行" in response["notice"]
     json.dumps(response, allow_nan=False)
     assert all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_results_project_npz_single_cell_outputs_after_audited_access(tmp_path, monkeypatch):
+    def no_anndata():
+        raise ArtifactDependencyError("anndata disabled for NPZ web projection regression")
+
+    monkeypatch.setattr(PayloadSerializer, "_get_anndata_module", no_anndata)
+    run, registry = fixture_run(tmp_path)
+    assert registry.get_metadata("adata://fixture/qc/v1").storage_path.endswith(".npz")
+    assert registry.get_metadata("adata://fixture/clustering/v1").storage_path.endswith(".npz")
+
+    response = result_views(run)
+    assert response["state"] == "ready", response
+    assert response["qc"]["retained_cells"] == 5
+    assert response["embedding"]["groups"] == [
+        {"label": "0", "count": 2}, {"label": "1", "count": 3},
+    ]
 
 
 def test_only_real_umap_method_uses_umap_label_and_sample_is_bounded(tmp_path, monkeypatch):
@@ -285,3 +303,44 @@ def test_large_preview_skipped_deg_remains_available_via_verified_catalog(tmp_pa
     catalog = service.deg_tables("fixture")
     assert catalog["tables"][0]["task_id"] == "task_deg"
     assert service.deg_table("fixture", task_id="task_deg")["total_items"] == 260
+
+
+def test_typed_csv_export_preserves_native_evidence_and_checks_cached_export(tmp_path):
+    from eacbp.webui.results import audited_deg_csv
+    run, registry = fixture_run(tmp_path, deg_rows=260)
+    native = Path(registry.get_metadata("table://fixture/deg/v1").storage_path)
+    assert native.name.endswith(".table.npz")
+    before = {path: path.read_bytes() for path in run.rglob("*") if path.is_file()}
+    export, name = audited_deg_csv(run, "task_deg")
+    assert export.suffix == ".csv" and name.endswith(".csv")
+    assert export.parent.parent.parent == run.parent / ".webui"
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+    assert audited_deg_csv(run, "task_deg")[0] == export
+    export.write_text("tampered CSV cache", encoding="utf-8")
+    with pytest.raises(ValueError, match="缓存"):
+        audited_deg_csv(run, "task_deg")
+    assert native.read_bytes() == before[native]
+
+
+def test_typed_table_expansion_limit_disables_catalog_and_precedes_decode(tmp_path, monkeypatch):
+    from eacbp.webui.results import deg_table_catalog, deg_table_page, audited_deg_csv
+    run, _ = fixture_run(tmp_path)
+    monkeypatch.setattr("eacbp.webui.results.MAX_TOTAL_BYTES", 1)
+    catalog = deg_table_catalog(run)
+    assert catalog["tables"][0]["query_available"] is False
+    def forbidden(*args, **kwargs):
+        pytest.fail("Expanded size must be bounded before typed table decoding")
+    monkeypatch.setattr(PayloadSerializer, "deserialize", forbidden)
+    with pytest.raises(ValueError, match="大小限制"):
+        deg_table_page(run, "task_deg")
+    with pytest.raises(ValueError, match="大小限制"):
+        audited_deg_csv(run, "task_deg")
+
+
+def test_legacy_csv_pagination_preserves_identifier_strings(tmp_path):
+    from eacbp.webui.results import _table_chunk_rows
+    path = tmp_path / "legacy.csv"
+    path.write_text(",gene,log2_fold_change,fdr_q_value\n0,001,1,.01\n1,NA,-1,.02\n", encoding="utf-8")
+    rows, total = _table_chunk_rows(path, page=1, size=50, query="", fdr_max=None,
+                                  significant_only=False, abs_log2fc_min=None)
+    assert total == 2 and [row["gene"] for row in rows] == ["001", "NA"]

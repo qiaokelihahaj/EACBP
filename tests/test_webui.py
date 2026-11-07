@@ -304,7 +304,8 @@ def test_worker_real_run_restart_resume_and_report_gate(service, tmp_path):
     """Real h5ad + real subprocess, retained across a fresh manager instance."""
     source = input_data(tmp_path)
     prepared = form(source)
-    result = service.start(prepared)
+    preview = service.preview(prepared)
+    result = service.start({**prepared, "preview_token": preview["preview_token"]})
     first = wait_job(service.manager, result["job"]["id"])
     assert first["status"] == "success", first
     run_dir = Path(first["run_dir"])
@@ -313,7 +314,7 @@ def test_worker_real_run_restart_resume_and_report_gate(service, tmp_path):
     assert reuse["form"]["data"] == ""
     assert reuse["unsupported_manifest_sections"]
     equivalent = service.preview({**reuse["form"], "data": str(source)})
-    assert equivalent["config"] == reuse["original"]["config"]
+    assert equivalent["config"] == {**reuse["original"]["config"], "research_purpose": "overview"}
     methods = service.methods_report(result["run_id"])
     assert "软件版本（历史产物元数据）" in methods and "snapshot_capability_parameters" in methods
     bundle, bundle_name = service.export_bundle(result["run_id"])
@@ -334,6 +335,7 @@ def test_worker_real_run_restart_resume_and_report_gate(service, tmp_path):
     rebuilt = restarted.submit("report", run_dir=run_dir)
     assert wait_job(restarted, rebuilt["id"])["status"] == "success"
     assert (run_dir / "report.md").read_bytes() == report
+
     from eacbp.artifact.registry import ArtifactRegistry
     registry = ArtifactRegistry(str(run_dir / "artifacts"))
     raw = registry.get_metadata("adata://ui_test/raw/v1")
@@ -342,6 +344,123 @@ def test_worker_real_run_restart_resume_and_report_gate(service, tmp_path):
     failure = wait_job(restarted, rejected["id"])
     assert failure["status"] == "failed"
     assert (run_dir / "report.md").read_bytes() == report
+
+
+def test_start_requires_server_issued_preview_token(service, tmp_path, monkeypatch):
+    payload = form(input_data(tmp_path))
+    monkeypatch.setattr(service.manager, "submit", lambda *a, **k: pytest.fail("unconfirmed run submitted"))
+    for token in (None, "forged", [], {}):
+        with pytest.raises(ValueError, match="方案确认"):
+            service.start({**payload, "preview_token": token})
+
+
+@pytest.mark.parametrize("change", ["input", "form", "config", "plan"])
+def test_start_rejects_changes_since_confirmed_preview(service, tmp_path, monkeypatch, change):
+    source = input_data(tmp_path)
+    payload = form(source)
+    preview = service.preview(payload)
+    payload["preview_token"] = preview["preview_token"]
+    if change == "input":
+        import anndata as ad
+        changed = ad.read_h5ad(source)
+        changed.X *= 2
+        changed.write_h5ad(source)
+    elif change == "form":
+        payload["title"] = "Changed title"
+    elif change == "config":
+        payload["min_genes"] = 2
+    else:
+        from eacbp.orchestrator import planning
+        original = planning.preview_study_plan
+        def changed_plan(*args, **kwargs):
+            value = original(*args, **kwargs)
+            value["notices"].append("Plan changed after confirmation")
+            return value
+        monkeypatch.setattr(planning, "preview_study_plan", changed_plan)
+    monkeypatch.setattr(service.manager, "submit", lambda *a, **k: pytest.fail("changed run submitted"))
+    with pytest.raises(ValueError, match="已改变"):
+        service.start(payload)
+
+
+def test_preview_detects_input_change_during_design_check(service, tmp_path, monkeypatch):
+    source = input_data(tmp_path)
+    original = service.design
+    def changed_design(*args, **kwargs):
+        result = original(*args, **kwargs)
+        with source.open("ab") as stream:
+            stream.write(b"changed")
+        return result
+    monkeypatch.setattr(service, "design", changed_design)
+    with pytest.raises(ValueError, match="检查方案期间"):
+        service.preview(form(source))
+    assert not service._study_previews
+
+
+def test_preview_confirmation_expires_and_is_consumed_after_submission(service, tmp_path, monkeypatch):
+    payload = form(input_data(tmp_path))
+    expired = service.preview(payload)["preview_token"]
+    service._study_previews[expired]["expires"] = 0
+    with pytest.raises(ValueError, match="方案确认"):
+        service.start({**payload, "preview_token": expired})
+    preview = service.preview(payload)
+    captured = {}
+    def submit(operation, **values):
+        captured.update(values)
+        return {"id": "confirmed", "run_dir": str(values["run_dir"])}
+    monkeypatch.setattr(service.manager, "submit", submit)
+    service.start({**payload, "preview_token": preview["preview_token"]})
+    assert captured["preview_binding"] == preview["preview_binding"]
+    with pytest.raises(ValueError, match="方案确认"):
+        service.start({**payload, "preview_token": preview["preview_token"]})
+
+
+@pytest.mark.parametrize("explicit_purpose", [False, True])
+def test_returned_preview_form_roundtrips_without_changing_research_scope(service, tmp_path, monkeypatch, explicit_purpose):
+    payload = form(input_data(tmp_path))
+    if explicit_purpose:
+        payload["research_purpose"] = "overview"
+    preview = service.preview(payload)
+    assert ("research_purpose" in preview["form"]) is explicit_purpose
+    assert ("research_purpose" in preview["config"]) is explicit_purpose
+    captured = {}
+    def submit(operation, **values):
+        captured.update(values)
+        return {"id": "roundtrip", "run_dir": str(values["run_dir"])}
+    monkeypatch.setattr(service.manager, "submit", submit)
+    service.start({**preview["form"], "preview_token": preview["preview_token"]})
+    assert captured["preview_binding"] == preview["preview_binding"]
+    assert captured["config"] == preview["config"]
+    assert captured["webui_context"] == {"research_purpose": "overview"}
+
+
+@pytest.mark.parametrize("change", ["input", "config", "binding", "missing_binding"])
+def test_worker_rejects_queued_run_if_confirmed_inputs_change(service, tmp_path, monkeypatch, change):
+    from types import SimpleNamespace
+    from eacbp.webui import worker
+    source = input_data(tmp_path)
+    payload = form(source)
+    preview = service.preview(payload)
+    monkeypatch.setattr("eacbp.webui.jobs.subprocess.Popen",
+                        lambda *a, **k: SimpleNamespace(wait=lambda: 0))
+    queued = service.start({**payload, "preview_token": preview["preview_token"]})
+    directory = service.manager.jobs_dir / queued["job"]["id"]
+    request = read_json(directory / "request.json")
+    if change == "input":
+        with source.open("ab") as stream:
+            stream.write(b"changed after queueing")
+    elif change == "config":
+        request["config"]["capability_parameters"]["qc"]["min_genes"] = 2
+    elif change == "binding":
+        request["preview_binding"]["source_sha256"] = "a" * 64
+    else:
+        request.pop("preview_binding")
+    write_json(directory / "request.json", request)
+    monkeypatch.setattr("eacbp.application.study_service._import_h5ad",
+                        lambda *a: pytest.fail("changed input imported"))
+    assert worker.run_job(directory) == 1
+    saved = read_json(directory / "job.json")
+    assert saved["status"] == "failed" and saved["error"]
+    assert not (Path(queued["job"]["run_dir"]) / "artifacts").exists()
 
 
 def test_active_queued_job_prevents_double_submission(service):

@@ -42,20 +42,28 @@ class ComputationalValidator(BaseAuditor):
             return report
 
         meta, payload = registry.get(target_uri)
+        qc_review = (contract.capability == "qc_review"
+                     and result.method_used == "raw_count_qc_review_v1")
 
         # 1. Check for AnnData / SCData / SpatialData payloads
         if meta.type in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA):
-            data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+            data = SCData.from_payload(payload)
+            if contract.capability == "qc":
+                from eacbp.auditor.qc import validate_qc_disposition
+                check = validate_qc_disposition(contract, result, registry, meta, data)
+                report.add_check(check.check_name, check.passed, check.severity, check.message, check.metrics)
             
             # Check shape
             n_cells, n_genes = data.shape
             has_cells = n_cells > 0
             has_genes = n_genes > 0
+            empty_candidate = qc_review and meta.operation == "preserve_qc_candidates" and n_cells == 0
             report.add_check(
                 name="matrix_non_empty",
-                passed=has_cells and has_genes,
+                passed=(has_cells or empty_candidate) and has_genes,
                 severity=ValidationSeverity.ERROR,
-                message=f"Matrix dimensions are valid: {n_cells} cells x {n_genes} genes.",
+                message=("No cells were excluded; the full feature axis is preserved in the empty candidate set."
+                         if empty_candidate else f"Matrix dimensions are valid: {n_cells} cells x {n_genes} genes."),
                 metrics={"n_cells": n_cells, "n_genes": n_genes},
             )
 
@@ -141,6 +149,22 @@ class ComputationalValidator(BaseAuditor):
                     nullable = [c for c in numeric_cols if c.startswith(("mean_", "comparison_p_value_", "comparison_fdr_"))]
                     total_nans = int(np.isinf(check_df[numeric_cols].to_numpy(dtype=float)).sum())
                     total_nans += int(check_df[[c for c in numeric_cols if c not in nullable]].isna().sum().sum())
+                if qc_review:
+                    # Only unavailable mitochondrial values and empty-group
+                    # descriptive means/fractions are structurally nullable.
+                    # The mandatory independent qc_review audit reconstructs
+                    # every value and verifies these missingness conditions.
+                    allowed = pd.DataFrame(False, index=check_df.index, columns=numeric_cols)
+                    if meta.operation == "qc_review_cell_dispositions" and "mito_pct_available" in check_df and "mito_pct" in numeric_cols:
+                        allowed["mito_pct"] = check_df["mito_pct_available"].eq(False)
+                    elif meta.operation == "qc_review_feature_counts" and {"n_cells", "status"}.issubset(check_df):
+                        empty_group = check_df["n_cells"].eq(0) & check_df["status"].eq("no_cells")
+                        for column in ("detection_fraction", "mean_raw_count"):
+                            if column in numeric_cols:
+                                allowed[column] = empty_group
+                    numeric = check_df[numeric_cols]
+                    total_nans = int(np.isinf(numeric.to_numpy(dtype=float)).sum())
+                    total_nans += int((numeric.isna() & ~allowed).sum().sum())
                 report.add_check(
                     name="table_finite_values",
                     passed=(total_nans == 0),

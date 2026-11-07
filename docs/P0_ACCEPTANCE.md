@@ -10,6 +10,8 @@
 | Contrast / alpha | 反向对比的效应、置信区间、标签一致；数值 contrast 必须明确效应定义；计算、审计、证据准入和报告使用相同 alpha |
 | 稀疏 pseudobulk | 执行与审计均不展开细胞级完整 counts；校验非法 counts；聚合结果与稠密参考一致；资源预检在分配前生效 |
 
+CI test boundaries are defined in `.github/ci-test-suites.json`. The Windows/Linux Python 3.11/3.12/3.13 core matrix installs only `.[dev]` and runs the explicit core module list; the H5AD subprocess regression runs in full integration because it requires AnnData. Five Linux/Python 3.12 capability jobs install their own extras and reject skipped selected tests. A full Linux/Python 3.12 integration job installs `.[dev]` plus the hash-verified `docker/requirements-linux-py312-scientific.lock`, runs the complete test tree, rejects every skip except the documented Windows-only process test and the CellBender report test that needs an external smoke artifact, saves JUnit and `pip freeze`, and runs `pip check`. It installs the hash-verified build lock, builds a wheel, and smoke-tests the installed wheel's CLI, web UI and acceptance files, and Slurm template in a fresh virtual environment. The workflow artifact includes the wheel-smoke output. A workflow definition does not prove a remote run passed; the recorded local validation below remains separate evidence.
+
 本地测试使用已有 Windows / Python 3.13 环境。它不能证明干净 Linux / Python 3.12 安装、远端 GitHub Actions、容器或 Slurm 已通过。发布锁文件应来自干净目标环境的成功解析与能力测试，不从 Windows 快照推导。
 
 ## P0-3 稀疏 pseudobulk RSS 探针

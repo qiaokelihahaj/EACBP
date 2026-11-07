@@ -1,0 +1,161 @@
+{
+  "core": [
+    "tests/test_adapters.py",
+    "tests/test_adaptive_planning.py",
+    "tests/test_adversarial_guardrails.py",
+    "tests/test_adversarial_stress.py",
+    "tests/test_analysis_requirements.py",
+    "tests/test_architecture_integration.py",
+    "tests/test_artifact_audit.py",
+    "tests/test_artifact_maintenance.py",
+    "tests/test_artifact_portability.py",
+    "tests/test_artifacts.py",
+    "tests/test_atomic_json.py",
+    "tests/test_auditors.py",
+    "tests/test_autonomous_analysis.py",
+    "tests/test_background_plan.py",
+    "tests/test_biological_unit_audit_p0.py",
+    "tests/test_biological_unit_roles.py",
+    "tests/test_capabilities.py",
+    "tests/test_capability_descriptors.py",
+    "tests/test_ci_test_suites.py",
+    "tests/test_cluster_markers.py",
+    "tests/test_clustering_parameter_contracts.py",
+    "tests/test_clustering_sensitivity.py",
+    "tests/test_completed_finalization.py",
+    "tests/test_crash_and_concurrency.py",
+    "tests/test_deployment_slurm.py",
+    "tests/test_descriptive_review.py",
+    "tests/test_evidence_dependence.py",
+    "tests/test_evidence_graph.py",
+    "tests/test_evidence_provenance.py",
+    "tests/test_evidence_row_bindings.py",
+    "tests/test_evidence_snapshot.py",
+    "tests/test_execution_context.py",
+    "tests/test_execution_journal.py",
+    "tests/test_external_resources.py",
+    "tests/test_fastq_pipeline.py",
+    "tests/test_fetch_public_validation_data.py",
+    "tests/test_inference_contract.py",
+    "tests/test_ingestion_regressions.py",
+    "tests/test_kat8_study.py",
+    "tests/test_knowledge.py",
+    "tests/test_knowledge_audit_modes.py",
+    "tests/test_method_regressions.py",
+    "tests/test_multi_target.py",
+    "tests/test_normalization_input_layer.py",
+    "tests/test_numeric_helpers.py",
+    "tests/test_orchestrator.py",
+    "tests/test_p1_result_claims.py",
+    "tests/test_perturbation.py",
+    "tests/test_perturbation_integrity.py",
+    "tests/test_plan_preview.py",
+    "tests/test_planning_contracts.py",
+    "tests/test_process_resources.py",
+    "tests/test_process_supervision.py",
+    "tests/test_public_marker_audit.py",
+    "tests/test_public_research_value.py",
+    "tests/test_qc_review.py",
+    "tests/test_qc_review_audit.py",
+    "tests/test_qc_review_integration.py",
+    "tests/test_qc_sensitivity.py",
+    "tests/test_qc_sensitivity_execution.py",
+    "tests/test_raw_count_qc.py",
+    "tests/test_registry_injection.py",
+    "tests/test_report_inference_settings.py",
+    "tests/test_required_audit_coverage.py",
+    "tests/test_requirement_completion_p0.py",
+    "tests/test_research_value_reference.py",
+    "tests/test_research_purpose.py",
+    "tests/test_rna_velocity.py",
+    "tests/test_run_events.py",
+    "tests/test_runtime_state.py",
+    "tests/test_schemas.py",
+    "tests/test_scientific_governance.py",
+    "tests/test_spatial.py",
+    "tests/test_spatial_integrity_p0.py",
+    "tests/test_storage_regressions.py",
+    "tests/test_table_storage_contract.py",
+    "tests/test_recovery_cli.py",
+    "tests/test_task_transactions.py",
+    "tests/test_verification.py",
+    "tests/test_verification_cli.py",
+    "tests/test_verify_public_kang.py",
+    "tests/test_webui_inference_settings.py"
+  ],
+  "core_deselect": [
+    "tests/test_storage_regressions.py::test_h5ad_scdata_reloads_all_slots_in_another_process"
+  ],
+  "capabilities": {
+    "standard": {
+      "tests": [
+        "tests/test_classic_autonomy_evaluation.py",
+        "tests/test_clustering_integrity.py",
+        "tests/test_clustering_sensitivity_execution.py",
+        "tests/test_clustering_sensitivity_recovery.py",
+        "tests/test_recovery.py",
+        "tests/test_real_methods.py",
+        "tests/test_research_purpose_execution.py",
+        "tests/test_standard_study_script.py",
+        "tests/test_cli.py",
+        "tests/test_end_to_end_study.py",
+        "tests/test_real_quantification.py",
+        "tests/test_webui_directories.py",
+        "tests/test_webui.py",
+        "tests/test_webui_recovery.py",
+        "tests/test_webui_results.py",
+        "tests/test_public_pbmc_acceptance.py"
+      ],
+      "deselect": [
+        "tests/test_real_methods.py::test_dpt_to_cellrank_is_connected_in_study_plan"
+      ]
+    },
+    "advanced-statistics": {
+      "tests": [
+        "tests/test_advanced_statistics.py",
+        "tests/test_advanced_statistics_contrast_alpha.py",
+        "tests/test_advanced_statistics_sparse.py",
+        "tests/test_advanced_pipeline.py",
+        "tests/test_inference_end_to_end.py",
+        "tests/test_inference_audit_contract.py",
+        "tests/test_research_acceptance.py",
+        "tests/test_fit_diagnostics.py"
+      ],
+      "deselect": []
+    },
+    "advanced-qc": {
+      "tests": [
+        "tests/test_advanced_qc.py",
+        "tests/test_celltypist_real.py",
+        "tests/test_qc_pipeline.py"
+      ],
+      "deselect": []
+    },
+    "communication": {
+      "tests": [
+        "tests/test_advanced_communication.py"
+      ],
+      "deselect": []
+    },
+    "fate": {
+      "tests": [
+        "tests/test_cellrank.py",
+        "tests/test_real_methods.py::test_dpt_to_cellrank_is_connected_in_study_plan"
+      ],
+      "deselect": []
+    },
+    "velocity": {
+      "tests": [
+        "tests/test_rna_velocity_real.py"
+      ],
+      "deselect": []
+    }
+  },
+  "integration_only": [
+    "tests/test_cellbender_warnings.py"
+  ],
+  "expected_skips": {
+    "tests/test_cellbender_warnings.py::test_cellbender_real_report_keeps_elbo_warnings_beyond_jupyter_css": "CellBender smoke report is absent; run the CellBender smoke workflow first",
+    "tests/test_process_supervision.py::test_failed_job_assignment_kills_suspended_parent": "Windows must assign the job before resuming the process"
+  }
+}

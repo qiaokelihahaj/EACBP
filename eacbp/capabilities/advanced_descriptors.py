@@ -88,6 +88,7 @@ def _descriptor(
     output_types,
     required_audit_ids,
     method_aliases=(),
+    runtime_packages=(),
     description: str,
 ) -> CapabilityDescriptor:
     return CapabilityDescriptor(
@@ -98,6 +99,7 @@ def _descriptor(
         output_types=output_types,
         required_audit_ids=required_audit_ids,
         method_aliases=method_aliases,
+        runtime_packages=runtime_packages,
         plan_factory=lambda **context: _extension_plan(capability_name, **context),
         description=description,
         scope="per_target" if capability_name in {"functional_activity", "donor_sensitivity"} else "shared",
@@ -112,15 +114,17 @@ ADVANCED_EXTENSION_DESCRIPTORS: Dict[str, CapabilityDescriptor] = {
         output_types=(ArtifactType.TABLE,),
         required_audit_ids=("advanced_statistics_integrity",),
         method_aliases=("decoupler_functional_v1",),
+        runtime_packages=("anndata", "decoupler"),
         description="Donor-level decoupler ULM activity and condition comparison.",
     ),
     "donor_sensitivity": _descriptor(
         "donor_sensitivity",
         "pydeseq2_leave_one_donor_out_v1",
         input_types=(ArtifactType.ANNDATA,),
-        output_types=(ArtifactType.TABLE,),
+        output_types=(ArtifactType.TABLE, ArtifactType.JSON),
         required_audit_ids=("advanced_statistics_integrity",),
         method_aliases=("donor_loo_pydeseq2_v1",),
+        runtime_packages=("pydeseq2",),
         description="Leave-one-donor-out PyDESeq2 sensitivity analysis.",
     ),
     "doublet_detection": _descriptor(
@@ -130,6 +134,7 @@ ADVANCED_EXTENSION_DESCRIPTORS: Dict[str, CapabilityDescriptor] = {
         output_types=(ArtifactType.ANNDATA, ArtifactType.TABLE, ArtifactType.JSON),
         required_audit_ids=("advanced_qc_integrity",),
         method_aliases=("scrublet", "scrublet_v1"),
+        runtime_packages=("anndata", "scanpy", "scikit-image"),
         description="Scanpy Scrublet doublet scoring with optional filtering.",
     ),
     "cell_annotation": _descriptor(
@@ -139,6 +144,7 @@ ADVANCED_EXTENSION_DESCRIPTORS: Dict[str, CapabilityDescriptor] = {
         output_types=(ArtifactType.ANNDATA, ArtifactType.TABLE, ArtifactType.JSON),
         required_audit_ids=("advanced_qc_integrity",),
         method_aliases=("celltypist",),
+        runtime_packages=("anndata", "celltypist"),
         description="Local CellTypist annotation with conflict provenance.",
     ),
     "background_removal": _descriptor(
@@ -148,6 +154,7 @@ ADVANCED_EXTENSION_DESCRIPTORS: Dict[str, CapabilityDescriptor] = {
         output_types=(ArtifactType.ANNDATA, ArtifactType.JSON),
         required_audit_ids=("advanced_qc_integrity",),
         method_aliases=("cellbender",),
+        runtime_packages=("anndata",),
         description="Explicit CellBender external background-removal adapter.",
     ),
     "liana_communication": _descriptor(
@@ -156,6 +163,7 @@ ADVANCED_EXTENSION_DESCRIPTORS: Dict[str, CapabilityDescriptor] = {
         input_types=(ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA),
         output_types=(ArtifactType.TABLE,),
         required_audit_ids=("liana_integrity",),
+        runtime_packages=("anndata", "liana"),
         description="Donor-condition LIANA ligand/receptor rank aggregation.",
     ),
 }

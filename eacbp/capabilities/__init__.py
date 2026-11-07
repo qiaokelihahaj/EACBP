@@ -7,9 +7,12 @@ from eacbp.capabilities.side_effect import SideEffectValidator
 from eacbp.capabilities.registry import CapabilityRegistry
 from eacbp.capabilities.sc_data import SCData
 from eacbp.capabilities.qc import DatasetAuditCapability, QCCapability
+from eacbp.capabilities.qc_review import QCReviewCapability
 from eacbp.capabilities.normalization import NormalizationCapability
 from eacbp.capabilities.integration import IntegrationCapability
 from eacbp.capabilities.clustering import ClusteringCapability
+from eacbp.capabilities.cluster_markers import ClusterMarkersCapability
+from eacbp.capabilities.rna_velocity import RNAVelocityCapability
 from eacbp.capabilities.subset import SubsetCapability
 from eacbp.capabilities.deg import DifferentialAbundanceCapability, DifferentialExpressionCapability
 from eacbp.capabilities.trajectory import TrajectoryCapability
@@ -49,10 +52,13 @@ def create_default_capability_registry() -> CapabilityRegistry:
     reg.register(FASTQQuantificationCapability(implementation_id="sc_quant_v1"))
     reg.register(DatasetAuditCapability())
     reg.register(QCCapability())
+    reg.register(QCReviewCapability())
     reg.register(NormalizationCapability())
     reg.register(IntegrationCapability(implementation_id="batch_mean_centering_v1"))
     reg.register(IntegrationCapability(implementation_id="no_correction_v1"))
     reg.register(ClusteringCapability())
+    reg.register(ClusterMarkersCapability())
+    reg.register(RNAVelocityCapability())
     reg.register(SubsetCapability())
     reg.register(DifferentialAbundanceCapability())
     reg.register(DifferentialExpressionCapability())
@@ -103,9 +109,12 @@ __all__ = [
     "SCData",
     "DatasetAuditCapability",
     "QCCapability",
+    "QCReviewCapability",
     "NormalizationCapability",
     "IntegrationCapability",
     "ClusteringCapability",
+    "ClusterMarkersCapability",
+    "RNAVelocityCapability",
     "SubsetCapability",
     "DifferentialAbundanceCapability",
     "DifferentialExpressionCapability",

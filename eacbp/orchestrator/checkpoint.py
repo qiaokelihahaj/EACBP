@@ -28,11 +28,17 @@ def fingerprint(value):
 def execution_environment():
     """Identify installed distributions and the actual package source for resume."""
     import platform
-    from importlib.metadata import distributions
+    import re
+    from importlib import metadata
     package = Path(__file__).resolve().parents[1]
     sources = {str(path.relative_to(package)): hashlib.sha256(path.read_bytes()).hexdigest()
                for path in sorted(package.rglob("*.py"))}
-    versions = {dist.metadata["Name"]: dist.version for dist in distributions() if dist.metadata["Name"]}
+    # Enumeration includes shadowed installs. Resolve each canonical project name
+    # through the active metadata search path instead of allowing the last copy to win.
+    names = {re.sub(r"[-_.]+", "-", name).lower()
+             for dist in metadata.distributions()
+             if (name := dist.metadata["Name"])}
+    versions = {name: metadata.version(name) for name in sorted(names)}
     return {"python": platform.python_version(), "platform": platform.platform(),
             "distributions": versions, "source_sha256": fingerprint(sources)}
 

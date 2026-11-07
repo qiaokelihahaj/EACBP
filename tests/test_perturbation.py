@@ -111,16 +111,13 @@ def test_genetic_perturbation_crispr_ko_propagation(populated_registry):
     assert reg.exists(adata_uri)
     assert reg.exists(table_uri)
 
-    meta_adata, payload_adata = reg.get(adata_uri)
+    meta_adata, res_data = reg.get_scdata(adata_uri)
     meta_table, payload_table = reg.get(table_uri)
-
-    res_data = payload_adata if isinstance(payload_adata, SCData) else SCData.from_dict(payload_adata)
     res_table = payload_table if isinstance(payload_table, pd.DataFrame) else pd.DataFrame(payload_table)
 
     # 3. Target gene expression is knocked down near zero
     trem2_idx = list(res_data.var["gene_name"].values).index("Trem2")
-    orig_meta, orig_payload = reg.get("adata://AD_TEST/microglia_subset/v1")
-    orig_data = orig_payload if isinstance(orig_payload, SCData) else SCData.from_dict(orig_payload)
+    orig_meta, orig_data = reg.get_scdata("adata://AD_TEST/microglia_subset/v1")
 
     orig_trem2_mean = float(np.mean(orig_data.X[:, trem2_idx]))
     pert_trem2_mean = float(np.mean(res_data.X[:, trem2_idx]))
@@ -238,8 +235,7 @@ def test_custom_grn_adjacency_propagation(populated_registry):
     result = cap.execute(contract, reg)
     assert result.status == TaskStatus.SUCCESS
 
-    _, payload_adata = reg.get(result.output_artifacts[0])
-    res_data = payload_adata if isinstance(payload_adata, SCData) else SCData.from_dict(payload_adata)
+    res_data = reg.load_scdata(result.output_artifacts[0])
 
     # Base perturbation on GeneA: v = [-10, 0, 0] for cell 0, [-12, 0, 0] for cell 1
     # Propagated shift: GeneB receives -11.0 * 0.5 = -5.5
@@ -304,8 +300,7 @@ def test_compound_perturbation_therapeutic_reversal(populated_registry):
         assert pytest.approx(r_sum, rel=1e-2) == 1.0
 
     # 3. Output AnnData contains counterfactual predictions
-    _, adata_payload = reg.get(adata_uri)
-    drug_data = adata_payload if isinstance(adata_payload, SCData) else SCData.from_dict(adata_payload)
+    drug_data = reg.load_scdata(adata_uri)
     assert "predicted_transition_state" in drug_data.obs.columns
 
 

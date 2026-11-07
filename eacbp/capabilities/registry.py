@@ -107,6 +107,21 @@ class CapabilityRegistry:
 
         return self.resolve(capability_name, method).get_descriptor()
 
+    def runtime_packages(self, capability_name: Optional[str] = None, method: Optional[str] = None) -> tuple[str, ...]:
+        """Discover optional distribution requirements without importing them.
+
+        A named capability resolves method aliases normally. Without a name,
+        return the union declared by this registry, including plugin methods.
+        """
+        if capability_name is not None:
+            return self.describe(capability_name, method).runtime_packages
+        if method is not None:
+            raise ValueError("A method requires a capability name")
+        return tuple(sorted({
+            package for methods in self._capabilities.values() for capability in methods.values()
+            for package in capability.get_descriptor().runtime_packages
+        }))
+
     @staticmethod
     def _artifact_type_from_uri(uri: str) -> Optional[ArtifactType]:
         """Map canonical artifact URI schemes to declared artifact types."""
@@ -199,10 +214,38 @@ class CapabilityRegistry:
                 for methods in self._capabilities.values() for cap in methods.values()
                 if cap.get_descriptor().validator is not None]
 
+    def validate_run_config(self, state, *, manifest=None):
+        """Reject misspelled capability namespaces before building any tasks.
+
+        Resolve against this registry, including injected plugins, rather than
+        a separate built-in allowlist. Parameter values remain the selected
+        descriptor's responsibility when its task contract is resolved.
+        """
+        namespaces = [(key, state.get(key) or {}) for key in
+                      ("method_overrides", "capability_parameters", "analysis_extensions")]
+        targets = state.get("target_parameters") or {}
+        if manifest is not None and targets:
+            from eacbp.orchestrator.dag import target_branch_slug_map
+            names = list(manifest.biological_design.target_cell_types)
+            valid_targets = set(names) | set(target_branch_slug_map(names).values())
+            unknown = sorted(set(targets) - valid_targets)
+            if unknown:
+                raise ValueError(f"Unknown target_parameters target(s): {unknown}; configured targets: {names}")
+        namespaces.extend((f"target_parameters.{target}", settings)
+                          for target, settings in targets.items())
+        for namespace, settings in namespaces:
+            for name in settings:
+                if not self.has(name):
+                    raise ValueError(
+                        f"Unknown capability {name!r} in {namespace}; "
+                        "use a registered capability name (including for plugin options)"
+                    )
+
     def plan_extensions(self, manifest, state, tasks):
         """Build user-requested extension tasks from registered declarations."""
         from eacbp.capabilities.advanced_descriptors import ADVANCED_EXTENSION_DESCRIPTORS
         built = []
+        factory_tasks = None
         for name, settings in state.get("analysis_extensions", {}).items():
             if name in ADVANCED_EXTENSION_DESCRIPTORS or settings is False:
                 continue
@@ -213,7 +256,17 @@ class CapabilityRegistry:
                 raise ValueError(f"Extension {name!r} has no declared plan factory")
             values = dict(settings) if isinstance(settings, dict) else {}
             values.update(state.get("capability_parameters", {}).get(name, {}))
-            result = descriptor.build_plan(manifest=manifest, parameters=values, tasks=tuple(tasks))
+            if factory_tasks is None:
+                # Built-in task methods are abstract planner defaults until
+                # the router applies the requested profile/overrides. Give
+                # extension factories the same provisional method selection,
+                # without mutating upstream contracts or executing methods.
+                from eacbp.orchestrator.router import CapabilityRouter
+                router = CapabilityRouter(self)
+                factory_tasks = tuple(task.model_copy(deep=True, update={
+                    "method": router.resolve_method(task.capability, manifest, state)
+                }) for task in tasks)
+            result = descriptor.build_plan(manifest=manifest, parameters=values, tasks=factory_tasks)
             result = [result] if isinstance(result, TaskContract) else list(result)
             for task in result:
                 if not isinstance(task, TaskContract) or task.capability != name:

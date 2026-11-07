@@ -1,26 +1,49 @@
 # P1 deployment: Python 3.12 CPU image and one-study Slurm jobs
 
-This slice adds a candidate Linux container and a thin Slurm adapter. The container installs the existing `eacbp` wheel with its `standard`, `fate`, and `advanced-statistics` extras, including PyDESeq2 and decoupler. It then runs the existing `eacbp run`, `eacbp resume`, or `eacbp report` command. Each submitted job performs one of those operations for one run directory. The adapter talks directly to Slurm; it does not keep a queue or database. Advanced QC and communication extras remain outside this image target.
+This slice adds a Linux/amd64 CPU container and a thin Slurm adapter. The image installs the existing `eacbp` wheel with all five scientific runtime extras: `standard`, `fate`, `advanced-statistics`, `advanced-qc`, and `communication`. Its checked-in lock contains 97 exact third-party distributions with PyPI hashes for Python 3.12 on Linux x86_64; the separate build lock pins the wheel-builder tools. The `dev` extra is not part of the runtime image, and the redundant `bio` extra is covered by `standard`. The image includes no GPU or CUDA framework. It runs the existing `eacbp run`, `eacbp resume`, or `eacbp report` command. Each submitted job performs one of those operations for one run directory. The adapter talks directly to Slurm; it does not keep a queue or database.
 
 The canonical Slurm batch template stays at `slurm/run_eacbp_container.sbatch` in the source tree and is included in wheels as `share/eacbp/slurm/run_eacbp_container.sbatch`. The adapter locates that installed data file by default, with a source-tree fallback; `--script` selects a site-specific template. This keeps one template source for both repository and wheel installs.
 
 ## Build candidate image
 
-Build from a clean Linux checkout with Docker BuildKit. `python:3.12-slim-bookworm` and the dependency ranges in `pyproject.toml` are candidate inputs, not a verified lock. The image build checks imports and `pip check`, then records the exact resolved Python distributions in `/opt/eacbp-build/pip-freeze.txt` inside that image. Save that file with the image after a successful Linux build, review the base image digest and dependency freeze, and only then treat the build as a deployment candidate.
+The Dockerfile pins the official Python 3.12.14 Bookworm image to OCI index digest `sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e` ([official Docker Hub tag](https://hub.docker.com/_/python/tags?name=3.12.14-slim-bookworm)). The dependency ranges in `pyproject.toml` are resolved into `docker/requirements-linux-py312-scientific.lock` and installed with hash checking; wheel-build tools are pinned in `docker/requirements-linux-py312-build.lock`. The base digest is a multi-platform index, while this lock and deployment target are Linux/amd64. Regenerate the lock files on Linux/amd64 with Python 3.12 so environment markers match the target. The image build checks the scientific imports and `pip check`, then records the installed distributions in `/opt/eacbp-build/pip-freeze.txt` inside the image.
+
+Build from a clean Linux checkout with Docker BuildKit:
 
 ```bash
 docker build \
+  --platform linux/amd64 \
   --file docker/Dockerfile \
   --build-arg EACBP_SOURCE_REVISION="$(git rev-parse HEAD)" \
   --tag eacbp:py312-cpu .
 
 docker run --rm eacbp:py312-cpu cat /opt/eacbp-build/pip-freeze.txt \
   > requirements-linux-py312-analysis.freeze
+
+docker run --rm eacbp:py312-cpu
 ```
+
+The locks were resolved with uv 0.11.8 against `https://pypi.org/simple` on 2026-09-27. Regenerate them from the repository root with:
+
+```bash
+uv pip compile pyproject.toml \
+  --extra standard --extra fate --extra advanced-statistics \
+  --extra advanced-qc --extra communication \
+  --no-emit-package eacbp --python-version 3.12 --generate-hashes \
+  --index-url https://pypi.org/simple \
+  --output-file docker/requirements-linux-py312-scientific.lock
+
+uv pip compile docker/requirements-linux-py312-build.in \
+  --python-version 3.12 --generate-hashes \
+  --index-url https://pypi.org/simple \
+  --output-file docker/requirements-linux-py312-build.lock
+```
+
+Review the new pins and rebuild the image when updating either lock.
 
 The image uses a non-root default user, CPU thread defaults of one, and writable `/outputs` and `/scratch` locations. Docker callers can override the user to match their host account and thread count. The image does not include FASTQ aligners, local reference files, input data, or private configuration. `.dockerignore` excludes the repository's local data and build/test outputs; the Dockerfile copies only package source and build metadata.
 
-This candidate does not pin the base image by digest or contain a checked-in Linux lock. Do not publish or describe it as reproducible until a clean Linux build has supplied and reviewed both. Do not use the Windows dependency snapshot as the Linux lock.
+The checked-in default now pins the base image and the Linux scientific dependencies. The image still needs a successful build and runtime smoke check on a host that can fetch the pinned base before it is treated as a verified container release. Do not use the Windows dependency snapshot as the Linux lock.
 
 ## Prepare the cluster
 
@@ -73,6 +96,4 @@ python -m eacbp.deployment cancel 123456
 
 The batch script has no project, account, partition, or absolute home-directory defaults. It checks the action and run ID, confines input file paths to their read-only roots, rejects a pre-existing run directory for `run`, and requires one for `resume`/`report`. The Python Slurm adapter constructs argv without a shell, validates scheduler identifiers and resource strings, supports a no-submit dry run, and wraps status, cancel, and log viewing.
 
-The wheel was built and installed into a temporary virtual environment, then imported from outside the source tree; the default batch template resolved from the installed `share/eacbp/slurm` data path. The deployment tests check argument construction and local validation. Git Bash syntax checks passed for the entrypoint and Slurm template. These checks do not validate a SIF, Apptainer behavior, cluster storage, or scientific analysis in the container.
-
-The current Windows session has a Docker client but no reachable Docker engine; the WSL status query was denied, and `sbatch`/Apptainer are unavailable locally. Therefore this change has **not** been built or run as a Linux image and has not been submitted to a Slurm cluster.
+The wheel was built and installed into a temporary virtual environment, then imported from outside the source tree; the default batch template resolved from the installed `share/eacbp/slurm` data path. The deployment tests check argument construction and local validation. Git Bash syntax checks passed for the entrypoint and Slurm template. After configuring the user-level Docker Desktop proxy, the pinned image built with its 97-package hashed Linux/Python 3.12 lock, and `pip check` passed. The rebuilt image uses the non-root `10001:10001` account; a network-disabled startup probe verified its cache and temporary directories are writable. The synthetic full-container lifecycle check passed run, resume, report, export, import, and restored report with networking disabled and a read-only root filesystem; see [DOCKER_ACCEPTANCE.md](docs/DOCKER_ACCEPTANCE.md) for the proxy recovery, image digest, and latest status. `sbatch` and Apptainer remain unavailable, so the SIF, cluster bind policy, compute-node storage, and Slurm submission remain unverified.

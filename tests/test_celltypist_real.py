@@ -32,9 +32,7 @@ def test_actual_celltypist_local_model_roundtrip(tmp_path, monkeypatch):
     contract = TaskContract(task_id="annotate", capability="cell_annotation", input_artifacts=[uri],
                             expected_outputs=["adata://toy/annotated/v1"], parameters={"model_path": str(path), "model_species": "synthetic", "model_tissue": "synthetic"})
     result = CellTypistAnnotationCapability().execute(contract, registry)
-    _, output = registry.get(result.output_artifacts[0])
-    if isinstance(output, dict):
-        output = SCData.from_dict(output)
+    output = registry.load_scdata(result.output_artifacts[0])
     assert output.obs.cell_type.eq("ExistingLabel").all()
     assert set(output.obs.cell_type_celltypist) <= {"SyntheticA", "SyntheticB"}
     assert output.obs.cell_type_celltypist_conflict.all()

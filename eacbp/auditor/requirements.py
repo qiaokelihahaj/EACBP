@@ -7,6 +7,7 @@ Missing required checks always reject it, independently of those severities.
 from eacbp.auditor.base import ValidationCheck, ValidationSeverity
 import numpy as np
 import pandas as pd
+from eacbp.capabilities.biological_units import complete_identity, resolve_donor_role
 from eacbp.capabilities.sc_data import SCData
 from eacbp.schemas.artifact import ArtifactType
 
@@ -39,16 +40,47 @@ def run_payload_requirements(contract, result, registry, checks):
     outputs = [registry.get(uri) for uri in result.output_artifacts]
     inputs = [registry.get(uri) for uri in contract.input_artifacts]
     def as_data(items):
-        return [p if isinstance(p, SCData) else SCData.from_dict(p) for m, p in items
+        return [SCData.from_payload(p) for m, p in items
                 if m.type in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA)]
     out_data, in_data = as_data(outputs), as_data(inputs)
     tables = [p for m, p in outputs if isinstance(p, pd.DataFrame)]
     present = {c.check_name for c in checks}
+    if (result.method_used == "scanpy_leiden_umap_v1"
+            and "leiden_execution_integrity" not in present):
+        from eacbp.auditor.clustering import ClusteringIntegrityValidator
+        clustering_report = ClusteringIntegrityValidator().audit(contract, result, registry)
+        reports.extend(clustering_report.checks)
+        present.update(check.check_name for check in clustering_report.checks)
+    # QC review intentionally permits zero candidate rows and structural NaNs.
+    # Those exceptions must always have independent reconstruction, even when
+    # a direct caller omits the descriptor's required-check list.
+    if contract.capability == "qc_review" and "qc_review_integrity" not in present:
+        from eacbp.auditor.qc_review import QCReviewValidator
+        review_report = QCReviewValidator().audit(contract, result, registry)
+        reports.extend(review_report.checks)
+        present.update(check.check_name for check in review_report.checks)
     for name in dict.fromkeys(contract.validation_requirements):
         if ALIASES.get(name, name) in present:
             continue
         ok, message, metrics = None, "", {}
-        if name == "fdr_correction_check" or name == "multiple_testing_correction":
+        if name == "rna_velocity_integrity" and contract.capability == "rna_velocity":
+            from eacbp.auditor.rna_velocity import RNAVelocityValidator
+            velocity_report = RNAVelocityValidator().audit(contract, result, registry)
+            reports.extend(velocity_report.checks)
+            present.update(check.check_name for check in velocity_report.checks)
+        elif name == "cluster_marker_integrity" and contract.capability == "cluster_markers":
+            # Also support callers constructing ScientificAuditor directly,
+            # without the capability registry's descriptor validators.
+            from eacbp.auditor.cluster_markers import ClusterMarkersValidator
+            marker_report = ClusterMarkersValidator().audit(contract, result, registry)
+            reports.extend(marker_report.checks)
+            present.update(check.check_name for check in marker_report.checks)
+        elif name == "qc_review_integrity" and contract.capability == "qc_review":
+            from eacbp.auditor.qc_review import QCReviewValidator
+            review_report = QCReviewValidator().audit(contract, result, registry)
+            reports.extend(review_report.checks)
+            present.update(check.check_name for check in review_report.checks)
+        elif name == "fdr_correction_check" or name == "multiple_testing_correction":
             ok = bool(tables) and all("fdr_q_value" in table for table in tables)
             if ok:
                 for table in tables:
@@ -81,16 +113,27 @@ def run_payload_requirements(contract, result, registry, checks):
                 ok = ok and len(tables[0]) == 1 and "n_cells" in tables[0] and int(tables[0].iloc[0]["n_cells"]) == in_data[0].n_obs
             message = "Compared recorded sample/cell dimensions against input artifacts."
         elif name == "replicate_check" and contract.capability == "dataset_audit":
-            ok = bool(in_data) and bool(tables) and "min_replicates_per_condition" in tables[0]
+            ok = bool(in_data) and bool(tables) and len(tables[0]) == 1 and "min_replicates_per_condition" in tables[0]
+            message = "Recomputed recorded donor counts; identity labels do not establish independent biological sampling."
             if ok:
-                obs = in_data[0].obs
-                condition = contract.parameters.get("condition_col", "condition")
-                donor = contract.parameters.get("donor_col") or next((c for c in ("donor_id", "donor", "mouse_id", "sample_id", "sample") if c in obs), None)
-                counts = obs.groupby(condition, observed=True)[donor].nunique() if condition in obs and donor else pd.Series(dtype=int)
-                actual = int(counts.min()) if len(counts) else 0
-                ok = int(tables[0].iloc[0]["min_replicates_per_condition"]) == actual
-                metrics = {"min_replicates": actual, "replication_assessed": True}
-            message = "Recomputed donor counts; an assessment does not establish sufficient replication."
+                try:
+                    obs = in_data[0].obs
+                    condition = contract.parameters.get("condition_col", "condition")
+                    donor_role = resolve_donor_role(obs, contract.parameters)
+                    donor = donor_role.column
+                    counts = obs.groupby(condition, observed=True)[donor].nunique() if condition in obs and donor else pd.Series(dtype=int)
+                    actual = int(counts.min()) if len(counts) else 0
+                    donor_complete = bool(donor and complete_identity(obs[donor]))
+                    ok = int(tables[0].iloc[0]["min_replicates_per_condition"]) == actual
+                    if "biological_replication_sufficient" in tables[0]:
+                        ok = ok and tables[0].iloc[0]["biological_replication_sufficient"] == (actual >= 2 and donor_complete)
+                    metrics = {"min_replicates": actual,
+                               "replication_assessed": bool(donor_complete and condition in obs and complete_identity(obs[condition])),
+                               "donor_metadata_complete": donor_complete, **donor_role.as_metrics()}
+                except (TypeError, ValueError) as exc:
+                    ok = False
+                    message = f"Donor replication reconstruction failed: {exc}"
+                    metrics = {"replication_assessed": False, "donor_independence_established": False}
         elif name == "retention_rate_check":
             ok = bool(out_data and in_data) and 0 < out_data[0].n_obs <= in_data[0].n_obs
             if ok:

@@ -1,7 +1,10 @@
 """Bounded, read-only chart views of outputs admitted in a saved snapshot."""
 from __future__ import annotations
 
+from eacbp.schemas.artifact import ArtifactType
+
 import math
+import hashlib
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -227,6 +230,10 @@ def result_views(run: Path):
                                                expected_auditor_fingerprint=context.auditor_fingerprint,
                                                expected_auditor_version=context.auditor_version)
             for metadata, payload in values:
+                if metadata.type in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA):
+                    # Normalize only after audited access; never bypass admission.
+                    from eacbp.capabilities.sc_data import SCData
+                    payload = SCData.from_payload(payload)
                 if task.capability == "qc":
                     response["qc"] = _qc_view(metadata, payload, task) or response["qc"]
                 elif task.capability == "clustering":
@@ -330,6 +337,12 @@ def deg_table_catalog(run: Path):
             task, context, metadata, path = _deg_table_metadata(
                 snapshot, registry, artifact_root, task.task_id)
             parameters = {**metadata.parameters, **metadata.summary_metrics, **task.metrics}
+            query_available = path.stat().st_size <= MAX_DEG_TABLE_BYTES
+            if query_available and path.name.endswith(".table.npz"):
+                try:
+                    _check_expanded_size(path)
+                except PreviewSizeLimit:
+                    query_available = False
             catalog.append({"task_id": task.task_id, "source_uri": metadata.uri,
                             "method": task.method_used, "total_bytes": path.stat().st_size,
                             "target_cell_type": parameters.get("target_cell_type"),
@@ -338,7 +351,7 @@ def deg_table_catalog(run: Path):
                             "contrast_label": parameters.get("contrast_label"),
                             "effect_definition": parameters.get("effect_definition"), "alpha": parameters.get("alpha", 0.05),
                             "statistical_unit": parameters.get("statistical_unit", "unknown"),
-                            "query_available": path.stat().st_size <= MAX_DEG_TABLE_BYTES,
+                            "query_available": query_available,
                             "notice": VERIFICATION_NOTICE})
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
             warnings.append(f"{task.task_id}：未列为可查询结果表（{exc}）。")
@@ -357,8 +370,14 @@ def _table_chunk_rows(path: Path, *, page: int, size: int, query: str,
     result = []
     total = 0
     try:
-        chunks = pd.read_csv(path, index_col=0, chunksize=4096, low_memory=False,
-                             dtype={"gene": "string"}, keep_default_na=False)
+        if path.name.endswith(".table.npz"):
+            from eacbp.artifact.storage import PayloadSerializer
+            _check_expanded_size(path)
+            frame = PayloadSerializer.deserialize(path, ArtifactType.TABLE)
+            chunks = (frame.iloc[start:start + 4096] for start in range(0, len(frame), 4096))
+        else:
+            chunks = pd.read_csv(path, index_col=0, chunksize=4096, low_memory=False,
+                                 dtype={"gene": "string"}, keep_default_na=False)
         for chunk in chunks:
             chunk = chunk.reset_index(drop=True)
             required = {"gene", "log2_fold_change", "fdr_q_value"}
@@ -444,7 +463,23 @@ def deg_table_page(run: Path, task_id: str, *, page=1, size=DEG_PAGE_SIZE,
 
 
 def audited_deg_csv(run: Path, task_id: str):
-    """Return a verified source path for streaming download of the full TABLE CSV."""
+    """Return the legacy CSV or an explicit CSV export of the typed source."""
     _, _, metadata, path = _audited_deg_table(run, task_id)
     safe_task = "".join(char if char.isalnum() or char in "-_" else "_" for char in task_id)
+    if path.name.endswith(".table.npz"):
+        from eacbp.artifact.storage import PayloadSerializer, _sha256_file
+        from eacbp._atomic_files import publish_new_text
+        _check_expanded_size(path)
+        table = PayloadSerializer.deserialize(path, ArtifactType.TABLE)
+        contents = table.to_csv(index=True)
+        if _sha256_file(path) != (metadata.sha256_hash, metadata.size_bytes):
+            raise ValueError("原生结果表在导出期间发生变化。")
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        exported = run.parent / ".webui" / "exports" / digest / f"deg-{safe_task}.csv"
+        try:
+            publish_new_text(exported, contents)
+        except FileExistsError:
+            if _sha256_file(exported)[0] != "sha256:" + digest:
+                raise ValueError("已缓存的 CSV 导出文件发生变化。")
+        path = exported
     return path, f"deg-{safe_task}.csv"

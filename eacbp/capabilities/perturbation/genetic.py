@@ -190,9 +190,7 @@ class GeneticPerturbationCapability(BaseCapability):
         Executes in silico genetic perturbation simulation within TaskContract bounds.
         """
         in_uri = contract.input_artifacts[0]
-        meta, payload = registry.get(in_uri)
-
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        meta, data = registry.get_scdata(in_uri)
         n_cells, n_genes = data.X.shape
         if int(n_cells) * int(n_genes) > MAX_PERTURBATION_ELEMENTS:
             raise ValueError(

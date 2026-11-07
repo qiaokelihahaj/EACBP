@@ -19,7 +19,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from .jobs import JobManager, contained, lease, read_json, write_json
+from .jobs import (JobManager, RECOVERY_OPERATION, contained, lease, read_json,
+                   recovery_directory, study_preview_binding, write_json)
 from .preferences import DirectorySettings, absolute_directory
 
 
@@ -27,6 +28,13 @@ MAX_IMPORT_FILE_BYTES = 64_000_000
 MAX_IMPORT_MATRIX_VALUES = 2_000_000
 MAX_IMPORT_CELLS = 250_000
 MAX_IMPORT_GENES = 100_000
+
+
+class RecoveryForm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prepared: str = Field(min_length=1, max_length=4096, strict=True)
+    expected_bindings_sha256: str = Field(min_length=64, max_length=64,
+                                         pattern=r"^[0-9a-f]{64}$", strict=True)
 
 
 class StudyForm(BaseModel):
@@ -56,7 +64,7 @@ class StudyForm(BaseModel):
     celltypist_model_path: str = ""
     annotation_use_as_cell_type: StrictBool = False
     min_genes: int = Field(default=100, ge=0)
-    max_mito_pct: float = Field(default=20, ge=0, le=100)
+    max_mito_pct: float = Field(default=20.0, ge=0, le=100)
     config_overrides: dict = Field(default_factory=dict)
 
 
@@ -76,11 +84,36 @@ class WebService:
         self.settings_file = Path(settings_file).resolve() if settings_file is not None else None
         self.manager = JobManager(workspace, runs_dir)
         self._import_previews = {}
+        self._study_previews = {}
+
+    def inspect_recovery(self, payload):
+        """Inspect a pinned prepared experiment without submitting or writing."""
+        from eacbp.application.recovery import inspect_recovery
+
+        form = RecoveryForm.model_validate(payload)
+        prepared = recovery_directory(self.manager.runs_dir, form.prepared)
+        report = inspect_recovery(prepared, expected_bindings_sha256=form.expected_bindings_sha256)
+        if report.get("output_dir") and Path(report["output_dir"]).resolve() != prepared:
+            raise ValueError("恢复检查返回了不同的实验目录")
+        return report
+
+    def resume_recovery(self, payload):
+        with self.directory_guard:
+            form = RecoveryForm.model_validate(payload)
+            prepared = recovery_directory(self.manager.runs_dir, form.prepared)
+            inspection = self.inspect_recovery(payload)
+            if inspection.get("status") != "ready" or inspection.get("can_resume") is not True:
+                return inspection
+            job = self.manager.submit(RECOVERY_OPERATION, run_dir=prepared,
+                expected_bindings_sha256=form.expected_bindings_sha256,
+                recovery_inspection=inspection)
+            return {"job": job, "inspection": inspection}
 
     def settings(self):
+        from eacbp.capabilities import create_default_capability_registry
+
         packages = {}
-        for name in ("anndata", "scanpy", "harmonypy", "leidenalg", "cellrank", "pydeseq2",
-                     "decoupler", "celltypist", "liana"):
+        for name in sorted({"anndata", *create_default_capability_registry().runtime_packages()}):
             try:
                 packages[name] = version(name)
             except PackageNotFoundError:
@@ -118,6 +151,7 @@ class WebService:
             # A failed save must leave the current roots untouched.
             self.manager = candidate
             self._import_previews.clear()
+            self._study_previews.clear()
         return {"workspace": str(workspace), "runs_dir": str(runs_dir),
                 "saved": self.settings_file is not None}
 
@@ -431,8 +465,10 @@ class WebService:
                 "use_as_cell_type": form.annotation_use_as_cell_type,
             }}
         config = merge(base, form.config_overrides)
+        if "research_purpose" in form.model_fields_set:
+            config["research_purpose"] = form.research_purpose
         config = RunConfig.from_mapping(normalise_config_paths(config, base_dir=self.manager.workspace)).to_mapping()
-        if validate_contrast:
+        if validate_contrast and config.get("research_purpose") is None:
             for capability in ("deg", "differential_abundance"):
                 values = config.get("capability_parameters", {}).get(capability, {}) or {}
                 condition_a, condition_b = values.get("condition_a"), values.get("condition_b")
@@ -462,7 +498,7 @@ class WebService:
 
         original_config = deepcopy(original_config)
         preserved = deepcopy(original_config)
-        for key in ("resume", "has_fastq", "data"):
+        for key in ("resume", "has_fastq", "data", "analysis_request"):
             preserved.pop(key, None)
 
         def take(capabilities, key, default=None):
@@ -528,6 +564,8 @@ class WebService:
                     if isinstance(current_annotation, dict):
                         current_annotation.pop("model_path", None)
         research_context = read_json(run / "webui_context.json", {}) or {}
+        if original_config.get("research_purpose"):
+            research_context = {**research_context, "research_purpose": original_config["research_purpose"]}
         purpose_saved = research_context.get("research_purpose") in {
             "overview", "deg", "abundance", "trajectory", "batch", "annotation"}
         if purpose_saved:
@@ -567,7 +605,7 @@ class WebService:
         selected_deg = config.get("method_overrides", {}).get("deg") or (
             "pydeseq2_pseudobulk_v1" if config.get("advanced_analysis") else "donor_pseudobulk_welch_v1"
         )
-        if config.get("capability_parameters", {}).get("deg", {}).get("paired") and selected_deg not in {
+        if config.get("research_purpose") in (None, "deg") and config.get("capability_parameters", {}).get("deg", {}).get("paired") and selected_deg not in {
             "pydeseq2_pseudobulk_v1", "pydeseq2_deg_v1", "pydeseq2_donor_pseudobulk_v1",
         }:
             raise ValueError("配对设计需要开启 PyDESeq2 高级分析")
@@ -608,9 +646,13 @@ class WebService:
             task = tasks.get(capability)
             if task is not None:
                 return dict(task.get("parameters") or {})
+            if plan and config.get("research_purpose") is not None:
+                return {}
             return dict(raw_parameters.get(capability) or {})
 
         def all_parameters(capability):
+            if plan and config.get("research_purpose") is not None and capability not in tasks:
+                return []
             planned = tasks_by_capability.get(capability, [])
             return [dict(task.get("parameters") or {}) for task in planned] or [
                 dict(raw_parameters.get(capability) or {})
@@ -655,6 +697,17 @@ class WebService:
                 "donor_col": [audit_raw.get("donor_col"), deg_raw.get("donor_col"), abundance_raw.get("donor_col")],
                 "batch_col": [audit_raw.get("batch_col"), integration_raw.get("batch_col")],
             }
+            if plan and config.get("research_purpose") is not None:
+                role_capabilities = {
+                    "condition_col": ("dataset_audit", "deg", "differential_abundance"),
+                    "donor_col": ("dataset_audit", "deg", "differential_abundance"),
+                    "batch_col": ("dataset_audit", "integration"),
+                }
+                configured_roles = {
+                    role: [raw_parameters.get(capability, {}).get(role)
+                           for capability in capabilities if capability in tasks]
+                    for role, capabilities in role_capabilities.items()
+                }
             effective_roles = {
                 "condition_col": [
                     self._effective_column(values, "condition_col", "condition")
@@ -694,7 +747,7 @@ class WebService:
                 block("sample_col", f"样本标识列「{form.sample_col}」不在当前文件中。", "从当前文件的列下拉框重新选择。")
 
             condition_col = effective["audit_condition"]
-            summary_donor = effective["deg_donor"] or effective["audit_donor"]
+            summary_donor = (effective["deg_donor"] if not plan or "deg" in tasks else "") or effective["audit_donor"]
             summary_batch = effective["integration_batch"] or effective["audit_batch"]
             condition_values, condition_missing, condition_groups = [], None, []
             if condition_col in names:
@@ -746,7 +799,8 @@ class WebService:
 
             if purpose in {"deg", "abundance"} and not (selected_a and selected_b):
                 block("condition_a", "此研究问题需要明确指定两个不同的条件值。", "选择条件 A 和 B；如果由专家 JSON 设置，请检查最终计划。")
-            if condition_col in names and len(condition_values) == 2 and not (selected_a and selected_b):
+            comparison_planned = not plan or any(name in tasks for name in ("deg", "differential_abundance", "functional_activity", "donor_sensitivity"))
+            if comparison_planned and condition_col in names and len(condition_values) == 2 and not (selected_a and selected_b):
                 block("condition_a", "后端会在恰好两个条件值时自动建立比较；请先确认比较方向。", "在条件 A/B 下拉框明确选择两组，避免依赖自动顺序。")
 
             stats_donor = effective["deg_donor"]
@@ -769,7 +823,7 @@ class WebService:
                 abundance_donors_a = set(abundance_values.loc[abundance_conds.eq(abundance_a)].dropna().tolist())
                 abundance_donors_b = set(abundance_values.loc[abundance_conds.eq(abundance_b)].dropna().tolist())
             abundance_overlap = abundance_donors_a & abundance_donors_b
-            method = tasks.get("deg", {}).get("method") or config.get("method_overrides", {}).get("deg")
+            method = tasks.get("deg", {}).get("method") or (config.get("method_overrides", {}).get("deg") if not plan else None)
             is_pydeseq = str(method or "").startswith("pydeseq2") or (not plan and bool(config.get("advanced_analysis")))
             paired = bool(deg.get("paired", deg.get("paired_design", False)))
             try:
@@ -875,25 +929,53 @@ class WebService:
             data.file.close()
 
     def preview(self, payload):
+        with self.directory_guard:
+            prepared = self._preview(payload)
+            if prepared["can_run"]:
+                now = time.monotonic()
+                self._study_previews = {key: value for key, value in self._study_previews.items()
+                                        if value["expires"] > now}
+                if len(self._study_previews) >= 32:
+                    self._study_previews.pop(next(iter(self._study_previews)))
+                token = secrets.token_urlsafe(32)
+                self._study_previews[token] = {
+                    "expires": now + 1800, "binding": deepcopy(prepared["preview_binding"]),
+                    "form": deepcopy(prepared["form"]),
+                }
+                prepared["preview_token"] = token
+            return prepared
+
+    def _preview(self, payload):
         from eacbp.orchestrator.planning import preview_study_plan
         form, data, manifest, config = self.prepare(payload)
+        source_sha256 = self._csv_digest(data)
         plan = preview_study_plan(manifest, config)
         design = self.design({**form.model_dump(), "data": str(data)}, plan=plan, prepared_config=config)
         manifest.experimental_design.total_samples = design["overview"]["samples"]["count"] or 0
+        plan = preview_study_plan(manifest, config)
+        from eacbp.capabilities import create_default_capability_registry
+
+        capabilities = create_default_capability_registry()
         required = {"anndata"}
-        by_method = {"harmonypy_v1": ["harmonypy", "scanpy"],
-                     "scanpy_leiden_umap_v1": ["scanpy", "leidenalg"],
-                     "scanpy_dpt_v1": ["scanpy"], "cellrank_fate_v1": ["cellrank"],
-                     "pydeseq2_pseudobulk_v1": ["pydeseq2"],
-                     "pydeseq2_leave_one_donor_out_v1": ["pydeseq2"],
-                     "decoupler_ulm_v2": ["decoupler"],
-                     "celltypist_local_v1": ["celltypist"]}
         for task in plan["tasks"]:
-            required.update(by_method.get(task.get("method"), []))
+            # Unresolved methods already make the plan invalid. Keep their
+            # original planning diagnostics instead of failing discovery.
+            if capabilities.has(task["capability"], task.get("method")):
+                required.update(capabilities.runtime_packages(task["capability"], task.get("method")))
         installed = self.settings()["packages"]
         missing = sorted(package for package in required if not installed.get(package))
-        return {"form": form.model_dump(), "data": str(data),
+        if self._csv_digest(data) != source_sha256:
+            raise ValueError("检查方案期间输入文件发生变化，请重新检查并确认。")
+        binding = study_preview_binding(data=str(data), source_sha256=source_sha256,
+                                        manifest=manifest.model_dump(mode="json"), config=config, plan=plan)
+        returned_form = form.model_dump()
+        if "research_purpose" not in form.model_fields_set:
+            # Preserve legacy scope when a client submits the returned form.
+            # A display default must not become an explicit scoped request.
+            returned_form.pop("research_purpose", None)
+        return {"form": returned_form, "data": str(data),
                 "manifest": manifest.model_dump(mode="json"), "config": config,
+                "preview_binding": binding,
                 "plan": plan, "missing_packages": missing, "design": design,
                 "can_run": plan["valid"] and not missing and design["can_run"]}
 
@@ -902,14 +984,24 @@ class WebService:
             return self._start(payload)
 
     def _start(self, payload):
-        prepared = self.preview(payload)
+        values = dict(payload) if isinstance(payload, dict) else {}
+        token = values.pop("preview_token", None)
+        preview = self._study_previews.get(token) if isinstance(token, str) else None
+        if preview is None or preview["expires"] <= time.monotonic():
+            raise ValueError("方案确认已过期或不存在，请重新检查方案并确认。")
+        prepared = self._preview(values)
+        if prepared["form"] != preview["form"] or prepared["preview_binding"] != preview["binding"]:
+            self._study_previews.pop(token, None)
+            raise ValueError("输入文件、设置或实际方案已改变，请重新检查方案并确认。")
         if not prepared["can_run"]:
             raise ValueError("计划包含错误或缺少依赖，请先修复预览中的问题")
         job = self.manager.submit(
             "run", run_dir=self.manager.new_run_dir(prepared["manifest"]["study_id"]),
             manifest=prepared["manifest"], config=prepared["config"], data=prepared["data"],
-            webui_context={"research_purpose": prepared["form"]["research_purpose"]},
+            webui_context={"research_purpose": prepared["form"].get("research_purpose", "overview")},
+            preview_binding=prepared["preview_binding"],
         )
+        self._study_previews.pop(token, None)
         return {"job": job, "run_id": Path(job["run_dir"]).relative_to(self.manager.runs_dir).as_posix()}
 
     def results(self, run_id):

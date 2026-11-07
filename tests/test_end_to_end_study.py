@@ -20,6 +20,7 @@ from eacbp.schemas.study import (
     ReproducibilityConfig,
 )
 from eacbp.schemas.evidence import LanguageTier, ClaimType
+from eacbp.schemas.task import TaskStatus
 from eacbp.orchestrator.intent import IntentParser
 from eacbp.orchestrator.loop import ScientificOrchestrator
 from eacbp.artifact.registry import ArtifactRegistry
@@ -30,7 +31,10 @@ from eacbp.report.markdown_report import ScientificReportGenerator
 
 def test_full_ad_mouse_study_pipeline(tmp_path):
     """
-    Baseline scRNA-seq pipeline execution (Stages 0-8).
+    Baseline scRNA-seq pipeline execution with simulated biological identities.
+
+    This checks admitted execution of the legacy fixed plan, not autonomous
+    fulfillment of every scientific phrase in the example prompt.
     """
     storage_dir = tmp_path / "artifacts_e2e_scrna"
     registry = ArtifactRegistry(storage_dir=str(storage_dir))
@@ -118,11 +122,15 @@ def test_full_ad_mouse_study_pipeline(tmp_path):
     assert "Evidence-to-Claim DAG" in report_md
 
 
-def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
+def test_multisection_multimodal_pipeline_rejects_unsupported_analytical_inference(tmp_path):
     """
-    Comprehensive 18-step E2E study across all 6 planes:
-    scRNA + Spatial + SpaCell + GeneAgent + ChatCell + Knowledge Engine (Prior-guided) +
-    In Silico CRISPR KO Simulation (Trem2) + Compound Simulation + Multimodal 5-Pillar Claims + Provenance Report.
+    Exercise the 18-step multimodal plan with explicitly simulated sections.
+
+    Biological contrasts use four simulated mouse identities per condition.
+    Each mouse has one declared local section; spatial contacts stay within
+    those coordinate systems. Global analytical Moran/Geary inference is
+    unsupported for these multiple sections, so the complete plan must fail
+    while preserving the valid statistical and descriptive output branches.
     """
     storage_dir = tmp_path / "artifacts_e2e_multimodal"
     registry = ArtifactRegistry(storage_dir=str(storage_dir))
@@ -144,8 +152,8 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
         experimental_design=ExperimentalDesign(
             biological_unit="mouse",
             batches=["batch_1", "batch_2"],
-            total_samples=12,
-            donor_replicates_per_condition={"AD": 6, "control": 6},
+            total_samples=8,
+            donor_replicates_per_condition={"AD": 4, "control": 4},
         ),
         data=DataSpec(
             modalities=["scRNA", "spatial", "perturbation"],
@@ -174,6 +182,14 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
         random_seed=42,
     )
     assert raw_spatial_data.uns["is_simulated"] is True
+    assert raw_spatial_data.obs.groupby("condition")["mouse_id"].nunique().to_dict() == {"AD": 4, "control": 4}
+    # This is an explicit fixture design, not an inference that a donor is a
+    # section. Local section names repeat across the eight simulated mice.
+    raw_spatial_data.obs["section_id"] = "simulated_local_section_1"
+    raw_spatial_data.uns["simulation_spatial_design"] = {
+        "coordinate_system": "one_local_simulated_section_per_declared_mouse",
+        "is_measured_biological_data": False,
+    }
 
     raw_uri = f"adata://{study_id}/raw/v1"
     manifest.data.raw_artifact_uri = raw_uri
@@ -204,7 +220,12 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
 
     # 4. Verify Task DAG Execution Across All 18 Steps
     assert study_summary["study_id"] == study_id
-    assert study_summary["status"] == "success", study_summary["failures"]
+    assert study_summary["status"] == "failed"
+    assert len(study_summary["failures"]) == 1, study_summary["failures"]
+    failure = study_summary["failures"][0]
+    assert failure["task_id"] == "task_011_spatial_deg"
+    assert "Multi-section spatial autocorrelation requires section-aware inference" in failure["error"]
+    assert study_summary["is_simulated"] is True
     assert study_summary["tasks_executed"] == 18, f"Expected 18 tasks, got {study_summary['tasks_executed']}"
     assert study_summary["artifacts_created"] >= 18
     assert study_summary["evidence_nodes_count"] >= 8
@@ -226,7 +247,7 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
     assert any("deg_results/v1" in u for u in registered_uris)
     assert any("trajectory_results/v1" in u for u in registered_uris)
     assert any("spatial_domains" in u for u in registered_uris)
-    assert any("spatial_deg" in u for u in registered_uris)
+    assert not any("spatial_deg" in u for u in registered_uris)
     assert any("spatial_cci" in u for u in registered_uris)
     assert any("spacell" in u for u in registered_uris)
     assert any("gene_agent" in u or "geneagent" in u for u in registered_uris)
@@ -235,13 +256,27 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
     assert any("knowledge_report" in u for u in registered_uris)
     assert any("perturbation" in u for u in registered_uris)
     assert any("compound" in u for u in registered_uris)
+    tasks = {task.task_id: task for task in orchestrator.task_history}
+    assert tasks["task_008_deg"].status == TaskStatus.SUCCESS
+    assert tasks["task_010_spatial_domain"].status == TaskStatus.SUCCESS
+    assert tasks["task_011_spatial_deg"].status == TaskStatus.EXECUTION_FAILURE
+    assert tasks["task_011_spatial_deg"].output_artifacts == []
+    assert tasks["task_012_spatial_cci"].status == TaskStatus.SUCCESS
+    assert tasks["task_013_spacell_adapter"].status == TaskStatus.SUCCESS
+    domain_data = registry.load_scdata(f"adata://{study_id}/spatial_domains/v6")
+    graph = domain_data.obsp["spatial_connectivities"]
+    donors = domain_data.obs["mouse_id"].to_numpy()
+    rows, columns = graph.nonzero()
+    assert np.all(donors[rows] == donors[columns])
+    assert tasks["task_012_spatial_cci"].metrics["n_spatial_partitions"] == 8
+    assert tasks["task_012_spatial_cci"].metrics["permutation_scope"] == "within_observed_spatial_partition"
 
     # 7. Check Invariant 3: Multi-Tier Calibrated Evidence Across 5 Pillars
     evidence_nodes = orchestrator.evidence_graph.evidence_nodes
     evidence_types = {ev.type for ev in evidence_nodes.values()}
     
     # 5 Pillars Verified:
-    # Pillar 1: Spatial localization
+    # Pillar 1: Descriptive spatial localization (no unsupported SVG inference)
     # Pillar 2: Pseudobulk DEG
     # Pillar 3: Literature & Pathway
     # Pillar 4: Trajectory
@@ -274,7 +309,8 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
         assert "adjacent to amyloid plaques" not in claim.statement
 
     # 9. Check Invariant 4: Independent Scientific Audits
-    assert len(orchestrator.audit_reports) == 18
+    assert len(orchestrator.audit_reports) == 17
+    assert not any(report.target_task_id == "task_011_spatial_deg" for report in orchestrator.audit_reports)
     for report in orchestrator.audit_reports:
         assert report.overall_passed is True, f"Audit failed for task {report.target_task_id}: {[c.message for c in report.checks if not c.passed]}"
 
@@ -299,3 +335,5 @@ def test_full_multimodal_spatial_and_perturbation_study_pipeline(tmp_path):
     assert "## 7. Evidence-to-Claim DAG" in report_md
     assert next(iter(claims)) in report_md
     assert perturbation_claims[0].claim_id in report_md
+    assert "execution_failure" in report_md
+    assert not any(ev.source_task_id == "task_011_spatial_deg" for ev in evidence_nodes.values())

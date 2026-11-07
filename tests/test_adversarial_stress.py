@@ -348,8 +348,7 @@ def test_genetic_perturbation_missing_genes_and_edge_inputs(tmp_path):
     
     # Verify non-negativity of simulated expression
     out_adata_uri = res_ko.output_artifacts[0]
-    _, res_payload = registry.get(out_adata_uri)
-    res_sc = SCData.from_dict(res_payload)
+    res_sc = registry.load_scdata(out_adata_uri)
     assert np.min(res_sc.X) >= 0.0
     # Knocked out gene at index 0 should be 0.0 across all cells
     assert np.allclose(res_sc.X[:, 0], 0.0)

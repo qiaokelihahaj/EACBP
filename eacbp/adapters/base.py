@@ -15,7 +15,7 @@ import pandas as pd
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus, ExecutionFailureType
 from eacbp.schemas.artifact import ArtifactType, ArtifactMetadata
 from eacbp.capabilities.base import BaseCapability, ImplementationType
-from eacbp.capabilities.side_effect import SideEffectValidator
+from eacbp.capabilities.side_effect import SideEffectValidator, label_assignments_preserved
 from eacbp.capabilities.sc_data import SCData
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
@@ -325,9 +325,8 @@ class BaseAgentAdapter(BaseCapability, ABC):
                 if "recluster" in contract.forbidden_operations or "mutate_clusters" in contract.forbidden_operations:
                     if in_obs is not None and out_obs is not None:
                         for cluster_col in ["leiden", "louvain", "cluster", "cell_type", "cell_type_annotation"]:
-                            if cluster_col in in_obs.columns and cluster_col in out_obs.columns:
-                                if not in_obs[cluster_col].equals(out_obs[cluster_col]):
-                                    return f"POLICY VIOLATION: Cluster assignments '{cluster_col}' were modified despite 'recluster' being forbidden."
+                            if cluster_col in in_obs.columns and not label_assignments_preserved(in_obs, out_obs, cluster_col):
+                                return f"POLICY VIOLATION: Cluster assignments '{cluster_col}' were modified despite 'recluster' being forbidden."
 
         # Run standard SideEffectValidator check
         valid, violation_msg = SideEffectValidator.validate(

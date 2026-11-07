@@ -79,8 +79,7 @@ class NormalizationCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        meta, payload = registry.get(in_uri)
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        meta, data = registry.get_scdata(in_uri)
 
         target_sum = float(contract.parameters.get("target_sum", 10000.0))
         n_top_genes = int(contract.parameters.get("n_top_genes", 300))

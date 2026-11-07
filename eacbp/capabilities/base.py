@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, is_dataclass
 from typing import Callable, Iterable, List, Dict, Any, Optional, Sequence, Tuple
 from enum import Enum
+import re
 
 from pydantic import BaseModel
 from eacbp.schemas.task import TaskContract, TaskResult
@@ -90,6 +91,10 @@ class CapabilityDescriptor:
     study (``shared``) or once for each requested population (``per_target``).
     It takes precedence over legacy task parameter markers during expansion.
 
+    ``runtime_packages`` lists optional Python distribution names needed by
+    this method. Discovery checks their installation without importing them;
+    it does not certify compatible versions or external executables.
+
     The public constructor intentionally mirrors the existing vocabulary in
     ``BaseCapability`` (``capability_name`` and ``method``) so declarations
     remain explicit and discoverable.
@@ -98,7 +103,7 @@ class CapabilityDescriptor:
     __slots__ = (
         "capability_name", "method", "parameter_model", "input_types", "output_types",
         "required_audit_ids", "validator", "evidence_extractor", "plan_factory",
-        "method_aliases", "description", "validate_types", "scope",
+        "method_aliases", "description", "validate_types", "scope", "runtime_packages",
     )
 
     def __init__(
@@ -116,6 +121,7 @@ class CapabilityDescriptor:
         description: str = "",
         validate_types: bool = True,
         scope: str = "shared",
+        runtime_packages: Optional[Sequence[str]] = None,
     ) -> None:
         if not isinstance(capability_name, str) or not capability_name.strip():
             raise ValueError("Capability descriptor requires a non-empty capability_name")
@@ -136,6 +142,14 @@ class CapabilityDescriptor:
         self.description = str(description or "")
         self.validate_types = bool(validate_types)
         self.scope = scope
+        if isinstance(runtime_packages, str):
+            raise TypeError("runtime_packages must be a sequence of distribution names")
+        packages = []
+        for name in runtime_packages or ():
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", name):
+                raise ValueError(f"Invalid runtime distribution name: {name!r}")
+            packages.append(re.sub(r"[-_.]+", "-", name).lower())
+        self.runtime_packages = tuple(dict.fromkeys(packages))
 
     @property
     def capability(self) -> str:
@@ -163,6 +177,7 @@ class CapabilityDescriptor:
             method_aliases=tuple(getattr(capability, "legacy_aliases", {}).keys()),
             validate_types=False,
             scope="per_target" if capability.capability_name in TARGET_BRANCH_CAPABILITIES else "shared",
+            runtime_packages=getattr(capability, "runtime_packages", ()),
         )
 
     def validate_parameters(self, parameters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -256,6 +271,7 @@ class CapabilityDescriptor:
             "validate_types": self.validate_types,
             "scope": self.scope,
             "description": self.description,
+            "runtime_packages": list(self.runtime_packages),
         }
 
 

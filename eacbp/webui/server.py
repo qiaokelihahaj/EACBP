@@ -55,6 +55,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
     def send_json(self, value, status=200):
+        if status >= 400 and self.command == "POST" and not getattr(self, "_body_consumed", False):
+            # Closing with unread request bytes can reset the TCP connection
+            # on Windows and hide the HTTP error (notably a stale page token).
+            # Drain only bounded bodies, with a short timeout for slow clients.
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if 0 < size <= 1_000_000:
+                    self.connection.settimeout(1)
+                    self.rfile.read(size)
+            except (OSError, ValueError):
+                pass
+            self._body_consumed = True
         self.send_content(json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8"), status=status)
 
     def send_problem(self, exc, status, *, title=None):
@@ -120,6 +132,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"runs": service.manager.runs(), "jobs": service.manager.jobs()})
                 if path == "/api/run":
                     return self.send_json(service.manager.detail(query.get("id", [""])[0]))
+                if path == "/api/recovery/job":
+                    ids = query.get("id", [])
+                    if len(ids) != 1:
+                        raise ValueError("id 必须提供一次")
+                    return self.send_json(service.manager.recovery_detail(ids[0]))
                 if path == "/api/reuse":
                     return self.send_json(service.reuse_configuration(query.get("id", [""])[0]))
                 if path == "/api/results":
@@ -189,6 +206,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not 0 < size <= 1_000_000:
                     raise ValueError("请求大小必须在 1 MB 以内")
                 self.connection.settimeout(15)
+                self._body_consumed = True
                 payload = json.loads(self.rfile.read(size))
                 if not isinstance(payload, dict):
                     raise ValueError("Expected JSON object")
@@ -208,6 +226,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(service.confirm_import(payload))
                 if path == "/api/run":
                     return self.send_json(service.start(payload), 202)
+                if path == "/api/recovery/inspect":
+                    return self.send_json(service.inspect_recovery(payload))
+                if path == "/api/recovery/resume":
+                    result = service.resume_recovery(payload)
+                    return self.send_json(result, 202 if "job" in result else 200)
                 if path in {"/api/resume", "/api/report"}:
                     run = service.manager.run_path(payload.get("run_id", ""))
                     job = service.manager.submit(path.rsplit("/", 1)[1], run_dir=run)

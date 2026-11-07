@@ -27,7 +27,10 @@ class SCData:
         if hasattr(X, "tocsr"):
             self.X = X.tocsr(copy=True)
         else:
-            self.X = np.asarray(X, dtype=np.float32).copy()
+            # Import/copy is a representation boundary, not a numerical
+            # transformation. In particular, float32 rounds large integer
+            # counts and can make fractional float64 values appear integral.
+            self.X = np.asarray(X).copy()
         self.obs = obs.copy(deep=True) if isinstance(obs, pd.DataFrame) else pd.DataFrame(obs)
         self.var = var.copy(deep=True) if isinstance(var, pd.DataFrame) else pd.DataFrame(var)
         self.obsm = {k: self._copy_value(v) for k, v in (obsm or {}).items()}
@@ -259,6 +262,18 @@ class SCData:
         }
 
     @classmethod
+    def from_payload(cls, payload: Any) -> "SCData":
+        """Normalize an already verified payload without optional dependencies."""
+        if isinstance(payload, cls):
+            return payload
+        if isinstance(payload, Mapping):
+            missing = {"X", "obs", "var"} - payload.keys()
+            if missing:
+                raise ValueError(f"Single-cell payload is missing fields: {sorted(missing)}")
+            return cls.from_dict(payload)
+        raise TypeError(f"Expected SCData or a single-cell mapping, got {type(payload).__name__}")
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SCData":
         if isinstance(data, cls):
             return data.copy()
@@ -312,8 +327,14 @@ class SCData:
         adata: Any,
         max_cells: Optional[int] = None,
         random_seed: int = 42,
+        add_missing_annotations: bool = True,
     ) -> "SCData":
-        """Builds SCData directly from an anndata.AnnData object."""
+        """Build SCData from AnnData, optionally filling standard annotations.
+
+        Imports keep the historical behavior of adding absent cell/gene IDs
+        and summary counts. Storage reloads pass ``False`` to preserve the
+        exact obs/var columns that were serialized.
+        """
         if max_cells is not None and adata.n_obs > max_cells:
             rng = np.random.default_rng(random_seed)
             sub_idx = rng.choice(adata.n_obs, size=max_cells, replace=False)
@@ -324,31 +345,35 @@ class SCData:
         X = adata.X
         if hasattr(X, "tocsr"):
             X = X.tocsr(copy=True)
-            n_counts = np.asarray(X.sum(axis=1)).flatten()
-            n_genes = np.asarray((X > 0).sum(axis=1)).flatten()
-            n_cells_per_gene = np.asarray((X > 0).sum(axis=0)).flatten()
         else:
-            X = np.asarray(X, dtype=np.float32).copy()
-            n_counts = np.sum(X, axis=1)
-            n_genes = np.sum(X > 0, axis=1)
-            n_cells_per_gene = np.sum(X > 0, axis=0)
+            X = np.asarray(X).copy()
 
         obs = adata.obs.copy()
         var = adata.var.copy()
 
-        # Ensure essential columns exist in obs
-        if "cell_id" not in obs.columns:
-            obs["cell_id"] = obs.index.astype(str)
-        if "n_counts" not in obs.columns:
-            obs["n_counts"] = n_counts
-        if "n_genes" not in obs.columns:
-            obs["n_genes"] = n_genes
+        if add_missing_annotations:
+            if hasattr(X, "tocsr"):
+                n_counts = np.asarray(X.sum(axis=1)).flatten()
+                n_genes = np.asarray((X > 0).sum(axis=1)).flatten()
+                n_cells_per_gene = np.asarray((X > 0).sum(axis=0)).flatten()
+            else:
+                n_counts = np.sum(X, axis=1)
+                n_genes = np.sum(X > 0, axis=1)
+                n_cells_per_gene = np.sum(X > 0, axis=0)
 
-        # Ensure essential columns exist in var
-        if "gene_name" not in var.columns:
-            var["gene_name"] = var.index.astype(str)
-        if "n_cells" not in var.columns:
-            var["n_cells"] = n_cells_per_gene
+            # Ensure essential columns exist in obs
+            if "cell_id" not in obs.columns:
+                obs["cell_id"] = obs.index.astype(str)
+            if "n_counts" not in obs.columns:
+                obs["n_counts"] = n_counts
+            if "n_genes" not in obs.columns:
+                obs["n_genes"] = n_genes
+
+            # Ensure essential columns exist in var
+            if "gene_name" not in var.columns:
+                var["gene_name"] = var.index.astype(str)
+            if "n_cells" not in var.columns:
+                var["n_cells"] = n_cells_per_gene
 
         obsm_dict = {}
         for k in adata.obsm.keys():

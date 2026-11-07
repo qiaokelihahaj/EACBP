@@ -37,6 +37,9 @@ standard = [
     "leidenalg>=0.10",
 ]
 fate = ["cellrank>=2.3,<3", "anndata>=0.11,<0.13"]
+# scVelo 0.3.x generalized least squares assigns a length-one array to a
+# scalar, a conversion removed by NumPy 2.4. Keep the actual model compatible.
+velocity = ["scvelo>=0.3.3,<0.4", "anndata>=0.10,<0.13", "numpy>=1.24,<2.4"]
 advanced-statistics = [
     "pydeseq2>=0.5.4",
     "decoupler>=2.2.0",
@@ -51,7 +54,6 @@ eacbp = "eacbp.cli:main"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 pythonpath = ["."]
-addopts = "--basetemp=.pytest_temp"
 
 [tool.setuptools.packages.find]
 include = ["eacbp*"]

@@ -1120,6 +1120,23 @@ class ArtifactRegistry:
         )
         return meta, payload
 
+    def get_scdata(self, uri_str: str):
+        """Load verified single-cell data with a format-independent interface.
+
+        Generic get/load_payload retain their historical dictionary behavior.
+        Calling get also preserves transaction-parent lookup and hash checks.
+        """
+        from eacbp.capabilities.sc_data import SCData
+
+        meta, payload = self.get(uri_str)
+        if meta.type not in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA):
+            raise TypeError(f"Artifact {uri_str!r} is not single-cell data: {meta.type}")
+        return meta, SCData.from_payload(payload)
+
+    def load_scdata(self, uri_str: str):
+        """Return SCData from either H5AD or structured NPZ storage."""
+        return self.get_scdata(uri_str)[1]
+
     @_synchronized
     def exists(self, uri_str: str, artifact_type: Optional[ArtifactType] = None) -> bool:
         canonical_uri = ArtifactURI.parse(uri_str).to_string()

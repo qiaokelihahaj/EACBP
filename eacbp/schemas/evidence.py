@@ -5,7 +5,7 @@ Evidence and Claim schema defining the 4-tier language protocol and evidence-bac
 from typing import List, Dict, Any, Optional
 from enum import Enum
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class EvidenceType(str, Enum):
@@ -13,6 +13,8 @@ class EvidenceType(str, Enum):
     QC_METRICS = "qc_metrics"
     INTEGRATION_EVALUATION = "integration_evaluation"
     CLUSTERING_STABILITY = "clustering_stability"
+    CLUSTER_MARKERS = "cluster_markers"
+    RNA_VELOCITY = "rna_velocity"
     DIFFERENTIAL_ABUNDANCE = "differential_abundance"
     PSEUDOBULK_DEG = "pseudobulk_deg"
     CELL_LEVEL_DEG = "cell_level_deg"
@@ -66,6 +68,27 @@ class ConfidenceScore(BaseModel):
     overall: float = Field(0.0, ge=0.0, le=1.0, description="Aggregated confidence metric")
 
 
+class EvidenceRowSelector(BaseModel):
+    """A stable unique table key, plus the fields actually cited by evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_uri: str
+    key: Dict[str, Any] = Field(min_length=1)
+    metric_columns: Dict[str, str] = Field(min_length=1)
+    context_columns: Dict[str, str] = Field(default_factory=dict)
+    artifact_parameters: Dict[str, Any] = Field(default_factory=dict)
+    row_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("artifact_uri")
+    @classmethod
+    def table_uri(cls, value):
+        from eacbp.artifact.uri import ArtifactURI
+        if ArtifactURI.parse(value).to_string() != value or not value.startswith("table://"):
+            raise ValueError("row selector requires a canonical table artifact URI")
+        return value
+
+
 class EvidenceNode(BaseModel):
     evidence_id: str = Field(..., description="Unique evidence ID, e.g. E203")
     type: EvidenceType
@@ -77,6 +100,7 @@ class EvidenceNode(BaseModel):
     # Provenance
     source_task_id: str = Field(..., description="Task ID where this evidence was computed")
     source_artifact_uris: List[str] = Field(default_factory=list, description="Artifact URIs backing this evidence")
+    row_selector: Optional[EvidenceRowSelector] = Field(None, description="Unique source-table row; absent on legacy or aggregate evidence")
     inference_contract_id: Optional[str] = Field(None, description="Identity of the audited estimand and inference settings")
     
     # Quantitative support details

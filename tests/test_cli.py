@@ -54,6 +54,32 @@ def test_cli_plan_is_read_only_and_reports_errors(tmp_path, monkeypatch, capsys)
     assert not json.loads(capsys.readouterr().out)['valid']
 
 
+def test_confirmed_source_hash_is_checked_before_import(tmp_path, monkeypatch):
+    source = input_file(tmp_path)
+    monkeypatch.setattr(study_service, '_import_h5ad', lambda *a: pytest.fail('must reject before import'))
+    with pytest.raises(ValueError, match='confirmed preview'):
+        study_service.run_study(manifest=study(), config={}, data=source, run_dir=tmp_path / 'run',
+                                expected_source_sha256='0' * 64)
+    assert not (tmp_path / 'run' / 'artifacts').exists()
+
+
+def test_confirmed_source_hash_remains_checked_after_import(tmp_path, monkeypatch):
+    import hashlib
+    source = input_file(tmp_path)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    original = study_service._import_h5ad
+    def import_then_change(path):
+        value = original(path)
+        with path.open('ab') as stream:
+            stream.write(b'changed during import')
+        return value
+    monkeypatch.setattr(study_service, '_import_h5ad', import_then_change)
+    monkeypatch.setattr(study_service, '_make_registry', lambda *a: pytest.fail('changed input registered'))
+    with pytest.raises(ValueError, match='changed during import'):
+        study_service.run_study(manifest=study(), config={}, data=source, run_dir=tmp_path / 'run',
+                                expected_source_sha256=digest)
+
+
 def test_cli_real_import_strict_resume_and_snapshot_report(tmp_path, monkeypatch, audit_only):
     source = input_file(tmp_path)
     run_dir = tmp_path / 'run'
@@ -77,6 +103,31 @@ def test_cli_real_import_strict_resume_and_snapshot_report(tmp_path, monkeypatch
     assert 'task_resumed' in kinds and 'attempt_started' not in kinds
     assert len(list((run_dir / 'snapshots').glob('*.json'))) == 2
     assert json.loads((run_dir / 'run_config.json').read_text())['config'] == saved['config']
+
+
+@pytest.mark.parametrize('as_sparse', [False, True])
+@pytest.mark.parametrize('values', [
+    np.array([[2 ** 24 + 1, 3], [5, 7]], dtype=np.int64),
+    np.array([[np.nextafter(1.0, 2.0), 0.1], [0.0, 7.0]], dtype=np.float64),
+], ids=['integer_counts', 'fractional_expression'])
+def test_h5ad_ingestion_preserves_source_values_and_dtype(tmp_path, audit_only, as_sparse, values):
+    import anndata as ad
+    from scipy import sparse
+
+    matrix = sparse.csr_matrix(values) if as_sparse else values.copy()
+    source = tmp_path / 'precision.h5ad'
+    ad.AnnData(matrix, obs=pd.DataFrame(index=['c1', 'c2']),
+               var=pd.DataFrame(index=['g1', 'g2'])).write_h5ad(source)
+    source_bytes = source.read_bytes()
+    run_dir = tmp_path / 'run'
+    result = cli.run_study(manifest=study(), config={'method_profile': 'baseline'}, data=source, run_dir=run_dir)
+    assert result['status'] == 'success', result
+    imported = ArtifactRegistry(run_dir / 'artifacts').load_scdata('adata://cli_test/raw/v1')
+    actual = imported.X.toarray() if sparse.issparse(imported.X) else imported.X
+    assert actual.dtype == values.dtype
+    np.testing.assert_array_equal(actual, values)
+    np.testing.assert_array_equal(imported.obs['n_counts'].to_numpy(), values.sum(axis=1))
+    assert source.read_bytes() == source_bytes
 
 
 def test_run_refuses_existing_directory_without_modifying_it(tmp_path):

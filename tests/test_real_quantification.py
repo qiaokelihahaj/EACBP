@@ -58,11 +58,22 @@ def test_starsolo_multilane_command_matrix_and_hashes(tmp_path, monkeypatch):
     index = command.index("--readFilesIn")
     assert command[index + 1:index + 3] == [",".join(p[1] for p in reads), ",".join(p[0] for p in reads)]
     assert command[command.index("--soloUMIlen") + 1] == "12"
-    _, data = reg.get(result.output_artifacts[0])
+    data = reg.load_scdata(result.output_artifacts[0])
     assert data.shape == (2, 3) and list(data.var.index) == ["ENSG1", "ENSG2", "ENSG3"]
     assert data.obs.cell_id.tolist() == ["s1_AAAA", "s1_BBBB"]
     assert data.obs.donor.tolist() == ["donor1", "donor1"]
     assert result.metrics["input_file_hashes"] or result.metrics["input_hashes"]
+    provenance = data.uns["quantification_provenance"]
+    recorded_inputs = list(provenance["input_file_hashes"].values())
+    assert {record["path"] for record in recorded_inputs} == {
+        path for pair in reads for path in pair
+    }
+    assert all(record["sha256"].startswith("sha256:") for record in recorded_inputs)
+    assert all(
+        key.startswith("file_")
+        for hashes in (provenance["input_file_hashes"], provenance["reference_hashes"])
+        for key in hashes
+    )
 
 
 @pytest.mark.parametrize("failure", ["exit", "only_raw", "changed_input"])

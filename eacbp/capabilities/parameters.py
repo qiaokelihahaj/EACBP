@@ -47,6 +47,22 @@ class NormalizationParameters(MethodParameters):
     input_layer: NonEmptyString = "counts"
 
 
+class LeidenParameters(MethodParameters):
+    n_components: PositiveInt = 20
+    n_neighbors: Annotated[int, Field(ge=2)] = 15
+    resolution: PositiveFloat = 1.0
+    marker_reference: dict[str, list[NonEmptyString]] = Field(default_factory=dict)
+
+
+class NoCorrectionParameters(MethodParameters):
+    n_components: PositiveInt = 20
+    batch_col: NonEmptyString | None = None
+
+
+class HarmonyParameters(NoCorrectionParameters):
+    max_iter_harmony: PositiveInt = 10
+
+
 class ContrastParameters(MethodParameters):
     condition_col: NonEmptyString = "condition"
     donor_col: NonEmptyString | None = None
@@ -73,6 +89,7 @@ class WelchDEGParameters(ContrastParameters):
 
 
 class PyDESeq2Parameters(ContrastParameters):
+    fit_receipts_uri: NonEmptyString | None = None
     min_donors: ReplicateCount = 2
     paired: bool = False
     paired_design: bool = False

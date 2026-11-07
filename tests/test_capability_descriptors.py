@@ -4,6 +4,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from eacbp.artifact.registry import ArtifactRegistry
+from eacbp.capabilities import create_default_capability_registry
 from eacbp.auditor.base import ValidationReport, ValidationSeverity
 from eacbp.capabilities.base import BaseCapability, CapabilityDescriptor
 from eacbp.capabilities.registry import CapabilityRegistry
@@ -103,3 +104,40 @@ def test_descriptor_rejects_cross_task_evidence(tmp_path):
     capability.descriptor.evidence_extractor = wrong_source
     with pytest.raises(ValueError):
         registry.extract_evidence(contract, result, report, artifacts)
+
+
+@pytest.mark.parametrize('capability,method,packages', [
+    ('integration', 'harmonypy_v1', {'anndata', 'scanpy', 'harmonypy'}),
+    ('clustering', 'scanpy_leiden_umap_v1', {'anndata', 'scanpy', 'igraph', 'leidenalg'}),
+    ('trajectory_inference', 'scanpy_dpt_v1', {'anndata', 'scanpy'}),
+    ('fate_mapping', 'cellrank_fate_v1', {'anndata', 'scanpy', 'cellrank'}),
+    ('deg', 'pydeseq2_pseudobulk_v1', {'pydeseq2'}),
+    ('functional_activity', 'decoupler_ulm_v2', {'anndata', 'decoupler'}),
+    ('donor_sensitivity', 'pydeseq2_leave_one_donor_out_v1', {'pydeseq2'}),
+    ('doublet_detection', 'scrublet', {'anndata', 'scanpy', 'scikit-image'}),
+    ('cell_annotation', 'celltypist', {'anndata', 'celltypist'}),
+    ('liana_communication', 'liana_rank_aggregate_v1', {'anndata', 'liana'}),
+    ('rna_velocity', 'scvelo_stochastic_v1', {'anndata', 'scvelo'}),
+])
+def test_runtime_package_discovery_follows_method_descriptors_and_aliases(capability, method, packages):
+    registry = create_default_capability_registry()
+    assert set(registry.runtime_packages(capability, method)) == packages
+    assert set(registry.describe(capability, method).to_dict()['runtime_packages']) == packages
+    assert packages <= set(registry.runtime_packages())
+
+
+def test_plugin_runtime_package_discovery_is_declared_and_deduplicated():
+    registry = CapabilityRegistry()
+    capability = FixtureCapability()
+    capability.descriptor = CapabilityDescriptor('fixture', 'fixture_v1',
+                                                runtime_packages=['New_Package', 'new-package'])
+    registry.register(capability)
+    assert registry.runtime_packages('fixture', 'fixture_v1') == ('new-package',)
+    assert registry.runtime_packages() == ('new-package',)
+    assert capability.calls == 0
+
+
+@pytest.mark.parametrize('packages', ['scanpy', [''], ['../package'], ['scanpy>=1.10']])
+def test_runtime_package_declarations_reject_non_distribution_names(packages):
+    with pytest.raises((TypeError, ValueError), match='runtime|distribution'):
+        CapabilityDescriptor('fixture', 'fixture_v1', runtime_packages=packages)

@@ -14,8 +14,11 @@ from eacbp.schemas.artifact import ArtifactType
 from eacbp.capabilities.base import BaseCapability, ImplementationType
 from eacbp.capabilities.sc_data import SCData
 from eacbp.capabilities.spatial.domain import (
-    validate_spatial_coordinates,
+    extract_spatial_coordinates,
     build_spatial_neighborhood_graph,
+    resolve_spatial_sections,
+    validate_spatial_graph,
+    _spatial_partition_labels,
 )
 from eacbp.numerics import benjamini_hochberg
 from eacbp.artifact.registry import ArtifactRegistry
@@ -88,11 +91,17 @@ def compute_spatial_cci(
     n_permutations: int = 200,
     fdr_threshold: float = 0.05,
     random_seed: int = 42,
+    section_labels: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """
     Computes proximity-weighted ligand-receptor interaction scores and permutation p-values.
     """
     rng = np.random.default_rng(random_seed)
+    if section_labels is None:
+        section_labels, _ = resolve_spatial_sections(data)
+    sections = _spatial_partition_labels(section_labels, data.n_obs)
+    validate_spatial_graph(W, data.n_obs, sections)
+    permutation_blocks = [np.flatnonzero(sections == section) for section in np.unique(sections)]
     
     # 1. Determine cell type annotations
     obs = data.obs
@@ -113,7 +122,7 @@ def compute_spatial_cci(
     gene_names = list(data.var["gene_name"]) if "gene_name" in data.var.columns else [f"Gene_{i}" for i in range(data.n_vars)]
     gene_map = {g.lower(): (i, g) for i, g in enumerate(gene_names)}
 
-    pairs_to_evaluate = lr_pairs or CURATED_LIGAND_RECEPTOR_PAIRS
+    pairs_to_evaluate = CURATED_LIGAND_RECEPTOR_PAIRS if lr_pairs is None else lr_pairs
     
     valid_pairs = []
     for item in pairs_to_evaluate:
@@ -125,10 +134,7 @@ def compute_spatial_cci(
             valid_pairs.append((l_orig, r_orig, l_idx, r_idx, pw))
 
     if not valid_pairs:
-        if data.n_vars >= 2:
-            l_idx, r_idx = 0, 1
-            l_orig, r_orig = str(gene_names[0]), str(gene_names[1])
-            valid_pairs.append((l_orig, r_orig, l_idx, r_idx, "Data-Derived Interaction"))
+        raise ValueError("No ligand-receptor pairs from the supplied resource match observed genes; spatial CCI is not estimable.")
 
     # 3. Compute observed spatial contact densities
     obs_contact_densities = calculate_spatial_contact_density(labels, unique_cell_types, W)
@@ -183,7 +189,9 @@ def compute_spatial_cci(
 
     n_perms = max(10, n_permutations)
     for _ in range(n_perms):
-        perm_labels = rng.permutation(labels)
+        perm_labels = labels.copy()
+        for positions in permutation_blocks:
+            perm_labels[positions] = rng.permutation(labels[positions])
         perm_densities = calculate_spatial_contact_density(perm_labels, unique_cell_types, W)
         
         for k, inter in enumerate(interactions):
@@ -243,9 +251,7 @@ class CellCellCommunicationCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        meta, payload = registry.get(in_uri)
-
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        meta, data = registry.get_scdata(in_uri)
         
         # Parameters
         k_neighbors = int(contract.parameters.get("k_neighbors", 6))
@@ -256,36 +262,16 @@ class CellCellCommunicationCapability(BaseCapability):
         random_seed = int(contract.parameters.get("random_seed", 42))
 
         # Spatial coordinates
-        coords = None
-        if "spatial" in data.obsm:
-            coords = data.obsm["spatial"]
-        elif "spatial_coords" in data.obsm:
-            coords = data.obsm["spatial_coords"]
-        elif "x_coord" in data.obs.columns and "y_coord" in data.obs.columns:
-            coords = data.obs[["x_coord", "y_coord"]].values
-        elif "x" in data.obs.columns and "y" in data.obs.columns:
-            coords = data.obs[["x", "y"]].values
-
-        if coords is None:
-            # Non-spatial standard single-cell CCI (CellChat / CellPhoneDB style)
-            # Keep the old global-contact fallback for small non-spatial
-            # inputs.  Large spatial inputs always use the sparse kNN path.
-            if data.n_obs > 2000:
-                raise ValueError("CCI without spatial coordinates is limited to 2000 cells; provide coordinates for sparse kNN contacts")
-            W = np.ones((data.n_obs, data.n_obs), dtype=np.float32) / float(max(1, data.n_obs))
-            is_spatial = False
+        validated_coords = extract_spatial_coordinates(data)
+        sections, section_receipt = resolve_spatial_sections(data, contract.parameters)
+        supplied_graphs = [slot["spatial_connectivities"] for slot in (data.obsp, data.obsm, data.uns)
+                           if "spatial_connectivities" in slot]
+        if supplied_graphs:
+            for graph in supplied_graphs:
+                validate_spatial_graph(graph, data.n_obs, sections)
+            W = supplied_graphs[0]
         else:
-            validated_coords = validate_spatial_coordinates(coords, data.n_obs)
-            is_spatial = True
-            # Spatial connectivity graph safely loaded
-            if "spatial_connectivities" in data.obsm and (isinstance(data.obsm["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsm["spatial_connectivities"])):
-                W = data.obsm["spatial_connectivities"]
-            elif "spatial_connectivities" in data.uns and (isinstance(data.uns["spatial_connectivities"], np.ndarray) or sparse.issparse(data.uns["spatial_connectivities"])):
-                W = data.uns["spatial_connectivities"]
-            elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and (isinstance(data.obsp["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsp["spatial_connectivities"])):
-                W = data.obsp["spatial_connectivities"]
-            else:
-                W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors)
+            W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors, section_labels=sections)
 
         # Run Spatial CCI Computation
         cci_df = compute_spatial_cci(
@@ -296,6 +282,7 @@ class CellCellCommunicationCapability(BaseCapability):
             n_permutations=n_permutations,
             fdr_threshold=fdr_threshold,
             random_seed=random_seed,
+            section_labels=sections,
         )
 
         sig_interactions = cci_df[cci_df["is_significant"]] if not cci_df.empty else pd.DataFrame()
@@ -321,10 +308,16 @@ class CellCellCommunicationCapability(BaseCapability):
                 "fdr_threshold": fdr_threshold,
                 "cell_type_col": cell_type_col,
                 "random_seed": random_seed,
+                **section_receipt,
+                "permutation_scope": "within_observed_spatial_partition",
+                "inference_scope": "conditional_spatial_colocalization_not_donor_replicated_communication",
             },
             summary_metrics={
                 "total_interactions_tested": len(cci_df),
                 "significant_interactions": len(sig_interactions),
+                **section_receipt,
+                "permutation_scope": "within_observed_spatial_partition",
+                "inference_scope": "conditional_spatial_colocalization_not_donor_replicated_communication",
                 "top_interaction": (
                     f"{sig_interactions.iloc[0]['sender_cell_type']}->{sig_interactions.iloc[0]['receiver_cell_type']}: {sig_interactions.iloc[0]['ligand']}-{sig_interactions.iloc[0]['receptor']}"
                     if not sig_interactions.empty else "none"
@@ -362,6 +355,9 @@ class CellCellCommunicationCapability(BaseCapability):
             metrics={
                 "total_interactions": len(cci_df),
                 "significant_interactions": len(sig_interactions),
+                **section_receipt,
+                "permutation_scope": "within_observed_spatial_partition",
+                "inference_scope": "conditional_spatial_colocalization_not_donor_replicated_communication",
                 "top_interactions": (
                     sig_interactions[["sender_cell_type", "receiver_cell_type", "ligand", "receptor", "spatial_interaction_score"]]
                     .head(5)

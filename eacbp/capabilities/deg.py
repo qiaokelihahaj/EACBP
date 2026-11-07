@@ -1,10 +1,9 @@
 """Differential abundance/expression with explicit statistical units.
 
 The primary DEG path aggregates raw counts by donor and compares donor-level
-normalised pseudobulk values with Welch's t-test.  If donor metadata or
-replicate support is insufficient, the capability emits a clearly labelled
-``single_cell_exploratory`` result.  It never invents condition or donor
-labels and never calls a Welch test Mann-Whitney.
+normalised pseudobulk values with Welch's t-test. If donor metadata or
+replicate support is insufficient, the capability emits descriptive cell-level
+effects with a not-estimable inference result, without cell-level p-values.
 """
 
 from typing import Any, Optional
@@ -13,9 +12,10 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
+from eacbp.schemas.task import ScientificResult, ScientificResultStatus, TaskContract, TaskResult, TaskStatus
 from eacbp.schemas.artifact import ArtifactType
 from eacbp.capabilities.base import BaseCapability, ImplementationType
+from eacbp.capabilities.biological_units import complete_identity, resolve_donor_role
 from eacbp.capabilities.sc_data import SCData
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
@@ -58,15 +58,7 @@ def _resolve_conditions(obs: pd.DataFrame, params: dict) -> tuple[str, str]:
 
 
 def _resolve_donor_column(obs: pd.DataFrame, params: dict) -> Optional[str]:
-    explicit = params.get("donor_col")
-    if explicit is not None:
-        if explicit not in obs.columns:
-            raise ValueError(f"Donor metadata column '{explicit}' is not present")
-        return str(explicit)
-    for name in ("donor", "donor_id", "mouse_id", "sample_id", "sample"):
-        if name in obs.columns:
-            return name
-    return None
+    return resolve_donor_role(obs, params).column
 
 
 def _donor_pseudobulk(counts, obs, condition_col: str, donor_col: str, condition: str) -> tuple[np.ndarray, list[str]]:
@@ -108,17 +100,19 @@ class DifferentialAbundanceCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        _, payload = registry.get(in_uri)
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        _, data = registry.get_scdata(in_uri)
         obs = data.obs
         params = contract.parameters
         condition_col = str(params.get("condition_col", "condition"))
         if condition_col not in obs.columns:
             raise ValueError(f"Condition metadata column '{condition_col}' is required")
-        donor_col = _resolve_donor_column(obs, params)
+        donor_role = resolve_donor_role(obs, params)
+        donor_col = donor_role.column
         state_col = str(params.get("state_col", "cell_type" if "cell_type" in obs.columns else "microglia_state" if "microglia_state" in obs.columns else "cluster"))
         if donor_col is None:
-            raise ValueError("Differential abundance requires donor/sample metadata; no donor column was found")
+            raise ValueError("Differential abundance is not estimable: biological donor metadata are required; sample/library identifiers cannot substitute")
+        if not complete_identity(obs[donor_col]):
+            raise ValueError("Differential abundance is not estimable: biological donor identities are incomplete")
         if state_col not in obs.columns:
             raise ValueError(f"State metadata column '{state_col}' is required")
         cond_a, cond_b = _resolve_conditions(obs, params)
@@ -127,6 +121,8 @@ class DifferentialAbundanceCapability(BaseCapability):
         donors_b = set(obs.loc[obs[condition_col].astype(str) == cond_b, donor_col].dropna().astype(str))
         if donors_a & donors_b:
             raise ValueError("Independent abundance Welch test cannot analyze paired donors")
+        if min(len(donors_a), len(donors_b)) < 2:
+            raise ValueError("Differential abundance is not estimable: at least two biological donors per condition are required")
         ct_table = pd.crosstab([obs[donor_col], obs[condition_col]], obs[state_col], normalize="index").reset_index()
         states = list(pd.unique(obs[state_col]))
         rows = []
@@ -154,8 +150,18 @@ class DifferentialAbundanceCapability(BaseCapability):
                 "enriched_in": cond_a if np.isfinite(ratio) and ratio > 0 else cond_b if np.isfinite(ratio) else None,
             })
         res_df = pd.DataFrame(rows)
+        for key, value in donor_role.as_metrics().items():
+            res_df[key] = value
         if not res_df.empty:
             res_df["fdr_q_value"] = benjamini_hochberg(res_df["p_value"].values)
+        tested = len(res_df)
+        supported = int((res_df["fdr_q_value"] < 0.05).sum()) if tested else 0
+        science = ScientificResult(
+            status=(ScientificResultStatus.ESTIMATED_SUPPORTED if supported else
+                    ScientificResultStatus.ESTIMATED_INCONCLUSIVE if tested else ScientificResultStatus.NOT_ESTIMABLE),
+            n_features_tested=tested, n_features_supported=supported,
+            summary=f"Estimated {tested} donor-level state proportions; {supported} meet FDR < 0.05. Non-significance does not establish equivalence.",
+        )
         uri_obj = ArtifactURI.parse(in_uri)
         out_uri = (contract.expected_outputs[0] if contract.expected_outputs
                    else f"table://{uri_obj.study_id}/differential_abundance/v1")
@@ -169,7 +175,9 @@ class DifferentialAbundanceCapability(BaseCapability):
             parent_uris=[in_uri],
             summary_metrics={
                 "tested_states": len(res_df),
+                "scientific_result_schema_version": 1,
                 "statistical_unit": "donor_proportion",
+                **donor_role.as_metrics(),
                 "condition_a": cond_a,
                 "condition_b": cond_b,
                 "fdr_family": params.get("fdr_family", "study:differential_abundance"),
@@ -185,11 +193,12 @@ class DifferentialAbundanceCapability(BaseCapability):
             input_artifacts=[in_uri],
             output_artifacts=[out_uri],
             executed_operations=["aggregate_donor_proportions", "welch_t_test", "benjamini_hochberg"],
+            scientific_result=science,
             metrics={
                 "abundance_results": res_df.to_dict(orient="records"),
                 "condition_a": cond_a,
                 "condition_b": cond_b,
-                "donor_col": donor_col,
+                **donor_role.as_metrics(),
                 "fdr_family": params.get("fdr_family", "study:differential_abundance"),
                 "target_cell_type": params.get("target_cell_type"),
                 "target_branch": params.get("target_branch"),
@@ -198,7 +207,7 @@ class DifferentialAbundanceCapability(BaseCapability):
 
 
 class DifferentialExpressionCapability(BaseCapability):
-    """Donor pseudobulk Welch DEG with an explicitly exploratory fallback."""
+    """Donor pseudobulk Welch DEG with a descriptive, non-inferential fallback."""
 
     def __init__(self, implementation_id: str = "donor_pseudobulk_welch_v1"):
         super().__init__(
@@ -213,13 +222,13 @@ class DifferentialExpressionCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        _, payload = registry.get(in_uri)
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        _, data = registry.get_scdata(in_uri)
         obs = data.obs
         params = contract.parameters
         condition_col = str(params.get("condition_col", "condition"))
         cond_a, cond_b = _resolve_conditions(obs, params)
-        donor_col = _resolve_donor_column(obs, params)
+        donor_role = resolve_donor_role(obs, params)
+        donor_col = donor_role.column
         gene_names = (
             data.var["gene_name"].astype(str).values
             if "gene_name" in data.var.columns
@@ -241,10 +250,11 @@ class DifferentialExpressionCapability(BaseCapability):
                     "Use a paired model; the allow_paired_donors flag cannot bypass this restriction."
                 )
         min_replicates = max(2, int(params.get("min_replicates", 2)))
-        pseudobulk_supported = donor_col is not None and counts is not None and n_donor_a >= min_replicates and n_donor_b >= min_replicates
+        donor_complete = bool(donor_col and complete_identity(obs[donor_col]))
+        pseudobulk_supported = donor_complete and counts is not None and n_donor_a >= min_replicates and n_donor_b >= min_replicates
         require_pseudobulk = bool(params.get("require_pseudobulk", False))
         if require_pseudobulk and not pseudobulk_supported:
-            missing = "counts layer" if counts is None else "at least two donors per condition"
+            missing = "counts layer" if counts is None else "complete biological identities and at least two donors per condition"
             raise ValueError(f"Donor pseudobulk requested but {missing} is unavailable")
 
         if pseudobulk_supported:
@@ -279,8 +289,8 @@ class DifferentialExpressionCapability(BaseCapability):
             operations = ["aggregate_counts_by_donor", "library_size_normalize_donor_pseudobulk", "welch_t_test_donor_pseudobulk", "benjamini_hochberg"]
             is_pseudobulk = True
         else:
-            # This path is intentionally exploratory: cells are independent
-            # observations for the test only, so no donor-level claim is made.
+            # Cells do not become biological replicates when donor metadata
+            # are absent. Preserve descriptive effects without inferential tests.
             if counts is None:
                 counts = data.X
                 counts_source = "X_unverified_scale"
@@ -295,7 +305,6 @@ class DifferentialExpressionCapability(BaseCapability):
             log2_fc = np.log2((mean_a + 0.5) / (mean_b + 0.5))
             rows = []
             for j, gene in enumerate(gene_names):
-                p_val = float(stats.ttest_ind(values_a[:, j], values_b[:, j], equal_var=False).pvalue) if len(values_a) and len(values_b) else 1.0
                 rows.append({
                     "gene": str(gene),
                     "condition_a": cond_a,
@@ -304,24 +313,37 @@ class DifferentialExpressionCapability(BaseCapability):
                     "mean_condition_b": float(mean_b[j]),
                     "log2_fold_change": float(log2_fc[j]),
                     "effect_definition": "log2_ratio_of_mean_cell_values_plus_pseudocount_exploratory",
-                    "p_value": p_val if np.isfinite(p_val) else 1.0,
+                    "p_value": np.nan,
                     "statistical_unit": "single_cell_exploratory",
                     "donor_col": donor_col,
                     "n_donors_condition_a": n_donor_a,
                     "n_donors_condition_b": n_donor_b,
                     "counts_source": counts_source,
                     "pseudoreplication_warning": True,
+                    "status": "not_estimated",
+                    "status_reason": "biological_donor_inference_not_estimable",
                 })
-            operations = ["compute_cell_level_effect", "welch_t_test_single_cell_exploratory", "benjamini_hochberg"]
-            method_used = "single_cell_exploratory_welch_v1"
+            operations = ["compute_cell_level_effect", "record_inference_not_estimable"]
+            method_used = "single_cell_descriptive_v1"
             unit = "single_cell_exploratory"
             is_pseudobulk = False
 
         deg_df = pd.DataFrame(rows)
+        for key, value in donor_role.as_metrics().items():
+            deg_df[key] = value
         if not deg_df.empty:
-            deg_df["fdr_q_value"] = benjamini_hochberg(deg_df["p_value"].values)
+            deg_df["fdr_q_value"] = benjamini_hochberg(deg_df["p_value"].values) if is_pseudobulk else np.nan
             deg_df = deg_df.sort_values("fdr_q_value").reset_index(drop=True)
         sig_degs = deg_df[(deg_df["fdr_q_value"] < 0.05) & (deg_df["log2_fold_change"].abs() > 0.5)] if not deg_df.empty else deg_df
+        tested = len(deg_df) if is_pseudobulk else 0
+        supported = len(sig_degs) if is_pseudobulk else 0
+        science = ScientificResult(
+            status=(ScientificResultStatus.ESTIMATED_SUPPORTED if supported else
+                    ScientificResultStatus.ESTIMATED_INCONCLUSIVE if tested else ScientificResultStatus.NOT_ESTIMABLE),
+            n_features_tested=tested, n_features_supported=supported,
+            summary=(f"Estimated {tested} donor-level gene effects; {supported} meet FDR < 0.05 and absolute log2 fold change > 0.5. Non-significance does not establish equivalence."
+                     if is_pseudobulk else "Biological donor inference is not estimable: raw counts, complete donor identities, or sufficient biological replicates are unavailable. Cell-level effects are descriptive."),
+        )
 
         uri_obj = ArtifactURI.parse(in_uri)
         # The planner supplies a branch-local URI for multi-target studies.
@@ -340,7 +362,7 @@ class DifferentialExpressionCapability(BaseCapability):
                 "condition_col": condition_col,
                 "condition_a": cond_a,
                 "condition_b": cond_b,
-                "donor_col": donor_col,
+                **donor_role.as_metrics(),
                 "statistical_unit": unit,
                 "counts_required_for_pseudobulk": True,
                 "fdr_family": params.get("fdr_family", "study:deg"),
@@ -349,8 +371,11 @@ class DifferentialExpressionCapability(BaseCapability):
             },
             summary_metrics={
                 "total_genes": len(deg_df),
+                "scientific_result_schema_version": 1,
                 "significant_degs_fdr05": len(sig_degs),
                 "statistical_unit": unit,
+                **donor_role.as_metrics(),
+                **({"scientific_result_status": "not_estimable"} if not is_pseudobulk else {}),
                 "top_upregulated": sig_degs[sig_degs["log2_fold_change"] > 0]["gene"].head(5).tolist() if not sig_degs.empty else [],
             },
         )
@@ -362,10 +387,13 @@ class DifferentialExpressionCapability(BaseCapability):
             input_artifacts=[in_uri],
             output_artifacts=[out_uri],
             executed_operations=operations,
+            scientific_result=science,
             metrics={
                 "significant_degs": len(sig_degs),
                 "is_pseudobulk": is_pseudobulk,
                 "statistical_unit": unit,
+                **donor_role.as_metrics(),
+                **({"scientific_result_status": "not_estimable"} if not is_pseudobulk else {}),
                 "condition_a": cond_a,
                 "condition_b": cond_b,
                 "top_genes": sig_degs["gene"].head(5).tolist() if not sig_degs.empty else [],

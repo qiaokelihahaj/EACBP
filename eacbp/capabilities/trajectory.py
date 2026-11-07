@@ -58,8 +58,7 @@ class TrajectoryCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        _, payload = registry.get(in_uri)
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        _, data = registry.get_scdata(in_uri)
 
         emb = data.obsm.get("X_pca")
         if emb is None:

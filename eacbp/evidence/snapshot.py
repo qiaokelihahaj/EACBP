@@ -680,6 +680,11 @@ def _validate_cross_references(
         return True
 
     for node in graph.evidence_nodes.values():
+        from eacbp.evidence.extraction import EvidenceRowBindingError, validate_evidence_row_structure
+        try:
+            validate_evidence_row_structure(node)
+        except EvidenceRowBindingError as exc:
+            raise SnapshotValidationError(f"invalid evidence row binding {node.evidence_id}: {exc}") from exc
         if node.source_task_id not in task_map:
             raise SnapshotValidationError(
                 f"evidence {node.evidence_id} references missing source task {node.source_task_id!r}"
@@ -715,6 +720,12 @@ def _validate_cross_references(
                 )
             if inference_id and artifact_metadata[uri].summary_metrics.get("inference_contract_id") != inference_id:
                 raise SnapshotValidationError(f"artifact {uri} inference contract differs from source task")
+        if node.row_selector is not None:
+            from eacbp.evidence.extraction import validate_evidence_target_scope
+            try:
+                validate_evidence_target_scope(node, artifact_metadata[node.row_selector.artifact_uri].parameters, task)
+            except EvidenceRowBindingError as exc:
+                raise SnapshotValidationError(f"invalid evidence target scope {node.evidence_id}: {exc}") from exc
         for raw_uri in node.data_origin_uris:
             uri = _artifact_uri(raw_uri, f"evidence {node.evidence_id} artifact")
             if not _external_source(uri) and uri not in local_artifacts:
@@ -917,6 +928,12 @@ def _verify_registry_scope(snapshot: StudySnapshot, registry: Any) -> None:
                     f"rejected audit receipt {context.signature} cannot be reactivated"
                 )
 
+    from eacbp.evidence.extraction import EvidenceRowBindingError, validate_evidence_row_bindings
+    try:
+        validate_evidence_row_bindings(snapshot.evidence_graph.evidence_nodes.values(), registry, snapshot.task_results)
+    except EvidenceRowBindingError as exc:
+        raise SnapshotIntegrityError(f"evidence differs from its source row: {exc}") from exc
+
 
 def _snapshot_payload(snapshot: StudySnapshot) -> Dict[str, Any]:
     evidence_nodes = [
@@ -1036,8 +1053,8 @@ def write_study_snapshot(
 ) -> Path:
     """Validate and atomically write a versioned study snapshot.
 
-    The registry is read for metadata, lineage and durable audit context.  No
-    artifact payload is deserialized and no audit receipt is written.
+    The registry is read for metadata, lineage and durable audit context.
+    Tables cited by row selectors are also read; no audit receipt is written.
     """
 
     manifest_model = _coerce_model(manifest, StudyManifest, "manifest")
@@ -1153,8 +1170,8 @@ def _load_contexts(raw_values: Any) -> Dict[str, AuditContextSummary]:
     return dict(sorted(contexts.items()))
 
 
-def load_study_snapshot(path: str | Path) -> StudySnapshot:
-    """Load and strictly validate a snapshot without touching artifact payloads."""
+def load_study_snapshot(path: str | Path, artifact_registry: Any = None) -> StudySnapshot:
+    """Validate frozen structure; an optional registry also verifies live rows."""
 
     path = Path(path)
     try:
@@ -1284,6 +1301,8 @@ def load_study_snapshot(path: str | Path) -> StudySnapshot:
         snapshot.artifact_sources,
         snapshot.audit_contexts,
     )
+    if artifact_registry is not None:
+        _verify_registry_scope(snapshot, artifact_registry)
     return snapshot
 
 
@@ -1304,6 +1323,7 @@ def render_snapshot_report(path: str | Path, artifact_registry: Any) -> str:
         artifact_registry=artifact_registry,
         task_history=snapshot.task_results,
         audit_reports=snapshot.audit_reports,
+        run_summary=snapshot.summary,
     )
     try:
         return generator.generate_markdown()

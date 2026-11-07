@@ -15,8 +15,10 @@ from eacbp.schemas.artifact import ArtifactType
 from eacbp.capabilities.base import BaseCapability, ImplementationType
 from eacbp.capabilities.sc_data import SCData
 from eacbp.capabilities.spatial.domain import (
-    validate_spatial_coordinates,
+    extract_spatial_coordinates,
     build_spatial_neighborhood_graph,
+    resolve_spatial_sections,
+    validate_spatial_graph,
 )
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
@@ -195,25 +197,11 @@ class SpatialDEGCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        meta, payload = registry.get(in_uri)
-
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+        meta, data = registry.get_scdata(in_uri)
         
         # Extract spatial coordinates
-        coords = None
-        if "spatial" in data.obsm:
-            coords = data.obsm["spatial"]
-        elif "spatial_coords" in data.obsm:
-            coords = data.obsm["spatial_coords"]
-        elif "x_coord" in data.obs.columns and "y_coord" in data.obs.columns:
-            coords = data.obs[["x_coord", "y_coord"]].values
-        elif "x" in data.obs.columns and "y" in data.obs.columns:
-            coords = data.obs[["x", "y"]].values
-
-        if coords is None:
-            raise ValueError("Spatial coordinates not found for spatial autocorrelation analysis.")
-
-        validated_coords = validate_spatial_coordinates(coords, data.n_obs)
+        validated_coords = extract_spatial_coordinates(data)
+        sections, section_receipt = resolve_spatial_sections(data, contract.parameters)
 
         # Parameters
         k_neighbors = int(contract.parameters.get("k_neighbors", 6))
@@ -222,14 +210,19 @@ class SpatialDEGCapability(BaseCapability):
         target_genes = contract.parameters.get("target_genes", None)
 
         # Build or retrieve spatial connectivity graph safely
-        if "spatial_connectivities" in data.obsm and (isinstance(data.obsm["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsm["spatial_connectivities"])):
-            W = data.obsm["spatial_connectivities"]
-        elif "spatial_connectivities" in data.uns and (isinstance(data.uns["spatial_connectivities"], np.ndarray) or sparse.issparse(data.uns["spatial_connectivities"])):
-            W = data.uns["spatial_connectivities"]
-        elif hasattr(data, "obsp") and isinstance(getattr(data, "obsp", None), dict) and "spatial_connectivities" in data.obsp and (isinstance(data.obsp["spatial_connectivities"], np.ndarray) or sparse.issparse(data.obsp["spatial_connectivities"])):
-            W = data.obsp["spatial_connectivities"]
+        supplied_graphs = [slot["spatial_connectivities"] for slot in (data.obsp, data.obsm, data.uns)
+                           if "spatial_connectivities" in slot]
+        if supplied_graphs:
+            for graph in supplied_graphs:
+                validate_spatial_graph(graph, data.n_obs, sections)
+            W = supplied_graphs[0]
         else:
-            W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors)
+            W, _, _ = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors, section_labels=sections)
+        # The existing analytical randomization formulas assume global label
+        # exchangeability. A block-diagonal graph alone cannot make that null
+        # valid for several independently measured coordinate systems.
+        if section_receipt["n_spatial_partitions"] > 1:
+            raise ValueError("Multi-section spatial autocorrelation requires section-aware inference; this analytical method supports one spatial partition.")
 
         gene_names = list(data.var["gene_name"]) if "gene_name" in data.var.columns else [f"Gene_{i}" for i in range(data.n_vars)]
         
@@ -298,6 +291,8 @@ class SpatialDEGCapability(BaseCapability):
                 "min_moran_i": min_moran_i,
                 "fdr_threshold": fdr_threshold,
                 "tested_genes_count": len(gene_indices),
+                **section_receipt,
+                "inference_scope": "single_section_spatial_autocorrelation",
             },
             summary_metrics={
                 "tested_genes": len(res_df),
@@ -341,5 +336,7 @@ class SpatialDEGCapability(BaseCapability):
                 "total_genes_tested": len(res_df),
                 "significant_svg_count": len(sig_svgs),
                 "top_svg_genes": sig_svgs["gene"].head(5).tolist() if not sig_svgs.empty else [],
+                **section_receipt,
+                "inference_scope": "single_section_spatial_autocorrelation",
             },
         )

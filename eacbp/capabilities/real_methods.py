@@ -1,5 +1,7 @@
 """Real, optional-library implementations. No substitution with baseline algorithms."""
 from importlib.metadata import version
+from copy import deepcopy
+import hashlib
 import numpy as np
 import pandas as pd
 from scipy import sparse, stats
@@ -9,11 +11,11 @@ from eacbp.numerics import benjamini_hochberg
 from eacbp.schemas.artifact import ArtifactType
 from eacbp.schemas.task import TaskResult, TaskStatus
 from eacbp.artifact.uri import ArtifactURI
+from eacbp.schemas.audit import model_to_jsonable, stable_fingerprint
 
 
 def _input(contract, registry):
-    _, payload = registry.get(contract.input_artifacts[0])
-    data = SCData.from_dict(payload)
+    data = registry.load_scdata(contract.input_artifacts[0])
     if min(data.shape) < 3:
         raise ValueError("Standard methods require at least three cells and genes")
     values = data.X.data if sparse.issparse(data.X) else data.X
@@ -105,6 +107,10 @@ class LeidenClusteringCapability(_LibraryCapability):
         adata = _input(contract, registry)
         params = contract.parameters
         seed = int(params.get("random_seed", 42))
+        source_meta = registry.get_metadata(contract.input_artifacts[0])
+        reused = "X_pca" in adata.obsm
+        inherited = _leiden_receipt_values(adata.uns.get("integration", {}).get("representation_receipt", {})) if reused else {}
+        source_integration = str(adata.uns.get("integration", {}).get("method", "unavailable"))
         _neighbors(adata, params)
         sc.tl.leiden(adata, resolution=float(params.get("resolution", 1)), random_state=seed,
                      flavor="leidenalg", key_added="cluster", directed=False, n_iterations=2)
@@ -127,8 +133,89 @@ class LeidenClusteringCapability(_LibraryCapability):
             adata.obs["cell_type"] = [f"Cluster_{c}" for c in adata.obs["cluster"]]
         metrics = {"n_cells": adata.n_obs, "n_clusters": int(adata.obs["cluster"].nunique()),
                    "annotation_source": "user_marker_reference" if markers else "existing_obs_or_unannotated_clusters"}
+        role_columns = [name for name in ("donor", "donor_id", "batch", "batch_id") if name in adata.obs]
+        role_values = {name: [None if pd.isna(value) else str(value) for value in adata.obs[name]]
+                       for name in role_columns}
+        counts_source = "layers.counts" if "counts" in adata.layers else "X_input_representation"
+        counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
+        metrics["execution_receipt"] = {
+            "schema_version": 1, "schema_name": "leiden_execution_receipt_v1",
+            "method": self.implementation_id,
+            "source_artifact_uri": contract.input_artifacts[0], "source_sha256": source_meta.sha256_hash,
+            "cell_order_sha256": stable_fingerprint(adata.obs_names.astype(str).tolist()),
+            "feature_order_sha256": stable_fingerprint(adata.var_names.astype(str).tolist()),
+            "counts_source": counts_source, "counts_sha256": _leiden_matrix_sha256(counts),
+            "representation": {
+                "key": "X_pca", "source": "input.obsm.X_pca" if reused else "computed_from_input.X",
+                "reused": reused, "source_integration_method": source_integration,
+                "requested_n_components": int(params.get("n_components", 20)),
+                "actual_n_components": int(adata.obsm["X_pca"].shape[1]),
+                "shape": list(adata.obsm["X_pca"].shape), "sha256": _leiden_matrix_sha256(adata.obsm["X_pca"]),
+                "algorithm": inherited.get("algorithm", "inherited_not_documented") if reused else "scanpy_centered_pca_arpack",
+                "feature_selection": inherited.get("feature_selection", "inherited_not_documented") if reused else "all_features",
+                "feature_mask_sha256": inherited.get("feature_mask_sha256", "") if reused else stable_fingerprint([True] * adata.n_vars),
+                "inherited_representation_receipt": inherited,
+            },
+            "neighbors": {
+                "requested_n_neighbors": int(params.get("n_neighbors", 15)),
+                "actual_n_neighbors": int(adata.uns["neighbors"]["params"]["n_neighbors"]),
+                "use_rep": "X_pca", "actual_n_components": int(adata.obsm["X_pca"].shape[1]),
+                "all_representation_components_used": True, "metric": "euclidean", "method": "umap", "random_state": seed,
+                "connectivities_sha256": _leiden_matrix_sha256(adata.obsp["connectivities"]),
+                "distances_sha256": _leiden_matrix_sha256(adata.obsp["distances"]),
+            },
+            "leiden": {
+                "resolution": float(params.get("resolution", 1)), "random_state": seed,
+                "flavor": "leidenalg", "partition_type": "RBConfigurationVertexPartition",
+                "directed": False, "use_weights": True, "n_iterations": 2,
+                "n_clusters": metrics["n_clusters"],
+                "partition_sha256": _leiden_partition_sha256(adata.obs_names, adata.obs["cluster"]),
+            },
+            "input_roles": {"columns": role_columns, "metadata_sha256": stable_fingerprint(role_values),
+                            "donor_independence_established": False},
+            "annotation_source": metrics["annotation_source"], "clustering_reference_labels_used": False,
+            "independent_biological_validation": False, "validation_scope": "execution_reconstruction_only",
+            "umap_reconstruction_in_scope": False,
+        }
         adata.uns["clustering"] = {"method": self.implementation_id, **metrics}
         return self._save(contract, registry, SCData.from_anndata(adata), "annotated/v4", metrics, ["scanpy", "leidenalg", "igraph", "umap-learn", "anndata"])
+
+
+def _leiden_matrix_sha256(matrix):
+    """Hash typed values and shape; sparse index widths are storage details."""
+    digest = hashlib.sha256()
+    if sparse.issparse(matrix):
+        canonical = sparse.csr_matrix(matrix, copy=True)
+        canonical.sum_duplicates()
+        canonical.sort_indices()
+        canonical.eliminate_zeros()
+        digest.update(stable_fingerprint({"shape": canonical.shape, "dtype": canonical.dtype.str,
+                                          "format": "csr"}).encode())
+        for array in (canonical.indptr.astype(np.int64), canonical.indices.astype(np.int64), canonical.data):
+            digest.update(np.ascontiguousarray(array).tobytes())
+    else:
+        canonical = np.ascontiguousarray(matrix)
+        digest.update(stable_fingerprint({"shape": canonical.shape, "dtype": canonical.dtype.str}).encode())
+        digest.update(canonical.tobytes())
+    return "sha256:" + digest.hexdigest()
+
+
+def _leiden_receipt_values(value):
+    # H5AD represents sequences as arrays. Keep a one-element sequence as a
+    # sequence rather than converting it to its scalar with ndarray.item().
+    if isinstance(value, np.ndarray):
+        return _leiden_receipt_values(value.tolist())
+    if isinstance(value, dict):
+        return {key: _leiden_receipt_values(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_leiden_receipt_values(item) for item in value]
+    return model_to_jsonable(value)
+
+
+def _leiden_partition_sha256(cell_ids, labels):
+    """Bind cell membership, allowing an arbitrary cluster-label permutation."""
+    codes, _ = pd.factorize(np.asarray(labels).astype(str), sort=False)
+    return stable_fingerprint({"cell_ids": list(map(str, cell_ids)), "partition": codes.tolist()})
 
 
 class DPTTrajectoryCapability(_LibraryCapability):

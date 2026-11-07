@@ -8,6 +8,21 @@ from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus, ExecutionFa
 from eacbp.artifact.registry import ArtifactRegistry
 
 
+def label_assignments_preserved(in_obs, out_obs, column: str) -> bool:
+    """Compare retained labels by cell identity, ignoring storage-only dtypes."""
+    if column not in out_obs.columns:
+        return False
+    if not in_obs.index.is_unique or not out_obs.index.is_unique:
+        return False
+    if not out_obs.index.isin(in_obs.index).all():
+        return False
+    original = in_obs[column].reindex(out_obs.index)
+    current = out_obs[column]
+    # H5AD may turn string objects into categories or remove unused categories.
+    # Do not stringify values: that would hide changes such as missing -> "nan".
+    return original.isna().equals(current.isna()) and original.astype(object).equals(current.astype(object))
+
+
 class SideEffectValidator:
     """Validates that a TaskResult strictly adheres to allowed/forbidden operations and bounds."""
 
@@ -50,10 +65,16 @@ class SideEffectValidator:
                         return False, f"POLICY VIOLATION: Cell count changed from {in_n_cells} to {out_n_cells} despite 'filter_cells' being forbidden."
 
                 # Check cluster label tampering if recluster is forbidden
-                if "recluster" in contract.forbidden_operations and hasattr(in_data, "obs") and hasattr(out_data, "obs"):
-                    for column in ("cluster", "leiden", "louvain", "cell_type"):
-                        if column in in_data.obs.columns:
-                            if column not in out_data.obs.columns or not in_data.obs[column].equals(out_data.obs[column]):
+                if "recluster" in contract.forbidden_operations or "mutate_clusters" in contract.forbidden_operations:
+                    in_obs = getattr(in_data, "obs", None)
+                    out_obs = getattr(out_data, "obs", None)
+                    if in_obs is None and isinstance(in_data, dict):
+                        in_obs = in_data.get("obs")
+                    if out_obs is None and isinstance(out_data, dict):
+                        out_obs = out_data.get("obs")
+                    if in_obs is not None and out_obs is not None:
+                        for column in ("cluster", "leiden", "louvain", "cell_type", "cell_type_annotation"):
+                            if column in in_obs.columns and not label_assignments_preserved(in_obs, out_obs, column):
                                 return False, f"POLICY VIOLATION: Cluster assignments '{column}' were modified despite 'recluster' being forbidden."
 
         return True, None

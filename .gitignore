@@ -21,8 +21,9 @@ share/python-wheels/
 
 # Testing & Coverage
 .pytest_cache/
-.pytest_temp/
-.pytest_temp_*/
+.pytest_temp*/
+.pytest-tmp*/
+.pytest-basetemp*/
 .p3_*_validation*/
 p3_*_validation.xml
 tmp_luna_*/
@@ -55,15 +56,20 @@ venv.bak/
 Thumbs.db
 tmp/
 temp_*/
-!temp_debug_fastq/
 temp_tx_*/
+/debug.log
 
 # Multi-agent and Local Experiment Artifacts
 .artifacts/
 .agents/
 .cache/
-.pytest-basetemp-p1-*/
 .p1-wheel-install-smoke/
+.eacbp/
+
+# Regenerable diagram browser-check assets (keep JSON receipts)
+docs/archify/*.visual-check.*.png
+docs/archify/*.visual-check.html
+docs/archify/*.browser-command.json
 
 # Data & outputs (if large or generated)
 data/raw/*

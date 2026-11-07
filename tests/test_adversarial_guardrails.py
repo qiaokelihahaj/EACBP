@@ -798,12 +798,22 @@ def test_adversarial_canonical_adapters_under_strict_forbidden_bounds(test_setup
     
     register_all_adapters(cap_reg)
     
+    # Spatial guardrails require a supplied coordinate canvas. This fixture is
+    # explicitly simulated; the adapter must never manufacture missing input.
+    spatial_data = test_setup["sc_data"].copy()
+    positions = np.arange(spatial_data.n_obs)
+    spatial_data.obsm["spatial"] = np.column_stack((positions % 10, positions // 10)).astype(float)
+    spatial_data.obs["section"] = "simulated_section"
+    spatial_uri = "adata://AD_study/spatial_guardrail_fixture/v1"
+    reg.register(spatial_uri, spatial_data, ArtifactType.ANNDATA, "AD_study", "spatial_fixture",
+                 "simulated_coordinate_fixture", parent_uris=[in_uri], summary_metrics={"is_simulated": True})
+
     # 1. SpaCell under strict bounds
     contract_spa = TaskContract(
         task_id="adv_strict_spacell",
         capability="spacell_microenvironment_analysis",
         method="spacell_agent_v1",
-        input_artifacts=[in_uri],
+        input_artifacts=[spatial_uri],
         allowed_operations=[
             "compute_spatial_neighbors",
             "spatial_domain_clustering",

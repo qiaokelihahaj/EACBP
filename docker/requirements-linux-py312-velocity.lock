@@ -1,0 +1,15 @@
+# Supplemental velocity environment; all other dependencies are in the
+# scientific lock. Install after the build lock with --no-build-isolation.
+# The base lock uses NumPy 2.5; this explicit override is required by scVelo
+# 0.3.4's scalar-assignment solver API. The wheel is Linux x86_64 / CPython 3.12.
+numpy==2.3.5 \
+    --hash=sha256:0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28 \
+    --hash=sha256:784db1dcdab56bf0517743e746dfb0f885fc68d948aba86eeec2cba234bdf1c0
+loompy==3.0.8 \
+    --hash=sha256:c1f48d0bf21aa2bbdeee21a0577553cba9609d9435d7c32b687686bbb5869ca7
+numpy-groupies==0.12.3 \
+    --hash=sha256:4c2f39f5d7e1150b06ac82080c3c1b619376adb2cb647d87ce0ba2b4fc3d6361 \
+    --hash=sha256:4de73050f826e71999ac43bce576fd63ea5ae1c0ae1b9aa6d8b322dfdb5de985
+scvelo==0.3.4 \
+    --hash=sha256:e54102b7a34241b8952728af49350c2710bd3873e37686a746f1d1e3e6314b1a \
+    --hash=sha256:9480c111105a33638152ea34d61e9e92aa1abc251bc31158601a8678ee4886b9

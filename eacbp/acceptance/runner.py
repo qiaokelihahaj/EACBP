@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse, stats
 
-from eacbp.acceptance.manifest import AcceptanceManifest
+from eacbp.acceptance.manifest import AcceptanceManifest, _filled
 
 
 _RESEARCH_PACKAGES = ("pydeseq2", "numpy", "pandas", "scipy", "formulaic", "anndata")

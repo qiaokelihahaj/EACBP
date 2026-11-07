@@ -69,7 +69,7 @@ def _coerce_scdata(payload: Any) -> SCData:
     if hasattr(payload, "X") and hasattr(payload, "obs") and hasattr(payload, "var"):
         return SCData.from_anndata(payload)
     if isinstance(payload, Mapping):
-        return SCData.from_dict(dict(payload))
+        return SCData.from_payload(payload)
     raise TypeError(
         "Advanced QC capabilities require an AnnData/SCData artifact; "
         f"received {type(payload).__name__}"
@@ -80,8 +80,7 @@ def _load_scdata(contract: TaskContract, registry: ArtifactRegistry) -> Tuple[st
     if not contract.input_artifacts:
         raise ValueError("Advanced QC capabilities require one input AnnData artifact")
     in_uri = ArtifactURI.parse(contract.input_artifacts[0]).to_string()
-    _, payload = registry.get(in_uri)
-    return in_uri, _coerce_scdata(payload)
+    return in_uri, registry.load_scdata(in_uri)
 
 
 def _study_id(in_uri: str) -> str:

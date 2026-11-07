@@ -26,6 +26,7 @@ from scipy import stats
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
 from eacbp.capabilities.base import BaseCapability, ImplementationType
+from eacbp.capabilities.biological_units import complete_identity, resolve_donor_role
 from eacbp.capabilities.sc_data import SCData
 from eacbp.schemas.artifact import ArtifactType
 from eacbp.schemas.task import TaskContract, TaskResult, TaskStatus
@@ -138,18 +139,6 @@ def _package_version(name: str) -> str:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return "unavailable"
-
-
-def _as_scdata(payload: Any) -> SCData:
-    if isinstance(payload, SCData):
-        return payload.copy()
-    if isinstance(payload, Mapping) and "X" in payload and "obs" in payload:
-        return SCData.from_dict(dict(payload))
-    if hasattr(payload, "X") and hasattr(payload, "obs") and hasattr(payload, "var"):
-        return SCData.from_anndata(payload)
-    raise LianaCommunicationInputError(
-        "LIANA communication requires an AnnData-like or SCData artifact"
-    )
 
 
 def _as_dense(value: Any) -> np.ndarray:
@@ -722,12 +711,12 @@ class LianaCommunicationCapability(BaseCapability):
                 "liana_communication requires exactly one input AnnData artifact"
             )
         in_uri = ArtifactURI.parse(contract.input_artifacts[0]).to_string()
-        meta, payload = registry.get(in_uri)
-        if meta.type not in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA):
+        try:
+            meta, data = registry.get_scdata(in_uri)
+        except TypeError as exc:
             raise LianaCommunicationInputError(
-                f"liana_communication requires AnnData/SpatialData input, received {meta.type}"
-            )
-        data = _as_scdata(payload)
+                f"liana_communication requires AnnData/SpatialData input: {exc}"
+            ) from exc
         if data.n_obs == 0 or data.n_vars == 0:
             raise LianaCommunicationInputError("communication input must contain cells and genes")
         params = contract.parameters
@@ -746,9 +735,18 @@ class LianaCommunicationCapability(BaseCapability):
             raise LianaCommunicationInputError(
                 "liana_communication always requires return_all_lrs=True; significance filtering is not allowed"
             )
-        li = _load_liana()
-
-        donor_col = _resolve_column(data.obs, params.get("donor_col"), ("donor_id", "donor", "mouse_id", "sample_id", "sample"), "donor")
+        try:
+            donor_role = resolve_donor_role(data.obs, params)
+        except ValueError as exc:
+            raise LianaCommunicationInputError(str(exc)) from exc
+        donor_col = donor_role.column
+        if donor_col is None:
+            raise LianaCommunicationInputError(
+                "Donor-level communication inference is not estimable: biological donor "
+                "metadata are required; sample/library identifiers cannot substitute"
+            )
+        if not complete_identity(data.obs[donor_col]):
+            raise LianaCommunicationInputError("Biological donor identities must be complete and non-empty")
         condition_col = _resolve_column(data.obs, params.get("condition_col"), ("condition", "experimental_condition", "group"), "condition")
         cell_type_col = str(params.get("cell_type_col", "cell_type"))
         if cell_type_col not in data.obs.columns:
@@ -764,6 +762,7 @@ class LianaCommunicationCapability(BaseCapability):
                 "cell type metadata must be complete and contain non-empty labels"
             )
         design = self._condition_design(data, donor_col, condition_col, params)
+        li = _load_liana()
         min_cells = int(params.get("min_cells", 5))
         if min_cells < 1:
             raise LianaCommunicationInputError("min_cells must be positive")
@@ -932,7 +931,11 @@ class LianaCommunicationCapability(BaseCapability):
         full_table["rank_method"] = rank_params["aggregate_method"]
         full_table["rank_is_fdr"] = False
         full_table["spatial_used"] = bool(use_spatial)
+        for key, value in donor_role.as_metrics().items():
+            full_table[key] = value
         comparison, comparison_metrics = self._comparison_table(full_table, design)
+        for key, value in donor_role.as_metrics().items():
+            comparison[key] = value
 
         study_id = ArtifactURI.parse(in_uri).study_id
         primary_uri = _output_uri(contract, 0, study_id)
@@ -949,7 +952,7 @@ class LianaCommunicationCapability(BaseCapability):
         }
         effective_parameters = {
             "species": species,
-            "donor_col": donor_col,
+            **donor_role.as_metrics(),
             "condition_col": condition_col,
             "cell_type_col": cell_type_col,
             "min_cells": min_cells,
@@ -970,6 +973,7 @@ class LianaCommunicationCapability(BaseCapability):
         if resource_species is not None:
             effective_parameters["lr_resource_species"] = resource_species
         summary_metrics: Dict[str, Any] = {
+            **donor_role.as_metrics(),
             "n_rank_rows": int(len(full_table)),
             "n_unique_interactions": int(full_table[["source", "target", "ligand", "receptor"]].drop_duplicates().shape[0]),
             "donor_condition_groups": list(group_cell_counts),

@@ -191,6 +191,33 @@ def test_two_old_tabs_cannot_apply_conflicting_roots(http_server, tmp_path):
     assert saved["runs_dir"] == str(server.service.manager.runs_dir)
 
 
+def test_stale_post_body_is_consumed_before_closing_connection(http_server, monkeypatch):
+    from eacbp.webui.server import Handler
+
+    # Inspect the live request stream when the rejection response is sent.
+    # This catches the unread-body race even on hosts that do not send a reset.
+    sent = threading.Event()
+    unread = []
+    original = Handler.send_content
+
+    def inspect_response(handler, *args, **kwargs):
+        if kwargs.get("status") == 403:
+            handler.connection.settimeout(0.05)
+            try:
+                unread.append(handler.rfile.read(1))
+            except TimeoutError:
+                unread.append(b"")
+        result = original(handler, *args, **kwargs)
+        sent.set()
+        return result
+
+    monkeypatch.setattr(Handler, "send_content", inspect_response)
+    status, body = request(http_server, "/api/settings", token="stale-token", payload={"padding": "x" * 4096})
+    assert sent.wait(timeout=2)
+    assert status == 403 and "error" in json.loads(body)
+    assert unread == [b""]
+
+
 def test_job_submission_and_directory_save_are_serialized(http_server, tmp_path, monkeypatch):
     server = http_server
     started, release = threading.Event(), threading.Event()
@@ -229,9 +256,11 @@ def test_new_worker_uses_selected_data_and_output_roots(service, tmp_path):
     data.write_h5ad(source)
     before = source.read_bytes()
     service.update_directories(paths)
-    response = service.start({"data": "SYNTHETIC_ONLY.h5ad", "study_id": "directory_test",
-                              "species": "human", "tissue": "synthetic_test",
-                              "method_profile": "baseline", "min_genes": 1})
+    payload = {"data": "SYNTHETIC_ONLY.h5ad", "study_id": "directory_test",
+               "species": "human", "tissue": "synthetic_test",
+               "method_profile": "baseline", "min_genes": 1}
+    preview = service.preview(payload)
+    response = service.start({**payload, "preview_token": preview["preview_token"]})
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         job = next(j for j in service.manager.jobs() if j["id"] == response["job"]["id"])

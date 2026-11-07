@@ -45,6 +45,21 @@ def test_run_config_rejects_coerced_control_values():
         RunConfig.from_mapping({"method_profile": "baseline", "include_knowledge": "false"})
 
 
+@pytest.mark.parametrize("key", ["method_overides", "capabilty_parameters", "arbitrary_plugin_option"])
+def test_run_config_rejects_unknown_top_level_options(key):
+    with pytest.raises(ValueError, match=key):
+        RunConfig.from_mapping({key: {"deg": "not_registered"}})
+
+
+def test_request_options_are_protected_from_task_metrics():
+    state = ExecutionState.from_input({"research_purpose": "overview", "analysis_request": {"id": "frozen"}})
+    state.record_metrics({"research_purpose": "deg", "analysis_request": {"id": "changed"},
+                          "autonomous_analysis": {"question": "unrequested"}})
+    assert state.current_state["research_purpose"] == "overview"
+    assert state.current_state["analysis_request"] == {"id": "frozen"}
+    assert "autonomous_analysis" not in state.current_state
+
+
 @pytest.mark.parametrize("value", ["false", "true", 0, 1])
 def test_legacy_resume_rejects_non_boolean_controls(value):
     with pytest.raises(ValueError):

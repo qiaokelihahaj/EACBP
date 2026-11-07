@@ -129,6 +129,90 @@ def test_snapshot_roundtrip_rebuilds_graph_and_report_without_execution(tmp_path
     assert "Observed quality metrics" in first
 
 
+@pytest.mark.parametrize("numeric_value,covariates,invalid_field", [
+    (0.2, [], None),
+    (float("nan"), [], "lfc_se"),
+    (float("inf"), [], "lfc_se"),
+    (0.2, ["age"], "covariates"),
+])
+@pytest.mark.parametrize("storage_kind", ["legacy_csv", "table_v1"])
+def test_audited_csv_empty_descriptors_do_not_hide_invalid_statistics(tmp_path, monkeypatch, numeric_value, covariates, invalid_field, storage_kind):
+    import pandas as pd
+    from eacbp.artifact.storage import PayloadSerializer, _sha256_file
+    from eacbp.evidence.extraction import EvidenceRowBindingError, extract_evidence
+
+    if storage_kind == "legacy_csv":
+        # Construct historical-format bytes explicitly. Production only writes
+        # Table v1 now, while this regression still exercises the old decoder.
+        original_format = PayloadSerializer.preferred_format
+        original_serialize = PayloadSerializer.serialize
+        def legacy_format(cls, payload, artifact_type):
+            return "native" if artifact_type == ArtifactType.TABLE else original_format(payload, artifact_type)
+        def legacy_serialize(cls, payload, artifact_type, target_path, storage_format=None):
+            if artifact_type == ArtifactType.TABLE:
+                payload.to_csv(target_path, index=True)
+                return _sha256_file(target_path)
+            return original_serialize(payload, artifact_type, target_path, storage_format)
+        monkeypatch.setattr(PayloadSerializer, "preferred_format", classmethod(legacy_format))
+        monkeypatch.setattr(PayloadSerializer, "serialize", classmethod(legacy_serialize))
+
+    registry = ArtifactRegistry(str(tmp_path / "artifacts"))
+    input_uri, output_uri = "json://snap/raw/v1", "table://snap/deg/v1"
+    registry.register(input_uri, {"raw": True}, ArtifactType.JSON, "snap", "ingest", "ingest")
+    transaction = TaskArtifactTransaction(registry)
+    transaction.register(output_uri, pd.DataFrame([{
+        "gene": "fixture_gene", "log2_fold_change": 1.0, "fdr_q_value": 0.001,
+        "lfc_se": numeric_value, "covariates": "", "status": "estimated", "status_reason": "",
+    }]), ArtifactType.TABLE, "snap", "deg", "fixture", parent_uris=[input_uri],
+        parameters={"condition_a": "stim", "condition_b": "ctrl"})
+    contract = TaskContract(task_id="deg", capability="deg", method="fixture",
+                            input_artifacts=[input_uri], expected_outputs=[output_uri])
+    result = TaskResult(task_id="deg", capability="deg", method_used="fixture", status=TaskStatus.SUCCESS,
+                        input_artifacts=[input_uri], output_artifacts=[output_uri],
+                        metrics={"is_pseudobulk": True, "covariates": covariates})
+    registry.commit_task(transaction, "descriptor_fixture", result)
+    transaction.close()
+    report = ValidationReport(auditor_name="fixture", target_task_id="deg", overall_passed=True)
+    registry.record_audit("descriptor_fixture", contract, result, report, auditor_name="fixture")
+    decoded = registry.load_payload(output_uri)
+    if storage_kind == "legacy_csv":
+        assert pd.isna(decoded.loc[0, "covariates"])
+        assert pd.isna(decoded.loc[0, "status_reason"])
+    else:
+        assert decoded.loc[0, "covariates"] == "" and decoded.loc[0, "status_reason"] == ""
+    if invalid_field:
+        # New row-bound evidence rejects these already at construction; old
+        # selector-free snapshots must still reject the same non-finite data.
+        reason = "empty.*covariates" if storage_kind == "table_v1" and invalid_field == "covariates" else "non-finite.*" + invalid_field
+        with pytest.raises(EvidenceRowBindingError, match=reason):
+            extract_evidence(contract, result, report, registry)
+        nodes = [EvidenceNode(evidence_id="invalid_row", type=EvidenceType.PSEUDOBULK_DEG,
+                             source_task_id="deg", source_artifact_uris=[output_uri], audit_passed=True,
+                             summary="Invalid legacy row", metrics={invalid_field: float("nan")})]
+    else:
+        nodes = extract_evidence(contract, result, report, registry)
+    assert len(nodes) == 1
+    if not invalid_field:
+        assert nodes[0].metrics["status_reason"] == ""
+        assert nodes[0].metrics["covariates"] == []
+    graph = EvidenceGraph()
+    graph.add_evidence(nodes[0])
+    manifest = StudyManifest(study_id="snap", biological_design=BiologicalDesign(species="human", tissue="test"),
+                             data={"raw_artifact_uri": input_uri})
+    target = tmp_path / "snapshot.json"
+    arguments = dict(manifest=manifest, config={}, summary={"status": "success"}, evidence_graph=graph,
+                     artifact_registry=registry, task_history=[result], audit_reports=[report])
+    if invalid_field:
+        with pytest.raises(SnapshotValidationError, match="non-finite.*" + invalid_field):
+            write_study_snapshot(target, **arguments)
+    else:
+        write_study_snapshot(target, **arguments)
+        restored = load_study_snapshot(target)
+        evidence = next(iter(restored.evidence_graph.evidence_nodes.values()))
+        assert evidence.metrics["covariates"] == [] and evidence.metrics["status_reason"] == ""
+        assert evidence.metrics["lfc_se"] == 0.2
+
+
 @pytest.mark.parametrize("target_node", ["evidence", "claim"])
 def test_snapshot_rejects_inference_identity_not_owned_by_source(tmp_path, target_node):
     registry, manifest, result, report, graph = _fixture(tmp_path)

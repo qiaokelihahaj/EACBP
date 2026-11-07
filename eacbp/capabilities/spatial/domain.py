@@ -6,7 +6,7 @@ inputs still receive dense arrays, while large inputs receive CSR matrices;
 consumers must therefore use sparse-safe ``dot``/row-sum operations.
 """
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,7 @@ from eacbp.schemas.artifact import ArtifactType
 from eacbp.capabilities.base import BaseCapability, ImplementationType
 from eacbp.capabilities.clustering import simple_kmeans, calculate_silhouette as _calculate_silhouette
 from eacbp.capabilities.sc_data import SCData
+from eacbp.capabilities.biological_units import resolve_donor_role
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
 
@@ -56,6 +57,132 @@ def validate_spatial_coordinates(spatial_coords: np.ndarray, expected_n_obs: int
     return coords
 
 
+def extract_spatial_coordinates(data: SCData) -> np.ndarray:
+    """Require measured coordinates; cell order cannot supply a spatial layout."""
+    for key in ("spatial", "spatial_coords"):
+        if key in data.obsm:
+            return validate_spatial_coordinates(data.obsm[key], data.n_obs)
+    for x_col, y_col, z_col in (("x_coord", "y_coord", "z_coord"),
+                              ("spatial_x", "spatial_y", "spatial_z"),
+                              ("x", "y", "z"), ("X", "Y", "Z")):
+        if x_col in data.obs and y_col in data.obs:
+            columns = [x_col, y_col] + ([z_col] if z_col in data.obs else [])
+            return validate_spatial_coordinates(data.obs[columns].to_numpy(), data.n_obs)
+    raise ValueError("Measured spatial coordinates not found; a spatial conclusion requires observed coordinates.")
+
+
+def _spatial_partition_labels(values: Any, n_obs: int) -> np.ndarray:
+    if values is None:
+        return np.zeros(n_obs, dtype=int)
+    series = pd.Series(values)
+    if len(series) != n_obs:
+        raise ValueError("Spatial section labels must align with observations.")
+    labels = series.astype("string").str.strip()
+    if (labels.isna().any() or labels.eq("").any()
+            or labels.str.casefold().isin({"nan", "none", "null", "<na>"}).any()):
+        raise ValueError("Spatial section labels must be complete and nonempty.")
+    return pd.factorize(labels, sort=False)[0]
+
+
+def resolve_spatial_sections(data: SCData, parameters: Optional[Mapping[str, Any]] = None) -> Tuple[np.ndarray, dict]:
+    """Resolve observed section identity, keeping donor-local section IDs separate.
+
+    Donors are biological units, not inferred section identities. Multi-donor
+    inputs without section metadata therefore cannot define spatial adjacency.
+    """
+    params = parameters or {}
+    observed_roles = data.uns.get("autonomous_input_preparation", {}).get("obs_column_map", {})
+    role_map = params.get("obs_column_map", observed_roles)
+    if not isinstance(role_map, Mapping):
+        raise ValueError("Spatial observation role map must be a mapping.")
+    aliases = {
+        "section": ("section", "section_id", "slide_id", "slide", "slice_id", "slice"),
+    }
+    columns = {}
+    codes = {}
+    donor_params = dict(params)
+    if not donor_params.get("donor_col") and role_map.get("donor"):
+        donor_params["donor_col"] = role_map["donor"]
+    donor_role = resolve_donor_role(data.obs, donor_params)
+    columns["donor"] = donor_role.column
+    if donor_role.column:
+        codes["donor"] = _spatial_partition_labels(data.obs[donor_role.column], data.n_obs)
+    for role, names in aliases.items():
+        explicit = params.get(f"{role}_col") or role_map.get(role)
+        candidates = [explicit] if explicit else [name for name in names if name in data.obs]
+        if explicit and explicit not in data.obs:
+            raise ValueError(f"Declared spatial {role} column {explicit!r} was not observed.")
+        if not candidates:
+            columns[role] = None
+            continue
+        selected = candidates[0]
+        selected_labels = data.obs[selected].astype("string").str.strip()
+        codes[role] = _spatial_partition_labels(data.obs[selected], data.n_obs)
+        for alternate in candidates[1:]:
+            if not selected_labels.equals(data.obs[alternate].astype("string").str.strip()):
+                raise ValueError(f"Ambiguous spatial {role} columns {selected!r} and {alternate!r} disagree.")
+        columns[role] = selected
+    if not columns["section"] and "donor" in codes and len(np.unique(codes["donor"])) > 1:
+        raise ValueError("Multiple donors require observed section identities; a donor cannot be assumed to be one section.")
+    identities = [tuple(codes[role][i] for role in ("donor", "section") if role in codes)
+                  for i in range(data.n_obs)]
+    sections = pd.factorize(pd.Series(identities, dtype=object), sort=False)[0] if codes else np.zeros(data.n_obs, dtype=int)
+    return sections, {"section_col": columns["section"], **donor_role.as_metrics(),
+                      "n_spatial_partitions": int(len(np.unique(sections))),
+                      "identity_basis": "observed_donor_and_section" if columns["section"] else "single_coordinate_system"}
+
+
+def validate_spatial_graph(W: Any, n_obs: int, section_labels: Any = None) -> None:
+    """Reject invalid supplied contacts, including edges between sections."""
+    if getattr(W, "shape", None) != (n_obs, n_obs):
+        raise ValueError("Spatial connectivity graph must be observation-aligned and square.")
+    sections = _spatial_partition_labels(section_labels, n_obs)
+    if sparse.issparse(W):
+        edges = W.tocoo()
+        values = edges.data
+        rows, cols = edges.row, edges.col
+    else:
+        matrix = np.asarray(W)
+        values = matrix.ravel()
+        rows, cols = np.nonzero(matrix)
+    if not np.isfinite(values).all() or np.any(values < 0):
+        raise ValueError("Spatial connectivity weights must be finite and nonnegative.")
+    if sparse.issparse(W):
+        nonzero = values != 0
+        rows, cols = rows[nonzero], cols[nonzero]
+    if np.any(rows == cols):
+        raise ValueError("Spatial connectivity graph must not include self contacts.")
+    if np.any(sections[rows] != sections[cols]):
+        raise ValueError("Spatial connectivity graph contains edges across observed sections.")
+
+
+def build_spatial_knn_indices(coords: np.ndarray, k_neighbors: int = 6,
+                              metric: str = "euclidean", section_labels: Any = None) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Query neighbors inside each measured coordinate system, including small sections."""
+    coords = np.asarray(coords, dtype=np.float32)
+    if coords.ndim != 2 or not np.isfinite(coords).all():
+        raise ValueError("coords must be a finite 2D array")
+    n_obs = len(coords)
+    sections = _spatial_partition_labels(section_labels, n_obs)
+    neighbors = [np.array([], dtype=int) for _ in range(n_obs)]
+    distances = [np.array([], dtype=np.float32) for _ in range(n_obs)]
+    for section in np.unique(sections):
+        positions = np.flatnonzero(sections == section)
+        if len(positions) < 2:
+            continue
+        k = min(max(1, int(k_neighbors)), len(positions) - 1)
+        tree = cKDTree(coords[positions])
+        try:
+            edge_distances, indices = tree.query(coords[positions], k=k + 1, p=_tree_p(metric), workers=1)
+        except TypeError:  # older SciPy lacks workers
+            edge_distances, indices = tree.query(coords[positions], k=k + 1, p=_tree_p(metric))
+        for local, position in enumerate(positions):
+            keep = np.asarray(indices[local]) != local
+            neighbors[position] = positions[np.asarray(indices[local])[keep][:k]]
+            distances[position] = np.asarray(edge_distances[local])[keep][:k].astype(np.float32)
+    return neighbors, distances
+
+
 def _tree_p(metric: str):
     if metric in {"euclidean", "l2"}:
         return 2
@@ -70,6 +197,7 @@ def build_spatial_neighborhood_graph(
     coords: np.ndarray,
     k_neighbors: int = 6,
     metric: str = "euclidean",
+    section_labels: Any = None,
 ) -> Tuple[Any, Any, Any]:
     """Build a symmetric binary kNN graph without an all-pairs distance matrix.
 
@@ -84,23 +212,10 @@ def build_spatial_neighborhood_graph(
     if n_obs == 0:
         empty = np.zeros((0, 0), dtype=np.float32)
         return empty, empty.copy(), empty.copy()
-    k = min(max(1, int(k_neighbors)), max(1, n_obs - 1))
-    tree = cKDTree(coords)
-    try:
-        distances, indices = tree.query(coords, k=k + 1, p=_tree_p(metric), workers=1)
-    except TypeError:  # older SciPy lacks workers
-        distances, indices = tree.query(coords, k=k + 1, p=_tree_p(metric))
-    distances = np.asarray(distances)
-    indices = np.asarray(indices)
-    if k == 1:
-        distances = distances.reshape(n_obs, -1)
-        indices = indices.reshape(n_obs, -1)
-
-    rows = np.repeat(np.arange(n_obs), k)
-    nbrs = indices[:, 1 : k + 1].reshape(-1)
-    edge_dist = distances[:, 1 : k + 1].reshape(-1).astype(np.float32)
-    valid = (nbrs >= 0) & (nbrs < n_obs) & (nbrs != rows)
-    rows, nbrs, edge_dist = rows[valid], nbrs[valid], edge_dist[valid]
+    neighbors, distances = build_spatial_knn_indices(coords, k_neighbors, metric, section_labels)
+    rows = np.repeat(np.arange(n_obs), [len(indices) for indices in neighbors])
+    nbrs = np.concatenate(neighbors)
+    edge_dist = np.concatenate(distances)
 
     directed = sparse.coo_matrix((np.ones(len(rows), dtype=np.float32), (rows, nbrs)), shape=(n_obs, n_obs)).tocsr()
     directed_dist = sparse.coo_matrix((edge_dist, (rows, nbrs)), shape=(n_obs, n_obs)).tocsr()
@@ -151,21 +266,8 @@ class SpatialDomainCapability(BaseCapability):
 
     def execute(self, contract: TaskContract, registry: ArtifactRegistry) -> TaskResult:
         in_uri = contract.input_artifacts[0]
-        _, payload = registry.get(in_uri)
-        data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
-        coords = None
-        if "spatial" in data.obsm:
-            coords = data.obsm["spatial"]
-        elif "spatial_coords" in data.obsm:
-            coords = data.obsm["spatial_coords"]
-        elif "x_coord" in data.obs.columns and "y_coord" in data.obs.columns:
-            cols = ["x_coord", "y_coord"] + (["z_coord"] if "z_coord" in data.obs.columns else [])
-            coords = data.obs[cols].values
-        elif "x" in data.obs.columns and "y" in data.obs.columns:
-            coords = data.obs[["x", "y"]].values
-        if coords is None:
-            raise ValueError("Spatial coordinates not found. Expected in .obsm['spatial'] or coordinate columns.")
-        validated_coords = validate_spatial_coordinates(coords, data.n_obs)
+        _, data = registry.get_scdata(in_uri)
+        validated_coords = extract_spatial_coordinates(data)
 
         params = contract.parameters
         k_neighbors = int(params.get("k_neighbors", 6))
@@ -173,7 +275,8 @@ class SpatialDomainCapability(BaseCapability):
         n_domains = min(max(1, requested_domains), max(1, data.n_obs))
         smoothing_lambda = float(params.get("smoothing_lambda", 0.3))
         random_seed = int(params.get("random_seed", 42))
-        W_sym, D_pairwise, W_norm = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors)
+        sections, section_receipt = resolve_spatial_sections(data, params)
+        W_sym, D_pairwise, W_norm = build_spatial_neighborhood_graph(validated_coords, k_neighbors=k_neighbors, section_labels=sections)
 
         if "X_pca" in data.obsm:
             Z_base = np.asarray(data.obsm["X_pca"], dtype=np.float32)
@@ -200,6 +303,7 @@ class SpatialDomainCapability(BaseCapability):
         spatial_data.uns["spatial_connectivities"] = W_sym
         spatial_data.uns["spatial_distances"] = D_pairwise
         spatial_data.uns["spatial_domain_silhouette"] = silhouette
+        spatial_data.uns["spatial_partition_receipt"] = section_receipt
         if not hasattr(spatial_data, "obsp") or getattr(spatial_data, "obsp", None) is None:
             spatial_data.obsp = {}
         spatial_data.obsp["spatial_connectivities"] = W_sym
@@ -216,7 +320,7 @@ class SpatialDomainCapability(BaseCapability):
             created_by_task=contract.task_id,
             operation="spatial_knn_smooth_and_kmeans_domains",
             parent_uris=[in_uri],
-            parameters={"k_neighbors": k_neighbors, "n_domains": n_domains, "smoothing_lambda": smoothing_lambda, "random_seed": random_seed, "graph_storage": "csr_for_large_inputs"},
+            parameters={"k_neighbors": k_neighbors, "n_domains": n_domains, "smoothing_lambda": smoothing_lambda, "random_seed": random_seed, "graph_storage": "csr_for_large_inputs", **section_receipt},
             summary_metrics={"n_cells": spatial_data.n_obs, "n_domains": len(domain_counts), "silhouette_score": silhouette, "domain_distribution": domain_counts},
         )
         all_ops = ["validate_spatial_coordinates", "build_spatial_knn", "build_spatial_connectivities", "spatially_smoothed_embedding", "cluster_spatial_domains", "calculate_silhouette"]
@@ -229,5 +333,5 @@ class SpatialDomainCapability(BaseCapability):
             input_artifacts=[in_uri],
             output_artifacts=[out_uri],
             executed_operations=executed_ops,
-            metrics={"n_domains": len(domain_counts), "silhouette_score": silhouette, "domain_counts": domain_counts, "graph_storage": "sparse" if sparse.issparse(W_sym) else "dense_compatibility"},
+            metrics={"n_domains": len(domain_counts), "silhouette_score": silhouette, "domain_counts": domain_counts, "graph_storage": "sparse" if sparse.issparse(W_sym) else "dense_compatibility", **section_receipt},
         )

@@ -40,5 +40,5 @@ def test_genetic_projection_does_not_mix_unrelated_embedding_basis(tmp_path):
         reg.register(uri, data, ArtifactType.ANNDATA, "p", "input", "input")
         task = TaskContract(task_id="g", capability="genetic_perturbation_simulation", input_artifacts=[uri], parameters={"target_gene": "Trem2"})
         result = GeneticPerturbationCapability().execute(task, reg)
-        outputs.append(reg.get(result.output_artifacts[0])[1].obsm["X_pca"])
+        outputs.append(reg.load_scdata(result.output_artifacts[0]).obsm["X_pca"])
     assert np.allclose(outputs[0], outputs[1])

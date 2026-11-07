@@ -96,7 +96,7 @@ def test_scrublet_marks_by_batch_preserves_counts_and_honors_expected_output(tmp
         "adata://advanced/doublets/v7",
         "table://advanced/doublet_scores/v1",
     ]
-    _, output = registry.get(result.output_artifacts[0])
+    output = registry.load_scdata(result.output_artifacts[0])
     assert output.n_obs == source.n_obs
     assert np.array_equal(output.layers["counts"], source.layers["counts"])
     assert output.obs["predicted_doublet"].sum() == 2
@@ -126,7 +126,7 @@ def test_scrublet_filter_requires_explicit_parameter_and_records_before_after(tm
         parameters={"filter_doublets": True, "n_prin_comps": 3},
     )
     result = ScrubletDoubletCapability().execute(task, registry)
-    _, output = registry.get(result.output_artifacts[0])
+    output = registry.load_scdata(result.output_artifacts[0])
     assert output.n_obs == 6
     assert result.metrics["n_cells_before"] == source.n_obs
     assert result.metrics["n_cells_after"] == 6
@@ -180,7 +180,7 @@ def test_scrublet_real_scanpy_small_counts_by_library_batch(tmp_path):
         },
     )
     result = ScrubletDoubletCapability().execute(task, registry)
-    _, output = registry.get(result.output_artifacts[0])
+    output = registry.load_scdata(result.output_artifacts[0])
     assert result.method_used == "scanpy_scrublet_v1"
     assert output.n_obs == data.n_obs
     assert {"doublet_score", "predicted_doublet"} <= set(output.obs.columns)
@@ -196,7 +196,7 @@ def test_scrublet_real_scanpy_small_counts_by_library_batch(tmp_path):
 
 def test_scrublet_rejects_fractional_counts_before_optional_runtime(tmp_path):
     registry, uri, _ = _register_input(tmp_path)
-    _, payload = registry.get(uri)
+    payload = registry.load_scdata(uri)
     payload.layers["counts"] = payload.layers["counts"].astype(float)
     payload.layers["counts"][0, 0] = 0.5
     # Re-register a separate URI because registry artifacts are immutable.
@@ -248,7 +248,7 @@ def test_celltypist_local_model_hash_and_existing_labels_are_preserved(tmp_path,
         },
     )
     result = CellTypistAnnotationCapability().execute(task, registry)
-    _, output = registry.get(result.output_artifacts[0])
+    output = registry.load_scdata(result.output_artifacts[0])
     assert output.obs["cell_type"].tolist() == source.obs["cell_type"].tolist()
     assert output.obs["cell_type_existing"].tolist() == source.obs["cell_type"].tolist()
     assert output.obs["cell_type_celltypist"].tolist() == ["ModelType", "Unknown", "ModelType"]
@@ -273,7 +273,7 @@ def test_celltypist_rejects_model_hash_mismatch(tmp_path):
 
 def test_celltypist_explicit_use_writes_cell_type_without_mutating_cluster(tmp_path, monkeypatch):
     registry, uri, _ = _register_input(tmp_path, n_cells=3, n_genes=4, existing_types=False)
-    _, payload = registry.get(uri)
+    payload = registry.load_scdata(uri)
     payload.obs["cluster"] = ["0", "1", "0"]
     registry.register("adata://advanced/clustered/v1", payload, ArtifactType.ANNDATA, "advanced", "cluster", "cluster")
     model_path = tmp_path / "local_model.pkl"
@@ -306,7 +306,7 @@ def test_celltypist_explicit_use_writes_cell_type_without_mutating_cluster(tmp_p
         },
     )
     result = CellTypistAnnotationCapability().execute(task, registry)
-    _, output = registry.get(result.output_artifacts[0])
+    output = registry.load_scdata(result.output_artifacts[0])
     assert output.obs["cluster"].tolist() == ["0", "1", "0"]
     assert output.obs["cell_type"].tolist() == ["A", "B", "A"]
 
@@ -415,7 +415,7 @@ def test_cellbender_cli_preserves_counts_and_stores_corrected_layer(tmp_path, mo
         },
     )
     result = CellBenderBackgroundRemovalCapability().execute(task, registry)
-    _, output = registry.get(result.output_artifacts[0])
+    output = registry.load_scdata(result.output_artifacts[0])
     assert result.status == TaskStatus.SUCCESS
     assert np.array_equal(output.layers["counts"], source.layers["counts"])
     expected = external_matrix[[3, 2, 4, 1]][:, [2, 3, 1]]

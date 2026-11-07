@@ -311,8 +311,8 @@ def test_spacell_adapter_valid_execution(tmp_path):
     assert reg.exists(table_uri)
     assert reg.exists(json_uri)
 
-    meta_adata, payload_adata = reg.get(adata_uri)
-    out_sc = SCData.from_dict(payload_adata)
+    meta_adata = reg.get_metadata(adata_uri)
+    out_sc = reg.load_scdata(adata_uri)
     assert out_sc.n_obs == n_cells  # cell count preserved!
     assert "spatial_domain" in out_sc.obs.columns
     assert "neighborhood_composition" in out_sc.obsm
@@ -470,6 +470,68 @@ def test_gene_agent_adapter_valid_execution(tmp_path):
 # ============================================================================
 # Side-Effect Guardrail Interception Tests
 # ============================================================================
+
+@pytest.mark.parametrize("forbidden", ["recluster", "mutate_clusters"])
+@pytest.mark.parametrize("change, valid", [
+    ("roundtrip", True),
+    ("filtered", True),
+    ("reordered", True),
+    ("relabeled", False),
+    ("missing_to_string", False),
+    ("dropped_column", False),
+    ("unknown_barcode", False),
+    ("duplicate_barcode", False),
+    ("labels_attached_to_wrong_barcodes", False),
+])
+def test_label_guard_uses_cell_identity_across_h5ad_roundtrip(tmp_path, forbidden, change, valid):
+    pytest.importorskip("anndata")
+    from eacbp.capabilities.side_effect import SideEffectValidator
+
+    source = SCData(
+        X=np.arange(8).reshape(4, 2),
+        obs=pd.DataFrame({"cell_type": ["T", "B", "T", None]}, index=["c0", "c1", "c2", "c3"]),
+        var=pd.DataFrame({"gene_name": ["g0", "g1"]}, index=["g0", "g1"]),
+    )
+    output = source.copy()
+    if change == "filtered":
+        output = output.subset_obs(np.array([True, False, True, True]))
+    elif change == "reordered":
+        output = output.subset_obs(np.array([2, 1, 3, 0]))
+    elif change == "relabeled":
+        output.obs.loc["c0", "cell_type"] = "B"
+    elif change == "missing_to_string":
+        output.obs.loc["c3", "cell_type"] = "nan"
+    elif change == "dropped_column":
+        output.obs = output.obs.drop(columns=["cell_type"])
+    elif change == "unknown_barcode":
+        output.obs.index = ["unknown", "c1", "c2", "c3"]
+    elif change == "duplicate_barcode":
+        output.obs.index = ["c0", "c0", "c2", "c3"]
+    elif change == "labels_attached_to_wrong_barcodes":
+        output.obs.index = ["c1", "c0", "c2", "c3"]
+
+    registry = ArtifactRegistry(str(tmp_path / "artifacts"))
+    in_uri, out_uri = "adata://test_study/input/v1", "adata://test_study/output/v1"
+    registry.register(out_uri, output, ArtifactType.ANNDATA, "test_study", "roundtrip", "test")
+    restored = registry.load_payload(out_uri)
+    assert list((tmp_path / "artifacts").rglob("*.h5ad"))
+    assert source.obs["cell_type"].dtype == object
+    if change != "dropped_column":
+        assert isinstance(restored.obs["cell_type"].dtype, pd.CategoricalDtype)
+    contract = TaskContract(task_id="roundtrip", capability="test_compliant_adapter",
+                            input_artifacts=[in_uri], forbidden_operations=[forbidden])
+    result = TaskResult(task_id=contract.task_id, capability=contract.capability,
+                        method_used="compliant_v1", status=TaskStatus.SUCCESS,
+                        input_artifacts=[in_uri], output_artifacts=[out_uri])
+    input_payloads = {in_uri: source}
+
+    accepted, message = SideEffectValidator.validate(contract, result, input_payloads, {out_uri: restored})
+    adapter_message = MinimalCompliantAdapter()._check_guardrail_violations(
+        contract, result, input_payloads, {}, registry)
+    assert accepted is valid
+    assert (message is None) is valid
+    assert (adapter_message is None) is valid
+
 
 def test_guardrail_intercepts_unauthorized_cell_filtering(tmp_path):
     """Tests that rogue cell filtering is immediately blocked with POLICY_VIOLATION."""
@@ -703,8 +765,8 @@ def test_adapter_lineage_graph_tracking(tmp_path):
     assert spa_adata_uri in children
 
 
-def test_spacell_fallback_coordinates(tmp_path):
-    """Tests that SpaCell gracefully generates deterministic grid coordinates when none are present."""
+def test_spacell_rejects_missing_coordinates(tmp_path):
+    """Absent measurements cannot be replaced with a grid derived from cell order."""
     reg = ArtifactRegistry(storage_dir=str(tmp_path / "artifacts"))
     adapter = SpaCellAgentAdapter()
 
@@ -730,12 +792,9 @@ def test_spacell_fallback_coordinates(tmp_path):
         allowed_operations=["compute_spatial_neighbors", "spatial_domain_clustering", "analyze_microenvironment", "calculate_morans_i"],
     )
     res = adapter.execute(contract, reg)
-    assert res.status == TaskStatus.SUCCESS
-    out_adata_uri = res.output_artifacts[0]
-    _, payload = reg.get(out_adata_uri)
-    out_data = SCData.from_dict(payload)
-    assert "spatial" in out_data.obsm
-    assert out_data.obsm["spatial"].shape == (25, 2)
+    assert res.status == TaskStatus.EXECUTION_FAILURE
+    assert "Measured spatial coordinates not found" in res.error_message
+    assert res.output_artifacts == []
 
 
 def test_chatcell_with_deg_table_input(tmp_path):

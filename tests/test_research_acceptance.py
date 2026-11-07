@@ -14,7 +14,7 @@ pytest.importorskip("pydeseq2")
 
 from eacbp.acceptance.manifest import AcceptanceManifest
 from eacbp.acceptance.manifest import ResourceLimits
-from eacbp.acceptance.runner import _compare, run_acceptance
+from eacbp.acceptance.runner import _check_reference_environment, _compare, run_acceptance
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.orchestrator.dag import ComputationalDAGPlanner
 from eacbp.orchestrator.loop import ScientificOrchestrator
@@ -115,6 +115,82 @@ def test_complete_condition_batch_confounding_is_rejected(tmp_path):
     assert result["statuses"]["method"] == "not_run"
     assert result["failure"]["type"] == "AdvancedStatisticsInputError"
     assert "rank deficient" in result["failure"]["message"]
+
+
+def test_real_reference_environment_accepts_matching_runtime_and_lock(tmp_path, monkeypatch):
+    packages = {
+        "pydeseq2": "0.5.4",
+        "numpy": "2.3.0",
+        "pandas": "2.3.0",
+        "scipy": "1.16.0",
+        "formulaic": "1.2.0",
+        "anndata": "0.12.0",
+    }
+    lockfile = tmp_path / "scientific.lock"
+    lockfile.write_text("locked packages\n", encoding="utf-8")
+    lock_sha = hashlib.sha256(lockfile.read_bytes()).hexdigest()
+    manifest = AcceptanceManifest(
+        study_id="real_environment_check",
+        dataset_kind="real",
+        data_path="not_loaded.h5ad",
+        sha256="a" * 64,
+        source="Kang et al. (2018), GSE96583",
+        source_url="https://example.org/kang.h5ad",
+        license="CC BY 4.0",
+        species="Homo sapiens",
+        counts_layer="counts",
+        contrast={"column": "label", "tested": "stim", "reference": "ctrl"},
+        donor={"column": "replicate", "biological_unit": "donor", "paired": True},
+        reference_environment={
+            "python_version": "3.12.14",
+            "packages": packages,
+            "lockfile_path": str(lockfile),
+            "lockfile_sha256": lock_sha,
+        },
+    )
+    monkeypatch.setattr(
+        "eacbp.acceptance.runner._installed_versions",
+        lambda _extra=(): {"python": "3.12.14", **packages},
+    )
+
+    result = _check_reference_environment(manifest, tmp_path)
+
+    assert result["status"] == "passed"
+    assert result["missing_pins"] == []
+    assert result["mismatches"] == {}
+    assert result["lockfile"]["actual_sha256"] == lock_sha
+
+
+def test_custom_condition_column_acceptance_matches_canonical_reference(tmp_path):
+    data = _adata(condition_effect=True)
+    data.obs["label"] = data.obs["condition"]
+    h5ad_path = tmp_path / "custom_condition.h5ad"
+    data.write_h5ad(h5ad_path)
+    digest = hashlib.sha256(h5ad_path.read_bytes()).hexdigest()
+    manifest = AcceptanceManifest(
+        study_id="custom_condition_acceptance",
+        dataset_kind="synthetic",
+        data_path=h5ad_path.name,
+        sha256=digest,
+        source="Synthetic custom-condition regression fixture",
+        source_url=None,
+        license="not_applicable_synthetic",
+        species="mus_musculus",
+        species_metadata_key="species",
+        counts_layer="counts",
+        contrast={"column": "label", "tested": "B", "reference": "A"},
+        donor={"column": "donor_id", "biological_unit": "mouse", "paired": True},
+        batch_column="batch",
+        covariates=["batch"],
+        statistics={"cooks_filter": False, "independent_filter": False},
+    )
+
+    result = run_acceptance(manifest, tmp_path)
+
+    assert result["statuses"] == {"engineering": "passed", "method": "passed"}, result
+    assert result["scientific_result"]["metrics"]["contrast_spec"]["factor"] == "condition"
+    assert result["direct_reference"]["contrast"] == ["condition", "B", "A"]
+    assert result["direct_reference"]["comparison"]["status"] == "passed"
 
 
 @pytest.mark.parametrize(

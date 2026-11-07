@@ -93,6 +93,8 @@ class PayloadSerializer:
     """Serialize and deserialize the supported artifact payload types."""
 
     _ANNDATA_TYPES = (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA)
+    TABLE_FORMAT = "table_npz_v1"
+    TABLE_CONTRACT_KEY = "__eacbp_table_contract__"
 
     @staticmethod
     def _get_anndata_module():
@@ -115,6 +117,8 @@ class PayloadSerializer:
         the required matrix/table keys use the structured fallback.
         """
 
+        if artifact_type == ArtifactType.TABLE:
+            return cls.TABLE_FORMAT
         if artifact_type not in cls._ANNDATA_TYPES:
             return "native"
         try:
@@ -171,6 +175,231 @@ class PayloadSerializer:
         if payload.__class__.__name__ == "SCData":
             return payload.to_dict()
         return payload
+
+    @staticmethod
+    def _table_require(condition: bool, message: str) -> None:
+        if not condition:
+            raise ArtifactSerializationError("Invalid Table v1 contract: " + message)
+
+    @classmethod
+    def _serialize_table_npz(cls, payload: Any, target_path: Path) -> None:
+        """Persist table values and identity without CSV type/NA inference.
+
+        This is a separate versioned contract from the legacy AnnData fallback.
+        Native numeric arrays retain their binary dtype. Nullable columns carry
+        an explicit mask; object cells use primitive tags that distinguish an
+        empty string, NA-looking text, None, NaN and pandas.NA. Unsupported
+        types fail before publication rather than being stringified.
+        """
+        if isinstance(payload, pd.DataFrame):
+            frame = payload
+        elif isinstance(payload, (list, dict)):
+            frame = pd.DataFrame(payload)
+        else:
+            raise ArtifactSerializationError(f"Cannot serialize Table payload of type {type(payload).__name__}")
+        if frame.attrs:
+            raise ArtifactSerializationError("Table v1 does not support DataFrame.attrs; use artifact metadata")
+        arrays: Dict[str, np.ndarray] = {}
+
+        def array(value: np.ndarray) -> Dict[str, Any]:
+            value = np.asarray(value)
+            cls._table_require(not value.dtype.hasobject, "binary arrays cannot contain objects")
+            key = f"array_{len(arrays)}"
+            arrays[key] = np.array(value, copy=True)
+            return {"key": key, "dtype": value.dtype.str, "shape": list(value.shape)}
+
+        def scalar(value: Any) -> Dict[str, Any]:
+            if value is None:
+                return {"t": "none"}
+            if value is pd.NA:
+                return {"t": "pd_na"}
+            if isinstance(value, np.generic):
+                cls._table_require(value.dtype.kind in "biufU", "unsupported numpy object-cell scalar")
+                return {"t": "numpy_scalar", "array": array(np.asarray(value))}
+            if type(value) is bool:
+                return {"t": "bool", "v": value}
+            if type(value) is int:
+                return {"t": "int", "v": str(value)}
+            if type(value) is float:
+                return {"t": "float", "v": value.hex()}
+            if type(value) is str:
+                return {"t": "str", "v": value}
+            raise ArtifactSerializationError(f"Unsupported Table v1 scalar: {type(value).__name__}")
+
+        def vector(values: Any) -> Dict[str, Any]:
+            dtype = values.dtype
+            if isinstance(dtype, pd.CategoricalDtype):
+                categorical = values.array if isinstance(values, (pd.Series, pd.Index)) else values
+                return {"kind": "categorical", "dtype": "category", "ordered": bool(dtype.ordered),
+                        "categories": axis(categorical.categories), "codes": array(np.asarray(categorical.codes))}
+            if isinstance(dtype, pd.StringDtype):
+                cls._table_require(dtype.storage == "python", "only python-backed StringDtype is supported")
+                missing = "pd.NA" if dtype.na_value is pd.NA else "NaN"
+                mask = np.asarray(pd.isna(values), dtype=bool)
+                text = np.asarray(["" if flag else value for value, flag in zip(values, mask)], dtype=str)
+                return {"kind": "string", "dtype": "string", "storage": "python", "missing": missing,
+                        "values": array(text), "mask": array(mask)}
+            nullable = {"Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float32", "Float64", "boolean"}
+            if isinstance(dtype, pd.api.extensions.ExtensionDtype):
+                name = str(dtype)
+                cls._table_require(name in nullable, "unsupported extension dtype: " + name)
+                native = np.dtype("bool" if name == "boolean" else name.lower())
+                mask = np.asarray(pd.isna(values), dtype=bool)
+                return {"kind": "nullable", "dtype": name, "missing": "pd.NA", "mask": array(mask),
+                        "values": array(values.to_numpy(dtype=native, na_value=0))}
+            dtype = np.dtype(dtype)
+            if dtype == np.dtype("object"):
+                return {"kind": "object", "dtype": "object", "values": [scalar(value) for value in values]}
+            cls._table_require(dtype.kind in "biuf" and dtype.itemsize in (1, 2, 4, 8), "unsupported native dtype: " + str(dtype))
+            return {"kind": "native", "dtype": dtype.str, "values": array(np.asarray(values))}
+
+        def axis(value: pd.Index) -> Dict[str, Any]:
+            if isinstance(value, pd.RangeIndex):
+                return {"kind": "range", "start": value.start, "stop": value.stop, "step": value.step, "name": scalar(value.name)}
+            cls._table_require(not isinstance(value, pd.MultiIndex), "MultiIndex is not supported")
+            return {"kind": "categorical_index" if isinstance(value, pd.CategoricalIndex) else "index",
+                    "name": scalar(value.name), "values": vector(value)}
+
+        manifest = {"format": "eacbp.table.npz", "version": 1, "decoder": "eacbp.table.v1", "shape": list(frame.shape),
+                    "index": axis(frame.index), "columns": axis(frame.columns),
+                    "column_values": [vector(frame.iloc[:, position]) for position in range(frame.shape[1])],
+                    "allows_duplicate_labels": bool(frame.flags.allows_duplicate_labels)}
+        encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        arrays[cls.TABLE_CONTRACT_KEY] = np.frombuffer(encoded, dtype=np.uint8)
+        with target_path.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+
+    @classmethod
+    def _deserialize_table_npz(cls, target_path: Path) -> pd.DataFrame:
+        """Decode Table v1 strictly; declared type/shape never triggers coercion."""
+        try:
+            with np.load(target_path, allow_pickle=False) as stored:
+                cls._table_require(cls.TABLE_CONTRACT_KEY in stored.files, "missing table contract")
+                header = stored[cls.TABLE_CONTRACT_KEY]
+                cls._table_require(header.dtype == np.dtype("uint8") and header.ndim == 1, "contract must be UTF-8 bytes")
+                manifest = json.loads(header.tobytes().decode("utf-8"))
+                cls._table_require(isinstance(manifest, dict) and manifest.get("format") == "eacbp.table.npz"
+                                   and type(manifest.get("version")) is int and manifest["version"] == 1
+                                   and manifest.get("decoder") == "eacbp.table.v1", "unsupported format/version/decoder")
+                shape = manifest.get("shape")
+                cls._table_require(isinstance(shape, list) and len(shape) == 2 and all(type(n) is int and n >= 0 for n in shape), "invalid table shape")
+                used = {cls.TABLE_CONTRACT_KEY}
+
+                def array(info: Dict[str, Any], expected_shape: Tuple[int, ...]) -> np.ndarray:
+                    cls._table_require(isinstance(info, dict) and set(info) == {"key", "dtype", "shape"}, "invalid array declaration")
+                    key = info["key"]
+                    cls._table_require(isinstance(key, str) and key in stored.files and key not in used, "missing/reused array key")
+                    value = np.array(stored[key], copy=True)
+                    cls._table_require(not value.dtype.hasobject and value.dtype.str == info["dtype"]
+                                       and list(value.shape) == info["shape"] and value.shape == expected_shape, "array dtype/shape does not match contract")
+                    used.add(key)
+                    return value
+
+                def scalar(node: Dict[str, Any]) -> Any:
+                    cls._table_require(isinstance(node, dict), "invalid scalar tag")
+                    tag = node.get("t")
+                    if tag in ("none", "pd_na"):
+                        cls._table_require(set(node) == {"t"}, "invalid missing scalar")
+                        return None if tag == "none" else pd.NA
+                    if tag == "numpy_scalar":
+                        cls._table_require(set(node) == {"t", "array"}, "invalid numpy scalar")
+                        value = array(node["array"], ())
+                        cls._table_require(value.dtype.kind in "biufU", "unsupported numpy scalar dtype")
+                        return value[()]
+                    cls._table_require(set(node) == {"t", "v"}, "invalid primitive scalar")
+                    value = node["v"]
+                    if tag == "str":
+                        cls._table_require(type(value) is str, "text scalar must remain text")
+                        return value
+                    if tag == "bool":
+                        cls._table_require(type(value) is bool, "boolean scalar must remain bool")
+                        return value
+                    if tag == "int":
+                        cls._table_require(type(value) is str and str(int(value)) == value, "invalid integer scalar")
+                        return int(value)
+                    if tag == "float":
+                        cls._table_require(type(value) is str and float.fromhex(value).hex() == value, "invalid floating scalar")
+                        return float.fromhex(value)
+                    raise ArtifactSerializationError("Invalid Table v1 contract: unknown scalar tag")
+
+                def vector(node: Dict[str, Any], length: int) -> Any:
+                    cls._table_require(isinstance(node, dict), "invalid column declaration")
+                    kind = node.get("kind")
+                    if kind == "object":
+                        cls._table_require(set(node) == {"kind", "dtype", "values"} and node["dtype"] == "object"
+                                           and isinstance(node["values"], list) and len(node["values"]) == length, "invalid object dtype/length")
+                        value = np.empty(length, dtype=object)
+                        value[:] = [scalar(item) for item in node["values"]]
+                        return value
+                    if kind == "native":
+                        cls._table_require(set(node) == {"kind", "dtype", "values"}, "invalid native declaration")
+                        value = array(node["values"], (length,))
+                        cls._table_require(value.dtype.str == node["dtype"] and value.dtype.kind in "biuf"
+                                           and value.dtype.itemsize in (1, 2, 4, 8), "native dtype mismatch")
+                        return value
+                    if kind in ("nullable", "string"):
+                        expected_keys = {"kind", "dtype", "missing", "values", "mask"} | ({"storage"} if kind == "string" else set())
+                        cls._table_require(set(node) == expected_keys, "invalid nullable declaration")
+                        mask = array(node["mask"], (length,))
+                        cls._table_require(mask.dtype == np.dtype("bool"), "missing mask must be boolean")
+                        value = array(node["values"], (length,))
+                        if kind == "string":
+                            cls._table_require(node["dtype"] == "string" and node["storage"] == "python" and node["missing"] in ("pd.NA", "NaN")
+                                               and value.dtype.kind == "U", "invalid string dtype/decoder")
+                            dtype = pd.StringDtype(storage="python", na_value=pd.NA if node["missing"] == "pd.NA" else np.nan)
+                            result = pd.array(value, dtype=dtype)
+                            result[mask] = dtype.na_value
+                            return result
+                        nullable = {"Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float32", "Float64", "boolean"}
+                        name = node["dtype"]
+                        cls._table_require(name in nullable and node["missing"] == "pd.NA"
+                                           and value.dtype == np.dtype("bool" if name == "boolean" else name.lower()), "nullable dtype mismatch")
+                        constructor = pd.arrays.BooleanArray if name == "boolean" else pd.arrays.FloatingArray if name.startswith("Float") else pd.arrays.IntegerArray
+                        return constructor(value, mask)
+                    if kind == "categorical":
+                        cls._table_require(set(node) == {"kind", "dtype", "ordered", "categories", "codes"}
+                                           and node["dtype"] == "category" and type(node["ordered"]) is bool, "invalid categorical declaration")
+                        categories = axis(node["categories"])
+                        codes = array(node["codes"], (length,))
+                        cls._table_require(codes.dtype.kind == "i" and np.all(codes >= -1) and np.all(codes < len(categories)), "invalid categorical codes")
+                        return pd.Categorical.from_codes(codes, categories=categories, ordered=node["ordered"])
+                    raise ArtifactSerializationError("Invalid Table v1 contract: unsupported column kind")
+
+                def axis(node: Dict[str, Any], length: Optional[int] = None) -> pd.Index:
+                    cls._table_require(isinstance(node, dict), "invalid axis declaration")
+                    kind = node.get("kind")
+                    if kind == "range":
+                        cls._table_require(set(node) == {"kind", "start", "stop", "step", "name"}
+                                           and all(type(node[key]) is int for key in ("start", "stop", "step")) and node["step"] != 0, "invalid range axis")
+                        result = pd.RangeIndex(node["start"], node["stop"], node["step"], name=scalar(node["name"]))
+                    else:
+                        cls._table_require(kind in ("index", "categorical_index") and set(node) == {"kind", "name", "values"}, "unsupported axis kind")
+                        values_info = node["values"]
+                        if length is None:
+                            if values_info.get("kind") == "object":
+                                length = len(values_info["values"])
+                            else:
+                                ref = values_info.get("codes") if values_info.get("kind") == "categorical" else values_info.get("values")
+                                length = ref["shape"][0]
+                        values = vector(values_info, length)
+                        result = pd.CategoricalIndex(values, name=scalar(node["name"])) if kind == "categorical_index" else pd.Index(values, dtype=values.dtype, name=scalar(node["name"]))
+                    cls._table_require(length is None or len(result) == length, "axis length differs from table shape")
+                    return result
+
+                index, columns = axis(manifest["index"], shape[0]), axis(manifest["columns"], shape[1])
+                column_values = manifest.get("column_values")
+                cls._table_require(isinstance(column_values, list) and len(column_values) == shape[1], "column count differs from table shape")
+                decoded = [vector(node, shape[0]) for node in column_values]
+                frame = pd.DataFrame({position: pd.Series(value, dtype=value.dtype) for position, value in enumerate(decoded)}, index=pd.RangeIndex(shape[0]))
+                frame.index, frame.columns = index, columns
+                cls._table_require(type(manifest.get("allows_duplicate_labels")) is bool, "invalid duplicate-label policy")
+                frame.flags.allows_duplicate_labels = manifest["allows_duplicate_labels"]
+                cls._table_require(set(stored.files) == used, "unbound array payload")
+                return frame
+        except ArtifactSerializationError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
+            raise ArtifactSerializationError(f"Unable to read Table v1 artifact at {target_path}: {exc}") from exc
 
     @classmethod
     def _serialize_structured_npz(cls, payload: Any, target_path: Path) -> None:
@@ -254,6 +483,7 @@ class PayloadSerializer:
                     "t": "dataframe",
                     "columns": columns,
                     "index": encode(value.index.tolist()),
+                    "index_name": encode(value.index.name),
                     "column_values": encoded_columns,
                 }
             if isinstance(value, pd.Series):
@@ -409,6 +639,8 @@ class PayloadSerializer:
                                     except (TypeError, ValueError):
                                         pass
                         frame.index = index
+                        if "index_name" in node:
+                            frame.index.name = decode(node["index_name"])
                         frame.columns = columns
                         return frame
                     if tag == "series":
@@ -470,14 +702,10 @@ class PayloadSerializer:
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         if artifact_type == ArtifactType.TABLE:
-            if isinstance(payload, pd.DataFrame):
-                payload.to_csv(target_path, index=True)
-            elif isinstance(payload, (list, dict)):
-                pd.DataFrame(payload).to_csv(target_path, index=True)
-            else:
-                raise ArtifactSerializationError(
-                    f"Cannot serialize Table payload of type {type(payload).__name__}"
-                )
+            storage_format = storage_format or cls.TABLE_FORMAT
+            if storage_format != cls.TABLE_FORMAT:
+                raise ArtifactSerializationError(f"Unknown Table storage format: {storage_format!r}")
+            cls._serialize_table_npz(payload, target_path)
         elif artifact_type in (ArtifactType.JSON, ArtifactType.GENE_LIST, ArtifactType.FASTQ, ArtifactType.GRAPH):
             with target_path.open("w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, ensure_ascii=False, default=_json_default)
@@ -520,6 +748,12 @@ class PayloadSerializer:
             raise FileNotFoundError(f"Artifact payload not found at {target_path}")
 
         if artifact_type == ArtifactType.TABLE:
+            if target_path.name.lower().endswith(".table.npz"):
+                return cls._deserialize_table_npz(target_path)
+            if target_path.suffix.lower() != ".csv":
+                raise ArtifactSerializationError(f"Unsupported Table artifact suffix {target_path.suffix!r}")
+            # Legacy CSV's inference is deliberately unchanged. New tables
+            # carry a binary versioned contract; old files are never migrated.
             return pd.read_csv(target_path, index_col=0)
         if artifact_type in (ArtifactType.JSON, ArtifactType.GENE_LIST, ArtifactType.FASTQ, ArtifactType.GRAPH):
             with target_path.open("r", encoding="utf-8") as handle:
@@ -536,7 +770,9 @@ class PayloadSerializer:
 
                 # Read failures are intentionally propagated.  A corrupt h5ad
                 # must not silently become an unrelated NPZ payload.
-                return SCData.from_anndata(ad.read_h5ad(target_path))
+                return SCData.from_anndata(
+                    ad.read_h5ad(target_path), add_missing_annotations=False
+                )
             if suffix == ".npz":
                 return cls._deserialize_structured_npz(target_path)
             raise ArtifactSerializationError(
@@ -607,6 +843,8 @@ class ArtifactStorageBackend:
         }
         if artifact_type in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA) and storage_format == "npz":
             ext = ".npz"
+        elif artifact_type == ArtifactType.TABLE and storage_format == PayloadSerializer.TABLE_FORMAT:
+            ext = ".table.npz"
         else:
             ext = ext_map.get(artifact_type, ".dat")
         candidate = self.base_dir / uri.study_id / uri.name / f"{uri.version}{ext}"
@@ -653,6 +891,10 @@ class ArtifactStorageBackend:
         return os.path.lexists(str(path))
 
     def _find_existing_path(self, uri: ArtifactURI, artifact_type: ArtifactType) -> Path:
+        if artifact_type == ArtifactType.TABLE:
+            typed = self._get_path_for_uri(uri, artifact_type, PayloadSerializer.TABLE_FORMAT)
+            if self._lexists(typed):
+                return self._validated_path(typed)
         primary = self._get_path_for_uri(uri, artifact_type)
         if self._lexists(primary):
             return self._validated_path(primary)
@@ -680,6 +922,8 @@ class ArtifactStorageBackend:
                 f"Artifact '{uri_str}' already exists at '{target_path}'. "
                 "Immutable artifact versions cannot be overwritten."
             )
+        if artifact_type == ArtifactType.TABLE and self._lexists(self._get_path_for_uri(uri, artifact_type)):
+            raise ArtifactAlreadyExistsError(f"Legacy Table artifact '{uri_str}' already exists; its version cannot be replaced by a new format")
 
         temp_path: Optional[Path] = None
         try:

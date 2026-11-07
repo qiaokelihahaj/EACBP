@@ -80,10 +80,10 @@ def test_demo_mode_is_explicit_and_provenance_is_persisted(tmp_path):
     assert result.metrics["is_simulated"] is True
     assert result.metrics["data_origin"] == "synthetic_demo"
     assert result.metrics["lane_pairs_requested"] == 2
-    meta, payload = registry.get(result.output_artifacts[0])
+    meta = registry.get_metadata(result.output_artifacts[0])
     assert meta.summary_metrics["is_simulated"] is True
     assert meta.summary_metrics["data_origin"] == "synthetic_demo"
-    uns = payload.uns if hasattr(payload, "uns") else payload["uns"]
+    uns = registry.load_scdata(result.output_artifacts[0]).uns
     assert uns["is_simulated"] == True
     assert uns["data_origin"] == "synthetic_demo"
 

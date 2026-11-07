@@ -30,14 +30,15 @@ def test_actual_harmony_leiden_umap_preserve_cells_and_provenance(tmp_path):
     harmony = HarmonyIntegrationCapability()
     task = TaskContract(task_id="h", capability="integration", input_artifacts=[uri], parameters={"random_seed": 7, "n_components": 5})
     result = harmony.execute(task, reg)
-    meta, data = reg.get(result.output_artifacts[0])
+    meta = reg.get_metadata(result.output_artifacts[0])
+    data = reg.load_scdata(result.output_artifacts[0])
     assert result.method_used == "harmonypy_v1"
     assert "harmonypy" in meta.software_versions
     assert data.obsm["X_pca_harmony"].shape == (80, 5)
     assert not np.allclose(data.obsm["X_pca"], data.obsm["X_pca_uncorrected"])
     task = TaskContract(task_id="l", capability="clustering", input_artifacts=result.output_artifacts, parameters={"n_neighbors": 10})
     clustered = LeidenClusteringCapability().execute(task, reg)
-    _, data = reg.get(clustered.output_artifacts[0])
+    data = reg.load_scdata(clustered.output_artifacts[0])
     assert data.n_obs == 80 and data.obsp["connectivities"].shape == (80, 80)
     assert data.obsm["X_umap"].shape == (80, 2) and np.isfinite(data.obsm["X_umap"]).all()
     assert data.obs["cluster"].nunique() > 1
@@ -52,7 +53,7 @@ def test_actual_diffusion_pseudotime_requires_root_and_saves_per_cell_output(tmp
         cap.execute(task, reg)
     task.parameters["root_cell_id"] = "c0"
     result = cap.execute(task, reg)
-    _, data = reg.get(result.output_artifacts[1])
+    data = reg.load_scdata(result.output_artifacts[1])
     pt = data.obs["dpt_pseudotime"].to_numpy()
     assert pt[0] == 0 and np.isfinite(pt).all() and pt[-1] > .5
     _, table = reg.get(result.output_artifacts[0])
@@ -71,7 +72,7 @@ def test_standard_profile_executes_real_libraries_through_audit_and_resume(tmp_p
     assert result["status"] == "success", result["failures"]
     methods = {t.method_used for t in orch.task_history}
     assert {"harmonypy_v1", "scanpy_leiden_umap_v1", "scanpy_dpt_v1"} <= methods
-    _, data = reg.get("adata://real/diffusion_pseudotime/v1")
+    data = reg.load_scdata("adata://real/diffusion_pseudotime/v1")
     assert "paga" in data.uns and data.uns["paga"]["connectivities"].shape[0] >= 2
     resumed = orch.run_study(manifest, {**state, "resume": True})
     assert resumed["status"] == "success", resumed["failures"]

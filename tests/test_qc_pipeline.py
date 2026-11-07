@@ -126,9 +126,9 @@ def test_real_qc_extensions_preserve_input_and_emit_audited_neutral_evidence(
     assert annotation_task.metrics["n_unknown_annotations"] > 0
     assert annotation_task.metrics["n_label_conflicts"] > 0
 
-    _, doublet_output = registry.get(doublet_task.output_artifacts[0])
-    _, clustered_output = registry.get(f"adata://{study_id}/annotated/v4")
-    _, annotation_output = registry.get(annotation_task.output_artifacts[0])
+    doublet_output = registry.load_scdata(doublet_task.output_artifacts[0])
+    clustered_output = registry.load_scdata(f"adata://{study_id}/annotated/v4")
+    annotation_output = registry.load_scdata(annotation_task.output_artifacts[0])
     for output in (doublet_output, annotation_output):
         np.testing.assert_array_equal(output.layers["counts"], counts)
         assert output.obs.index.tolist() == cell_ids

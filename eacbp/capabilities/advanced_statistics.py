@@ -48,6 +48,8 @@ from scipy import sparse, stats
 from eacbp.artifact.registry import ArtifactRegistry
 from eacbp.artifact.uri import ArtifactURI
 from eacbp.capabilities.base import BaseCapability, ImplementationType
+from eacbp.capabilities.biological_units import DonorRole, complete_identity, resolve_donor_role
+from eacbp.capabilities.fit_diagnostics import FitReceipt, SCHEMA as FIT_RECEIPT_SCHEMA, observe_dds, observe_stats
 from eacbp.numerics import benjamini_hochberg
 from eacbp.capabilities.sc_data import SCData
 from eacbp.schemas.artifact import ArtifactType
@@ -100,6 +102,7 @@ class _PseudobulkInput:
     estimated_aggregation_working_bytes: int = 0
     design_rank: Optional[int] = None
     design_columns: tuple[str, ...] = ()
+    donor_role: Optional[DonorRole] = None
 
 
 @dataclass(frozen=True)
@@ -189,7 +192,7 @@ def _coerce_data(payload: Any) -> SCData:
     if isinstance(payload, SCData):
         return payload.copy()
     if isinstance(payload, Mapping) and "X" in payload and "obs" in payload:
-        return SCData.from_dict(dict(payload))
+        return SCData.from_payload(payload)
     if hasattr(payload, "X") and hasattr(payload, "obs") and hasattr(payload, "var"):
         return SCData.from_anndata(payload)
     raise TypeError(
@@ -212,6 +215,22 @@ def _resolve_column(obs: pd.DataFrame, explicit: Any, candidates: Sequence[str],
     raise AdvancedStatisticsInputError(
         f"{label} metadata is required; provide {label.lower()}_col explicitly"
     )
+
+
+def _resolve_biological_role(obs: pd.DataFrame, params: Mapping[str, Any]) -> DonorRole:
+    try:
+        role = resolve_donor_role(obs, params)
+    except ValueError as exc:
+        raise AdvancedStatisticsInputError(str(exc)) from exc
+    if role.column is None:
+        raise AdvancedStatisticsInputError(
+            "Biological donor inference is not estimable: donor metadata are required; "
+            "sample/library identifiers cannot substitute. Provide donor_col explicitly "
+            "only when the biological sampling design supports that role mapping."
+        )
+    if not complete_identity(obs[role.column]):
+        raise AdvancedStatisticsInputError(f"donor metadata column {role.column!r} contains missing or empty values; biological donor inference is not estimable")
+    return role
 
 
 def _resolve_conditions(obs: pd.DataFrame, params: Mapping[str, Any], condition_col: str) -> tuple[str, str]:
@@ -572,12 +591,8 @@ def _validate_sample_qualification(
 def _prepare_pseudobulk(data: SCData, params: Mapping[str, Any]) -> _PseudobulkInput:
     obs = data.obs.copy(deep=True)
     condition_col = _resolve_column(obs, params.get("condition_col"), ("condition",), "Condition")
-    donor_col = _resolve_column(
-        obs,
-        params.get("donor_col"),
-        ("donor", "donor_id", "mouse_id", "sample_id", "sample"),
-        "Donor",
-    )
+    donor_role = _resolve_biological_role(obs, params)
+    donor_col = donor_role.column
     condition_a, condition_b = _resolve_conditions(obs, params, condition_col)
     covariates = _resolve_covariates(obs, params)
     paired = bool(params.get("paired", params.get("paired_design", False)))
@@ -623,6 +638,7 @@ def _prepare_pseudobulk(data: SCData, params: Mapping[str, Any]) -> _PseudobulkI
         donor_ids_b=donors_b,
         pseudobulk_dense_bytes=dense_bytes,
         estimated_aggregation_working_bytes=estimated_peak_bytes,
+        donor_role=donor_role,
     )
 
 
@@ -639,6 +655,12 @@ def _validate_design_and_make_dds(
     n_cpus = params.get("n_cpus", params.get("n_processes", 1))
     n_cpus = None if n_cpus is None else max(1, int(n_cpus))
     min_replicates = max(2, int(params.get("min_replicates", 2)))
+    dds_options = {
+        "min_replicates": min_replicates, "n_cpus": n_cpus, "quiet": True,
+        "low_memory": bool(params.get("low_memory", False)),
+        "fit_type": str(params.get("fit_type", "parametric")),
+        "size_factors_fit_type": str(params.get("size_factors_fit_type", "ratio")),
+    }
     try:
         dds = DeseqDataSet(
             counts=count_table,
@@ -662,6 +684,8 @@ def _validate_design_and_make_dds(
             n_cpus=n_cpus,
             quiet=True,
         )
+        dds_options = {"min_replicates": min_replicates, "n_cpus": n_cpus, "quiet": True}
+    observe_dds(dds, dds_options)
     design_matrix = np.asarray(dds.obsm.get("design_matrix"), dtype=float)
     if design_matrix.ndim != 2 or design_matrix.shape[0] != len(metadata_table):
         raise AdvancedStatisticsInputError("PyDESeq2 did not produce a valid design matrix")
@@ -686,11 +710,11 @@ def _resolve_contrast(prepared: _PseudobulkInput, params: Mapping[str, Any]) -> 
     supplied = params.get("contrast")
     if supplied is None:
         tested, reference = prepared.condition_a, prepared.condition_b
-        vector = ("condition", tested, reference)
+        factor = _condition_factor_in_design(prepared, "condition")
         return ContrastSpec(
             kind="categorical",
-            vector=vector,
-            factor="condition",
+            vector=(factor, tested, reference),
+            factor=factor,
             tested_level=tested,
             reference_level=reference,
             label=f"{tested} versus {reference}",
@@ -708,10 +732,11 @@ def _resolve_contrast(prepared: _PseudobulkInput, params: Mapping[str, Any]) -> 
             raise AdvancedStatisticsInputError("contrast levels must be observed condition levels")
         if tested == reference:
             raise AdvancedStatisticsInputError("contrast tested and reference levels must differ")
+        model_factor = _condition_factor_in_design(prepared, factor)
         return ContrastSpec(
             kind="categorical",
-            vector=(factor, tested, reference),
-            factor=factor,
+            vector=(model_factor, tested, reference),
+            factor=model_factor,
             tested_level=tested,
             reference_level=reference,
             label=f"{tested} versus {reference}",
@@ -752,6 +777,23 @@ def _resolve_contrast(prepared: _PseudobulkInput, params: Mapping[str, Any]) -> 
     )
 
 
+def _condition_factor_in_design(prepared: _PseudobulkInput, requested: str) -> str:
+    """Resolve a metadata condition alias to the factor used by PyDESeq2.
+
+    Pseudobulk metadata always exposes canonical ``condition`` and ``donor``
+    columns. A custom source condition column is also retained, but it is only
+    a valid PyDESeq2 contrast factor when the selected design formula includes
+    that alias. Otherwise use the canonical factor if the model includes it.
+    """
+    design_variables = _formula_variables(prepared.design)
+    for candidate in dict.fromkeys((requested, prepared.condition_col, "condition")):
+        if candidate in design_variables:
+            return candidate
+    raise AdvancedStatisticsInputError(
+        f"categorical contrast factor {requested!r} is not included in design {prepared.design!r}"
+    )
+
+
 def _build_inference_contract(
     contract: TaskContract,
     registry: ArtifactRegistry,
@@ -762,17 +804,12 @@ def _build_inference_contract(
     if not contract.input_artifacts:
         raise AdvancedStatisticsInputError("inference contract requires an input artifact")
     if data is None:
-        _, payload = registry.get(contract.input_artifacts[0])
-        data = _coerce_data(payload)
+        data = registry.load_scdata(contract.input_artifacts[0])
     params = contract.parameters
     obs = data.obs
     condition_col = _resolve_column(obs, params.get("condition_col"), ("condition",), "Condition")
-    donor_col = _resolve_column(
-        obs,
-        params.get("donor_col"),
-        ("donor", "donor_id", "mouse_id", "sample_id", "sample"),
-        "Donor",
-    )
+    donor_role = _resolve_biological_role(obs, params)
+    donor_col = donor_role.column
     condition_a, condition_b = _resolve_conditions(obs, params, condition_col)
     covariates = _resolve_covariates(obs, params)
     paired = bool(params.get("paired", params.get("paired_design", False)))
@@ -914,6 +951,7 @@ def _run_pydeseq2(
         quiet=True,
         n_cpus=n_cpus,
     )
+    observe_stats(stats_obj)
     stats_obj.summary()
     result = stats_obj.results_df.copy()
     result.index = result.index.astype(str)
@@ -928,12 +966,81 @@ def _run_pydeseq2(
     return result, stats_obj
 
 
+def _run_recorded_pydeseq2(
+    prepared: _PseudobulkInput, contract: TaskContract, receipts: list[dict[str, Any]],
+    *, counts: Optional[pd.DataFrame] = None, metadata: Optional[pd.DataFrame] = None,
+    left_out_donor: Optional[str] = None,
+) -> tuple[pd.DataFrame, Any]:
+    if not contract.parameters.get("fit_receipts_uri"):
+        return _run_pydeseq2(prepared, contract.parameters, counts=counts, metadata=metadata)
+    receipt = FitReceipt(
+        task_id=contract.task_id, method=contract.method or "pydeseq2",
+        counts=prepared.counts if counts is None else counts,
+        metadata=prepared.metadata if metadata is None else metadata,
+        design_formula=prepared.design,
+        contrast=_resolve_contrast(prepared, contract.parameters).as_dict(),
+        params=contract.parameters, left_out_donor=left_out_donor,
+    )
+    try:
+        with receipt:
+            return _run_pydeseq2(prepared, contract.parameters, counts=counts, metadata=metadata)
+    finally:
+        receipts.append(receipt.record)
+
+
+def _scientific_outputs(contract: TaskContract) -> list[str]:
+    receipt_uri = contract.parameters.get("fit_receipts_uri")
+    return [str(uri) for uri in contract.expected_outputs if str(uri) != receipt_uri]
+
+
+def _register_fit_receipts(
+    registry: ArtifactRegistry, contract: TaskContract, input_uri: str,
+    science_outputs: list[str], receipts: list[dict[str, Any]], metrics: dict[str, Any],
+) -> list[str]:
+    receipt_uri = contract.parameters.get("fit_receipts_uri")
+    if not receipt_uri:
+        metrics["fit_receipts_status"] = "unavailable_legacy_task"
+        return science_outputs
+    receipt_uri = str(receipt_uri)
+    if receipt_uri not in contract.expected_outputs:
+        raise AdvancedStatisticsInputError("fit_receipts_uri must be declared in expected_outputs before execution")
+    inference = contract.inference_contract
+    input_meta = registry.get_metadata(input_uri)
+    payload = {
+        "schema": FIT_RECEIPT_SCHEMA, "task_id": contract.task_id,
+        "method": contract.method, "input_artifact": input_uri,
+        "input_sha256": input_meta.sha256_hash,
+        "inference_contract_id": inference.contract_id if inference is not None else None,
+        "science_outputs": list(science_outputs), "fits": receipts,
+        "fit_status": "not_attempted" if not receipts else "attempted",
+        "not_attempted_reason": metrics.get("skip_reason") if not receipts else None,
+        "limitations": ["A completed fit or absence of captured warnings does not certify convergence or scientific robustness.",
+                        "Warnings emitted only by worker subprocesses are not captured as Python warning records."],
+    }
+    parameters = {"inference_contract_id": payload["inference_contract_id"]}
+    if inference is not None:
+        parameters["inference_contract"] = inference.model_dump(mode="json")
+    registry.register(
+        receipt_uri, payload, ArtifactType.JSON, ArtifactURI.parse(receipt_uri).study_id,
+        contract.task_id, "pydeseq2_fit_diagnostics",
+        parent_uris=[input_uri, *science_outputs], parameters=parameters,
+        software_versions=receipts[0]["software_versions"] if receipts else {},
+        summary_metrics={"inference_contract_id": payload["inference_contract_id"],
+                         "n_fit_attempts": len(receipts)},
+    )
+    metrics.update({"fit_receipts_status": "available", "fit_receipts_uri": receipt_uri,
+                    "n_fit_receipts": len(receipts),
+                    "fit_receipts_sha256": registry.get_metadata(receipt_uri).sha256_hash})
+    return [*science_outputs, receipt_uri]
+
+
 def _result_table(
     result: pd.DataFrame,
     prepared: _PseudobulkInput,
     params: Mapping[str, Any],
     *,
     status: str = "estimated",
+    fit_metadata: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     out = pd.DataFrame(index=result.index.astype(str))
     inference = InferenceSettings.from_params(params)
@@ -967,15 +1074,18 @@ def _result_table(
     out["statistical_unit"] = "donor_pseudobulk"
     out["pseudobulk_unit"] = "donor_condition"
     out["donor_col"] = prepared.donor_col
+    if prepared.donor_role is not None:
+        for key, value in prepared.donor_role.as_metrics().items():
+            out[key] = value
     out["counts_source"] = prepared.counts_source
     out["design"] = prepared.design
     out["paired"] = prepared.paired
     out["covariates"] = ",".join(prepared.covariates)
-    out["n_pseudobulk_samples"] = int(len(prepared.metadata))
-    donor_counts = {
-        prepared.condition_a: len(prepared.donor_ids_a),
-        prepared.condition_b: len(prepared.donor_ids_b),
-    }
+    observed_fit_metadata = prepared.metadata if fit_metadata is None else fit_metadata
+    if not {"donor", "condition"}.issubset(observed_fit_metadata.columns):
+        raise AdvancedStatisticsInputError("fit metadata must identify each donor-condition pseudobulk sample")
+    out["n_pseudobulk_samples"] = int(len(observed_fit_metadata))
+    donor_counts = observed_fit_metadata.groupby("condition", observed=True)["donor"].nunique().to_dict()
     out["n_donors_condition_a"] = int(donor_counts.get(condition_a, 0))
     out["n_donors_condition_b"] = int(donor_counts.get(condition_b, 0))
     finite_lfc = out["log2_fold_change"].notna()
@@ -1020,6 +1130,7 @@ def _fit_metrics(prepared: _PseudobulkInput, result_table: pd.DataFrame) -> dict
         "condition_b": prepared.condition_b,
         "condition_col": prepared.condition_col,
         "donor_col": prepared.donor_col,
+        **(prepared.donor_role.as_metrics() if prepared.donor_role is not None else {}),
         "paired": bool(prepared.paired),
         "covariates": list(prepared.covariates),
         "design": prepared.design,
@@ -1056,6 +1167,9 @@ def _register_table(
     study_id = ArtifactURI.parse(uri).study_id
     parameter_record = dict(parameters)
     summary_record = dict(summary_metrics)
+    for key in ("donor_col", "donor_role_source", "donor_role_limitation", "donor_independence_established"):
+        if key in summary_record:
+            parameter_record[key] = summary_record[key]
     if contract.inference_contract is not None:
         inference_payload = contract.inference_contract.model_dump(mode="json")
         parameter_record["inference_contract"] = inference_payload
@@ -1120,8 +1234,9 @@ def _scientific_result(
             name="donor_independence",
             status=AssumptionStatus.UNKNOWN,
             scope="biological sampling design",
-            evidence={"independent_unit": inference_contract.independent_unit, "design_rank": design_rank},
-            reason="Independence between biological donors is not established by metadata or a full-rank design matrix.",
+            evidence={"independent_unit": inference_contract.independent_unit, "design_rank": design_rank,
+                      "donor_col": metrics.get("donor_col"), "donor_role_source": metrics.get("donor_role_source")},
+            reason=str(metrics.get("donor_role_limitation") or "Independence between biological donors is not established by metadata or a full-rank design matrix."),
         ),
         AssumptionAssessment(
             name="raw_integer_counts",
@@ -1207,7 +1322,7 @@ class PyDESeq2PseudobulkCapability(_InferenceContractCapability, BaseCapability)
             implementation_id=implementation_id,
             implementation_type=ImplementationType.PYTHON_TOOL,
             accepts_types=[ArtifactType.ANNDATA],
-            output_types=[ArtifactType.TABLE],
+            output_types=[ArtifactType.TABLE, ArtifactType.JSON],
             suitable_for=["raw_count_differential_expression", "paired_donor_design", "covariate_adjustment"],
         )
         self.legacy_aliases = {
@@ -1220,11 +1335,11 @@ class PyDESeq2PseudobulkCapability(_InferenceContractCapability, BaseCapability)
         if not contract.input_artifacts:
             raise AdvancedStatisticsInputError("DEG requires one input AnnData/SCData artifact")
         input_uri = contract.input_artifacts[0]
-        _, payload = registry.get(input_uri)
-        data = _coerce_data(payload)
+        data = registry.load_scdata(input_uri)
         self.ensure_inference_contract(contract, registry, data)
         prepared = _prepare_pseudobulk(data, contract.parameters)
-        result, _ = _run_pydeseq2(prepared, contract.parameters)
+        fit_receipts: list[dict[str, Any]] = []
+        result, _ = _run_recorded_pydeseq2(prepared, contract, fit_receipts)
         table = _result_table(result, prepared, contract.parameters)
         metrics = _fit_metrics(prepared, table)
         contrast_spec = _resolve_contrast(prepared, contract.parameters)
@@ -1284,13 +1399,14 @@ class PyDESeq2PseudobulkCapability(_InferenceContractCapability, BaseCapability)
             "benjamini_hochberg_fdr",
             "retain_all_genes",
         ]
+        outputs = _register_fit_receipts(registry, contract, input_uri, [out_uri], fit_receipts, metrics)
         return TaskResult(
             task_id=contract.task_id,
             status=TaskStatus.SUCCESS,
             capability=self.capability_name,
             method_used=self.implementation_id,
             input_artifacts=[input_uri],
-            output_artifacts=[out_uri],
+            output_artifacts=outputs,
             executed_operations=operations,
             metrics=metrics,
             inference_contract=contract.inference_contract,
@@ -1726,6 +1842,9 @@ class DecouplerFunctionalAnalysisCapability(_InferenceContractCapability, BaseCa
         for key, value in provenance.items():
             summary[key] = value
         summary["statistical_unit"] = "donor_pseudobulk_activity"
+        if prepared.donor_role is not None:
+            for key, value in prepared.donor_role.as_metrics().items():
+                summary[key] = value
         summary["is_pseudobulk"] = True
         summary["activity_input"] = "log1p_CPM_from_layers_counts"
         inference = InferenceSettings.from_params(contract.parameters)
@@ -1745,6 +1864,7 @@ class DecouplerFunctionalAnalysisCapability(_InferenceContractCapability, BaseCa
         out_uri = _output_uri(contract, contract.input_artifacts[0], "table://{study_id}/functional_activity/v1")
         metrics = {
             "n_sources": int(len(summary)),
+            **(prepared.donor_role.as_metrics() if prepared.donor_role is not None else {}),
             "n_sources_not_estimated": int(summary["status"].eq("not_estimated").sum()) if not summary.empty else 0,
             "n_significant_fdr05": int(summary["significant_fdr05"].eq(True).sum()) if not summary.empty else 0,
             "n_significant_at_alpha": int(summary["significant_at_alpha"].eq(True).sum()) if not summary.empty else 0,
@@ -1882,34 +2002,58 @@ def _leave_one_out_summary(
     silently dropping unestimated values.
     """
     loo = pd.concat(list(fit_tables), ignore_index=True) if fit_tables else pd.DataFrame()
+    loo_positions: Mapping[str, np.ndarray] = {}
+    if not loo.empty and not full_table.empty:
+        gene_keys = loo["gene"].astype(str)
+        loo_positions = gene_keys.groupby(gene_keys, sort=False).indices
+        loo_effects = (
+            pd.to_numeric(loo["log2_fold_change"], errors="coerce")
+            if "log2_fold_change" in loo
+            else pd.Series(np.nan, index=loo.index, dtype=float)
+        )
+        loo_q_values = (
+            pd.to_numeric(loo["fdr_q_value"], errors="coerce")
+            if "fdr_q_value" in loo
+            else pd.Series(np.nan, index=loo.index, dtype=float)
+        )
+    else:
+        loo_effects = pd.Series(dtype=float)
+        loo_q_values = pd.Series(dtype=float)
     rows: list[dict[str, Any]] = []
     for _, baseline in full_table.iterrows():
         gene = str(baseline["gene"])
-        if not loo.empty:
-            gene_loo = loo.loc[loo["gene"].astype(str) == gene]
+        positions = loo_positions.get(gene)
+        if positions is not None:
+            raw_effects = loo_effects.iloc[positions]
+            effects = raw_effects.loc[np.isfinite(raw_effects.to_numpy(dtype=float))]
+            raw_q_values = loo_q_values.iloc[positions]
+            q_values = raw_q_values.loc[np.isfinite(raw_q_values.to_numpy(dtype=float))]
         else:
-            gene_loo = pd.DataFrame()
-        effects = pd.to_numeric(gene_loo.get("log2_fold_change", pd.Series(dtype=float)), errors="coerce").dropna()
-        q_values = pd.to_numeric(gene_loo.get("fdr_q_value", pd.Series(dtype=float)), errors="coerce").dropna()
+            effects = pd.Series(dtype=float)
+            q_values = pd.Series(dtype=float)
         n_estimated = int(len(effects))
         baseline_lfc = pd.to_numeric(pd.Series([baseline.get("log2_fold_change")]), errors="coerce").iloc[0]
         baseline_q = pd.to_numeric(pd.Series([baseline.get("fdr_q_value")]), errors="coerce").iloc[0]
-        baseline_significant_fdr05 = bool(float(baseline_q) < 0.05) if pd.notna(baseline_q) else pd.NA
-        baseline_significant_at_alpha = bool(float(baseline_q) < alpha) if pd.notna(baseline_q) else pd.NA
-        if n_estimated and pd.notna(baseline_lfc) and float(baseline_lfc) != 0.0:
+        baseline_lfc_finite = pd.notna(baseline_lfc) and math.isfinite(float(baseline_lfc))
+        baseline_q_finite = pd.notna(baseline_q) and math.isfinite(float(baseline_q))
+        baseline_significant_fdr05 = bool(float(baseline_q) < 0.05) if baseline_q_finite else pd.NA
+        baseline_significant_at_alpha = bool(float(baseline_q) < alpha) if baseline_q_finite else pd.NA
+        if n_estimated and baseline_lfc_finite and float(baseline_lfc) != 0.0:
             direction_consistency = float((np.sign(effects.to_numpy()) == np.sign(float(baseline_lfc))).mean())
         else:
             direction_consistency = np.nan
-        if len(q_values) and pd.notna(baseline_q):
+        # This count describes available, finite LOO adjusted p-values even
+        # when the full-model adjusted p-value is NA.  Only retention needs a
+        # baseline decision for comparison.
+        n_significant_loo = int((q_values.to_numpy(dtype=float) < alpha).sum())
+        if len(q_values) and baseline_q_finite:
             loo_significant = q_values.to_numpy(dtype=float) < alpha
             # Retention is relative to the full-model decision: among the
             # estimated fits, how often did the same significant/non-significant
             # decision remain?
             significance_retention = float((loo_significant == baseline_significant_at_alpha).mean())
-            n_significant_loo = int(loo_significant.sum())
         else:
             significance_retention = np.nan
-            n_significant_loo = 0
         rows.append(
             {
                 "gene": gene,
@@ -1923,7 +2067,7 @@ def _leave_one_out_summary(
                 "effect_definition": baseline.get("effect_definition"),
                 "alpha": float(alpha),
                 "confidence_level": 1.0 - float(alpha),
-                "baseline_log2_fold_change": float(baseline_lfc) if pd.notna(baseline_lfc) else np.nan,
+                "baseline_log2_fold_change": float(baseline_lfc) if baseline_lfc_finite else np.nan,
                 "baseline_fdr_q_value": float(baseline_q) if pd.notna(baseline_q) else np.nan,
                 "baseline_significant_fdr05": baseline_significant_fdr05,
                 "baseline_significant_at_alpha": baseline_significant_at_alpha,
@@ -1964,7 +2108,7 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
             implementation_id=implementation_id,
             implementation_type=ImplementationType.PYTHON_TOOL,
             accepts_types=[ArtifactType.ANNDATA],
-            output_types=[ArtifactType.TABLE],
+            output_types=[ArtifactType.TABLE, ArtifactType.JSON],
             suitable_for=["donor_leave_one_out", "paired_donor_sensitivity"],
         )
         self.legacy_aliases = {"donor_loo_pydeseq2_v1": self.implementation_id}
@@ -1974,8 +2118,7 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
         if not contract.input_artifacts:
             raise AdvancedStatisticsInputError("donor sensitivity requires one input AnnData/SCData artifact")
         input_uri = contract.input_artifacts[0]
-        _, payload = registry.get(input_uri)
-        data = _coerce_data(payload)
+        data = registry.load_scdata(input_uri)
         self.ensure_inference_contract(contract, registry, data)
         # Prepare with the structural minimum so an underpowered LOO request
         # can produce an explicit, auditable skip artifact.  The ordinary
@@ -1986,6 +2129,8 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
         prepared = _prepare_pseudobulk(data, loo_params)
         inference = InferenceSettings.from_params(contract.parameters)
         contrast_spec = _resolve_contrast(prepared, contract.parameters)
+        scientific_outputs = _scientific_outputs(contract)
+        fit_receipts: list[dict[str, Any]] = []
         min_donors = max(3, int(contract.parameters.get("min_loo_donors", _DEFAULT_LOO_MIN_DONORS)))
         n_a, n_b = len(prepared.donor_ids_a), len(prepared.donor_ids_b)
         if n_a < min_donors or n_b < min_donors:
@@ -1997,6 +2142,7 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
             out_uri = _output_uri(contract, input_uri, "table://{study_id}/donor_sensitivity/v1")
             metrics = {
                 "skipped": True,
+                **(prepared.donor_role.as_metrics() if prepared.donor_role is not None else {}),
                 "skip_reason": reason,
                 "alpha": inference.alpha,
                 "inference_settings": inference.as_dict(),
@@ -2039,8 +2185,8 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
                 metrics,
             )
             outputs = [out_uri]
-            if len(contract.expected_outputs) >= 2:
-                summary_uri = str(contract.expected_outputs[1])
+            if len(scientific_outputs) >= 2:
+                summary_uri = scientific_outputs[1]
                 summary_table = table.copy()
                 summary_table["complete_fit_coverage"] = 0.0
                 summary_table["scientific_robustness_claim_supported"] = False
@@ -2055,6 +2201,7 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
                     {"n_rows": int(len(summary_table)), **metrics},
                 )
                 outputs.append(summary_uri)
+            outputs = _register_fit_receipts(registry, contract, input_uri, outputs, fit_receipts, metrics)
             return TaskResult(
                 task_id=contract.task_id,
                 status=TaskStatus.SUCCESS,
@@ -2070,8 +2217,15 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
 
         # Fit the complete model first.  This is also used as the explicit
         # baseline row for every gene in the output.
-        full_result, _ = _run_pydeseq2(prepared, contract.parameters)
+        full_result, _ = _run_recorded_pydeseq2(prepared, contract, fit_receipts)
+        full_design_rank = prepared.design_rank
+        full_design_columns = tuple(prepared.design_columns)
+        if full_design_rank is None:
+            raise AdvancedStatisticsInputError("full-model design rank was not recorded")
+        full_residual_df = int(len(prepared.metadata) - full_design_rank)
         full_table = _result_table(full_result, prepared, contract.parameters)
+        full_table["design_rank"] = int(full_design_rank)
+        full_table["residual_degrees_of_freedom"] = full_residual_df
         fit_tables: list[pd.DataFrame] = []
         successful_fits = 0
         failed_fits: dict[str, str] = {}
@@ -2084,15 +2238,28 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
             sub_counts = prepared.counts.loc[keep].copy()
             sub_metadata = prepared.metadata.loc[keep].copy()
             try:
-                sub_result, _ = _run_pydeseq2(
+                sub_result, _ = _run_recorded_pydeseq2(
                     prepared,
-                    contract.parameters,
+                    contract,
+                    fit_receipts,
                     counts=sub_counts,
                     metadata=sub_metadata,
+                    left_out_donor=str(donor),
                 )
                 # _run_pydeseq2 updates the design diagnostics on prepared;
-                # every successful result contains the complete gene table.
-                sub_table = _result_table(sub_result, prepared, contract.parameters)
+                # snapshot each fit before the next fold mutates them.
+                sub_design_rank = prepared.design_rank
+                if sub_design_rank is None:
+                    raise AdvancedStatisticsInputError(f"design rank was not recorded after removing donor {donor}")
+                sub_residual_df = int(len(sub_metadata) - sub_design_rank)
+                sub_table = _result_table(
+                    sub_result,
+                    prepared,
+                    contract.parameters,
+                    fit_metadata=sub_metadata,
+                )
+                sub_table["design_rank"] = int(sub_design_rank)
+                sub_table["residual_degrees_of_freedom"] = sub_residual_df
                 sub_table.insert(1, "left_out_donor", str(donor))
                 sub_table["fit_status"] = "estimated"
                 sub_table["removed_sample_count"] = int((~keep).sum())
@@ -2135,6 +2302,7 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
         out_uri = _output_uri(contract, input_uri, "table://{study_id}/donor_sensitivity/v1")
         metrics = {
             "skipped": False,
+            **(prepared.donor_role.as_metrics() if prepared.donor_role is not None else {}),
             "skip_reason": None,
             "alpha": inference.alpha,
             "inference_settings": inference.as_dict(),
@@ -2147,6 +2315,10 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
             "failed_fits": failed_fits,
             "condition_a": contrast_spec.tested_level if contrast_spec.kind == "categorical" else prepared.condition_a,
             "condition_b": contrast_spec.reference_level if contrast_spec.kind == "categorical" else prepared.condition_b,
+            "design": prepared.design,
+            "design_rank": int(full_design_rank),
+            "design_columns": list(full_design_columns),
+            "residual_degrees_of_freedom": full_residual_df,
             "n_donors_condition_a": (
                 n_a if contrast_spec.kind != "categorical" or contrast_spec.tested_level == prepared.condition_a else n_b
             ),
@@ -2154,6 +2326,7 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
                 n_b if contrast_spec.kind != "categorical" or contrast_spec.reference_level == prepared.condition_b else n_a
             ),
             "paired": prepared.paired,
+            "n_pseudobulk_samples": int(len(prepared.metadata)),
             "paired_leaveout_removes_complete_donor": bool(prepared.paired),
             "complete_fit_coverage": float(successful_fits / len(donors_to_remove)) if donors_to_remove else np.nan,
             "all_requested_fits_completed": bool(successful_fits == len(donors_to_remove)),
@@ -2186,8 +2359,8 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
             metrics,
         )
         outputs = [out_uri]
-        if len(contract.expected_outputs) >= 2:
-            summary_uri = str(contract.expected_outputs[1])
+        if len(scientific_outputs) >= 2:
+            summary_uri = scientific_outputs[1]
             summary_output = summary_table.copy()
             summary_output["n_requested_fits"] = len(donors_to_remove)
             summary_output["n_successful_fits"] = successful_fits
@@ -2215,6 +2388,7 @@ class PyDESeq2LeaveOneDonorOutCapability(_InferenceContractCapability, BaseCapab
                 {"n_rows": int(len(summary_output)), **metrics},
             )
             outputs.append(summary_uri)
+        outputs = _register_fit_receipts(registry, contract, input_uri, outputs, fit_receipts, metrics)
         return TaskResult(
             task_id=contract.task_id,
             status=TaskStatus.SUCCESS,

@@ -41,7 +41,7 @@ class KnowledgeRetrievalCapability(BaseCapability):
                         df = df.iloc[:0]
                     deg_genes = df["gene"].dropna().head(20).tolist()
             elif meta.type in (ArtifactType.ANNDATA, ArtifactType.SPATIAL_DATA):
-                data = payload if isinstance(payload, SCData) else SCData.from_dict(payload)
+                data = SCData.from_payload(payload)
                 if "gene_name" in data.var.columns:
                     deg_genes = data.var["gene_name"].dropna().head(20).tolist()
 
